@@ -1,0 +1,57 @@
+# distr-hnsw
+
+Pre-implementation design for a self-hosted, Tailscale-native distributed
+semantic storage service: replicated encrypted blobs plus distributed HNSW
+vector search. The full design is in `DESIGN.md`.
+
+
+## Stack
+
+- Rust service/binary; SQLite control-plane metadata.
+- Tailscale networking and identity; browser dashboard/API.
+- HNSW indexes, local or API embedding providers, encrypted blob storage.
+
+## Working agreement
+
+- Read the relevant section of `DESIGN.md` before changing architecture.
+- Add or update focused tests with implementation changes; run the smallest
+  relevant build, format, lint, and test commands before handoff.
+- Preserve storage, durability, and epoch invariants; call out any intentional
+  tradeoff or deviation.
+- As you work, update the AGENTS.md and documentation.
+- I am currently developing on my personal laptop. This machine should only be used for developement and light testing. For larger tests where we might have large artifacts (like testing storage flow), use anthonylu@anthony pc on my tailscale network.
+
+## Documentation
+
+- Documentation should go in /docs. If there isn't /docs already, create the directory.
+- Update documentation as you go. Should be concise, accurate, with docs on the tech stack, architecture, etc.
+- Documentation should be professional, as the end goal fo this project is not only a learning project, but also hopefully something we can open-source.
+
+## Git
+
+- Do not commit, push, create branches, or alter history unless the human
+  explicitly asks.
+- Keep changes and eventual commits small and scoped; do not bundle unrelated
+  work or rewrite existing history.
+- Do not discard or overwrite existing user changes.
+
+## Structure
+
+- `DESIGN.md` — product and architecture specification.
+- `AGENTS.md` / `CLAUDE.md` — repository guidance.
+- `docs/` — living documentation (phase status, next steps).
+- `prototype/` — **disposable** phase-0 validation CLI (`distr-hnsw-validate`).
+  Not product code; do not grow it into the distributed service. See
+  `docs/phase-0-validation.md`.
+
+## Phase-0 compute
+
+Heavy embed/eval runs belong on `ssh anthonylu@anthonypc` (Fedora, RTX 3060 Ti)
+with Ollama. Laptop is for development and light fixture tests only.
+
+Phase-0 bakeoffs use a fresh run-scoped work directory. Persist the Ollama
+digest when embeddings are written and refuse evaluation if the query model no
+longer matches. Reports must include query, source-tree, and executable hashes;
+measure provider cold start separately from warmed p50/p95 query latency. Full
+vault reports stay private/gitignored, while a sanitized aggregate summary lives
+under `docs/` for reproducible public review.

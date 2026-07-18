@@ -1,0 +1,30 @@
+[package]
+name = "distr-hnsw-validate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phase-0 disposable validation prototype for semantic file search"
+publish = false
+
+[[bin]]
+name = "distr-hnsw-validate"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+html2text = "0.12"
+pdf-extract = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

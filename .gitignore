@@ -1,0 +1,9 @@
+/target/
+**/target/
+.DS_Store
+*.db
+*.db-*
+/prototype/testdata/tmp/
+/prototype/testdata/work/
+/prototype/testdata/reports/
+**/distr-hnsw-proto/

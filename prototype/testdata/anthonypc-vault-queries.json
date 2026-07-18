@@ -1,0 +1,62 @@
+[
+  {
+    "id": "q1",
+    "text": "notes about my beli-cli project",
+    "relevant_path_globs": ["**/beli-cli.md"],
+    "grades": { "beli-cli.md": 2 }
+  },
+  {
+    "id": "q2",
+    "text": "overview of my GitHub portfolio",
+    "relevant_path_globs": ["**/GitHub Portfolio Overview.md"],
+    "grades": { "GitHub Portfolio Overview.md": 2 }
+  },
+  {
+    "id": "q3",
+    "text": "list of GitHub repositories I care about",
+    "relevant_path_globs": ["**/GitHub Repositories.md"],
+    "grades": { "GitHub Repositories.md": 2 }
+  },
+  {
+    "id": "q4",
+    "text": "stable personal preferences I want agents to remember",
+    "relevant_path_globs": ["**/Stable Preferences.md"],
+    "grades": { "Stable Preferences.md": 2 }
+  },
+  {
+    "id": "q5",
+    "text": "environment context for my machines and setup",
+    "relevant_path_globs": ["**/Environment Context.md"],
+    "grades": { "Environment Context.md": 2 }
+  },
+  {
+    "id": "q6",
+    "text": "how the memory and knowledge base is set up",
+    "relevant_path_globs": ["**/Memory and Knowledge Base Setup.md"],
+    "grades": { "Memory and Knowledge Base Setup.md": 2 }
+  },
+  {
+    "id": "q7",
+    "text": "inbox for long-term memory items",
+    "relevant_path_globs": ["**/Memory Inbox.md"],
+    "grades": { "Memory Inbox.md": 2 }
+  },
+  {
+    "id": "q8",
+    "text": "GitHub Contributions.md",
+    "relevant_path_globs": ["**/GitHub Contributions.md"],
+    "grades": { "GitHub Contributions.md": 2 }
+  },
+  {
+    "id": "q9",
+    "text": "personal context about me",
+    "relevant_path_globs": ["**/Personal Context.md"],
+    "grades": { "Personal Context.md": 2 }
+  },
+  {
+    "id": "q10",
+    "text": "index of daily notes",
+    "relevant_path_globs": ["**/Daily Notes Index.md"],
+    "grades": { "Daily Notes Index.md": 2 }
+  }
+]

@@ -1,0 +1,26 @@
+[
+  {
+    "id": "q1",
+    "text": "spring tax documents and deductions",
+    "relevant_path_globs": ["**/tax-notes.md"],
+    "grades": {
+      "tax-notes.md": 2
+    }
+  },
+  {
+    "id": "q2",
+    "text": "invoice 4021",
+    "relevant_path_globs": ["**/invoice-4021*"],
+    "grades": {
+      "invoice-4021.txt": 2
+    }
+  },
+  {
+    "id": "q3",
+    "text": "architecture notes for the distributed search design",
+    "relevant_path_globs": ["**/architecture.md"],
+    "grades": {
+      "architecture.md": 2
+    }
+  }
+]

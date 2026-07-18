@@ -1,0 +1,71 @@
+{
+  "generated_at": "2026-07-18T21:59:05.724496048+00:00",
+  "remote_run_id": "20260718T215901Z",
+  "corpus": {
+    "label": "private Obsidian vault",
+    "file_count": 14,
+    "chunk_count": 27,
+    "embedding_count": 81,
+    "recency_at_max_mtime": 5,
+    "recency_max_mtime_fraction": 0.35714285714285715
+  },
+  "evaluation": {
+    "k": 10,
+    "judged_queries": 10,
+    "query_set_blake3": "ee7040128dc91a4eda30dbb91a38c292d4519f7969a79693b097b063dce81afa",
+    "retrieval_metrics_equal_on_repeat": true
+  },
+  "provenance": {
+    "binary": "distr-hnsw-validate 0.1.0",
+    "source_revision": "unknown",
+    "source_tree_blake3": "dcae7725367a38120adba03addfc2c42e8b391d27640ab8d000dec22004c2236",
+    "executable_blake3": "7b7c61a73951846e95fc51b2b7b39b92263eac1b4b7322215b8ff2873fe8dc35",
+    "schema_version": 2,
+    "prepare_fingerprint": "extractor=v0-inprocess;max_file_bytes=8388608;chunk_chars=2000;chunk_overlap=200",
+    "ollama_model": "nomic-embed-text",
+    "embedding_time_ollama_digest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
+    "evaluation_time_ollama_digest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f"
+  },
+  "configs": [
+    {
+      "dims": 768,
+      "win_rate_vs_name": 0.16666666666666666,
+      "win_rate_vs_recency": 1.0,
+      "win_rate_vs_keyword": 0.625,
+      "mean_recall_at_k": 1.0,
+      "mean_ndcg_at_k": 0.7248996447822396,
+      "cold_latency_ms": 998.1465619999999,
+      "warm_p50_latency_ms": 14.003881,
+      "warm_p95_latency_ms": 14.567008
+    },
+    {
+      "dims": 512,
+      "win_rate_vs_name": 0.16666666666666666,
+      "win_rate_vs_recency": 1.0,
+      "win_rate_vs_keyword": 0.625,
+      "mean_recall_at_k": 1.0,
+      "mean_ndcg_at_k": 0.7095192840476248,
+      "cold_latency_ms": null,
+      "warm_p50_latency_ms": 13.922320000000001,
+      "warm_p95_latency_ms": 15.899406
+    },
+    {
+      "dims": 384,
+      "win_rate_vs_name": 0.16666666666666666,
+      "win_rate_vs_recency": 1.0,
+      "win_rate_vs_keyword": 0.5,
+      "mean_recall_at_k": 1.0,
+      "mean_ndcg_at_k": 0.7246141434859121,
+      "cold_latency_ms": null,
+      "warm_p50_latency_ms": 13.743627,
+      "warm_p95_latency_ms": 15.47766
+    }
+  ],
+  "recommendation": {
+    "model": "nomic-embed-text",
+    "dims": 512,
+    "dims_locked": false,
+    "reason": "judged query count is 10 and nDCG spread across dimensions is 0.015"
+  },
+  "verdict": "no-go (semantic win-rate vs name baseline below 60%); dims not locked"
+}
