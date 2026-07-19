@@ -15,6 +15,7 @@ def report():
     return {
         "generated_at": "2026-07-19T00:00:00Z",
         "k": 10,
+        "recommendation": "Suggested model=`nomic-embed-text` dims=512, warm latency p50/p95=19/25ms). dims locked",
         "provenance": {
             "source_revision": "abc123",
             "source_tree_blake3": "source-hash",
@@ -52,11 +53,22 @@ class CompareEvalReportsTests(unittest.TestCase):
         repeat["configs"][0]["cold_latency_ms"] = 120.0
         repeat["configs"][0]["mean_latency_ms"] = 22.0
         repeat["configs"][0]["warm_p95_latency_ms"] = 29.0
+        repeat["recommendation"] = "Suggested model=`nomic-embed-text` dims=512, warm latency p50/p95=20/29ms). dims locked"
 
         result = MODULE.compare_reports(first, repeat)
 
         self.assertTrue(result["passed"])
         self.assertTrue(result["retrieval_metrics_equal_on_repeat"])
+
+    def test_recommended_model_difference_fails(self):
+        first = report()
+        repeat = copy.deepcopy(first)
+        repeat["recommendation"] = first["recommendation"].replace("dims=512", "dims=384")
+
+        result = MODULE.compare_reports(first, repeat)
+
+        self.assertFalse(result["passed"])
+        self.assertIn("recommendation", result["first_difference"])
 
     def test_ranking_difference_fails(self):
         first = report()

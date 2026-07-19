@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,12 @@ def retrieval_view(report: dict[str, Any]) -> dict[str, Any]:
     """Return all deterministic evidence, excluding timestamps and latency."""
     view = copy.deepcopy(report)
     view.pop("generated_at", None)
+    if isinstance(view.get("recommendation"), str):
+        view["recommendation"] = re.sub(
+            r", warm latency p50/p95=[^)]*?ms",
+            "",
+            view["recommendation"],
+        )
     for config in view.get("configs", []):
         for field in tuple(config):
             if field in LATENCY_FIELDS or field.endswith("_latency_ms"):
