@@ -6,23 +6,22 @@ tracks only the immediate work needed to advance the current milestone.
 
 ## Close M0 before M1
 
-M0 is **In progress**. Current candidate evidence is mixed-v4b on `anthonypc`
-(`20260719T192138Z`): same `mixed-v4-20260719` corpus tree, corrected query
-set, candidate **`nomic-embed-text` @ 512** at **72.2%** vs name. The query
-corrections followed a loss audit, so this is development-set evidence rather
-than the final gate. See [phase-0-validation.md](phase-0-validation.md) and
+M0 is **In progress — semantic go, dimensions unresolved**. The frozen
+independent holdout (`anthonypc` run `20260719T202526Z-holdout`) scores
+**32/0/8** at 512d versus name with exact repeat retrieval evidence and complete
+provenance. See [phase-0-validation.md](phase-0-validation.md) and
 [phase-0-bakeoff-summary.json](phase-0-bakeoff-summary.json).
 
-Before M1:
+Only one gate remains before M1:
 
-1. Build from an exact source revision and retain the evaluated executable.
-2. Freeze at least 40 independent, stratified meaning queries before retrieval.
-3. Run the nomic 768/512/384 matrix twice against unchanged inputs.
-4. Compare retrieval metrics and rankings exactly; report latency variance.
-5. Audit private remote artifacts and publish the sanitized final decision.
+1. Resolve the dimension policy without retuning the frozen holdout. Its nDCG
+   spread is 0.014, so the existing rule correctly leaves dimensions unlocked.
+2. Record the selected policy and dimension in DESIGN §15.
+3. Perform the M0 exit review and then unblock M1.
 
-Keep `prototype/` disposable. Hybrid RRF is not part of the semantic-only gate;
-use it only as a separate fallback experiment if the holdout fails.
+Keep `prototype/` disposable. Public code fragments remain weak and keyword
+search wins more decided comparisons than semantic search, so hybrid fusion
+remains a phase-5 product requirement rather than more M0 prototype work.
 
 ## Phase 1 (after M0 passes)
 
@@ -45,5 +44,8 @@ Then build the smallest recovery-first slice:
 - Development queries: `~/distr-hnsw-proto/corpora/mixed-v4b-20260719-queries.json`
   (beside stage; blake3 `025a6ff4423709f0be1b78425b7c35bf219e8ee177c515f33d194181e74ecb01`)
 - Development candidate run: `~/distr-hnsw-proto/runs/20260719T192138Z`
+- Frozen holdout queries: `~/distr-hnsw-proto/corpora/mixed-v4-holdout-20260719-queries.json`
+  (pre-run SHA-256 `9ee8153dea157c823cb7a1f84416ba9d554691682d4b276f87cb6762448b5ec7`)
+- Holdout run: `~/distr-hnsw-proto/runs/20260719T202526Z-holdout`
 - Prior mixed-v4 no-go run `20260719T045711Z` and BGE-M3 diagnostic
   `20260719T045506Z` are historical only, not lock evidence.

@@ -76,7 +76,7 @@ Assemble larger corpora with `prototype/scripts/assemble-mixed-corpus.sh`
 beside the stage tree, not inside it, so prepare does not index labels. Run
 `prototype/scripts/run-bakeoff-anthonypc.sh` for the matrix.
 
-**M0 status:** In progress. The mixed-v4b run on `anthonypc` is promising
-development-set evidence for `nomic-embed-text` @ 512, but an independent
-holdout and an unchanged-input repeat are still required
-(`docs/phase-0-validation.md`). M1 remains gated.
+**M0 status:** In progress — semantic go, dimensions unresolved. The frozen
+holdout and exact repeat validate `nomic-embed-text`, but eligible nDCG spread
+is below the documented dimension-lock threshold (`docs/phase-0-validation.md`).
+Do not retune the holdout. M1 remains gated until DESIGN §15 locks a dimension.

@@ -19,13 +19,12 @@ design first and then bring this document back into alignment.
 | M6 — Dashboard and operations | Not started | User and operator workflows are complete, truthful, and accessible |
 | M7 — Vault, sharing, and v1 release | Not started | Security, deployment, recovery, and operating-envelope qualification pass |
 
-The phase-0 implementation is intentionally disposable. Mixed-v4b
-(`anthonypc` run `20260719T192138Z`) is promising development-set evidence:
-same mixed-v4 corpus tree (392 evaluated files / 2625 chunks), a
-judgment/paraphrase-corrected 50-query set, and candidate
-**`nomic-embed-text` @ 512** at **72.2%** vs name. Because the corrections were
-informed by the prior loss audit, M0 remains in progress pending a frozen
-independent holdout and unchanged-input repeat. See
+The phase-0 implementation is intentionally disposable. A frozen independent
+40-query holdout (`anthonypc` run `20260719T202526Z-holdout`) validates the
+semantic product bet: the 512d candidate scores 32/0/8 versus name, and an
+unchanged-input repeat reproduces rankings and retrieval metrics exactly with
+complete provenance. M0 remains in progress only because eligible nDCG spread
+is 0.014, below the documented 0.03 dimension-lock threshold. See
 [phase-0-validation.md](phase-0-validation.md) and
 [next-steps.md](next-steps.md).
 
@@ -117,20 +116,20 @@ their formats and capacity costs become embedded in later milestones.
 
 - [x] The evaluated corpus has at least hundreds of mixed-format files and the
   judged set contains at least 40 meaning-oriented queries.
-- [ ] Semantic search wins at least approximately 60% of decided comparisons
+- [x] Semantic search wins at least approximately 60% of decided comparisons
   against the name baseline, or a documented human review establishes clear
   qualitative dominance on meaning queries.
-  *(mixed-v4b candidate: 72.2% vs name; independent holdout pending)*
+  *(independent holdout at 512d: 100% vs name, 32/0/8)*
 - [x] Recall/nDCG, baseline comparisons, cold start, and warmed p50/p95 latency
   are reported for every candidate configuration.
-- [ ] Re-running evaluation against unchanged inputs reproduces retrieval
+- [x] Re-running evaluation against unchanged inputs reproduces retrieval
   metrics; latency variance is reported rather than treated as determinism.
 - [x] The stored and current provider/model identities match for every query.
 - [ ] Dimensionality is not locked with fewer than 40 judged queries or when
   configurations are indistinguishable under the documented selection rule.
-- [ ] The go/no-go decision and its limitations are reviewed and reflected in
+- [x] The go/no-go decision and its limitations are reviewed and reflected in
   the design and phase documentation.
-  *(candidate: `nomic-embed-text`@512; final decision pending)*
+  *(semantic go; public-fragment and keyword limitations documented)*
 
 ### Verification and evidence
 
@@ -144,13 +143,14 @@ directory. Because mixed-v4b was corrected after inspecting the prior losses,
 freeze and evaluate an independent holdout of at least 40 meaning-oriented
 queries before the final decision; do not revise it based on retrieval output.
 
-**Exit gate.** **Pending.** Mixed-v4b nominates `nomic-embed-text` at 512
-dimensions. The independent holdout, exact repeat comparison, and final review
-must pass before DESIGN §15 is locked or M1 begins.
+**Exit gate.** **Pending on dimensions only.** The independent holdout and
+repeat validate `nomic-embed-text` and the semantic product bet. DESIGN §15 and
+M1 remain gated because the existing selection rule does not lock any dimension
+when eligible nDCG spread is below 0.03.
 
 **Explicit non-goals.** Distribution, HNSW, WALs, Tailscale auth, replication,
-the dashboard, and production extraction. Offline hybrid fusion is a bounded
-fallback experiment only if semantic-only retrieval fails the holdout.
+the dashboard, and production extraction. Holdout keyword results preserve
+hybrid fusion as a phase-5 product requirement, not an M0 implementation task.
 
 ---
 

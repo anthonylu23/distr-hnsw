@@ -1,11 +1,11 @@
 # Phase-0 validation prototype
 
-Status: **M0 In progress**. Current candidate evidence is **mixed-v4b** on
-`anthonypc` (run `20260719T192138Z`): same `mixed-v4-20260719` corpus tree,
-judgment/paraphrase-corrected query set, candidate
-**`nomic-embed-text` @ 512** at **72.2%** vs name. Because those corrections
-were informed by the prior loss audit, an independent holdout and
-unchanged-input repeat are required before locking dimensions or starting M1.
+Status: **M0 In progress — semantic go, dimensions unresolved**. A frozen
+40-query independent holdout on `anthonypc` (run
+`20260719T202526Z-holdout`) produced **32/0/8** at 512d versus name, exact
+repeat retrieval evidence, and complete provenance. The semantic product bet
+passes. Eligible nDCG spread is only **0.014**, below the documented **0.03**
+dimension-lock threshold, so DESIGN §15 and M1 remain gated.
 
 ## Purpose
 
@@ -45,6 +45,45 @@ Disposable Rust CLI: [`prototype/`](../prototype/) (`distr-hnsw-validate`).
   vector slicing is not a valid model configuration.
 - Oversized configs are diagnostics only: they do not choose the model, affect
   dimension spread, produce a go verdict, or lock dimensions.
+
+## Independent holdout — canonical quality evidence (2026-07-19)
+
+The holdout was curated from document content, structurally validated, and
+hashed before any retrieval run. It contains 40 new queries: 8 code, 10 PDF, 6
+personal-note, 6 public, and 10 study-note queries. Every relevance selector
+resolves to exactly one extracted document.
+
+| Field | Value |
+|---|---|
+| Work dir | `~/distr-hnsw-proto/runs/20260719T202526Z-holdout` |
+| Evaluator revision | `3e18096757e426c06c567a78dc8f3ee8112783c1` |
+| Query SHA-256 before retrieval | `9ee8153dea157c823cb7a1f84416ba9d554691682d4b276f87cb6762448b5ec7` |
+| Query BLAKE3 in reports | `d37e55d895b974fce20fcf3498a831b47935dec2bde0c9fdddf36cff914dfb47` |
+| Retained executable SHA-256 | `33efe3f04417bb9763f635d951449c52ab1927f6900e23cbed3290f97fc8ffdf` |
+| Repeat comparison | **pass** — provenance, rankings, and retrieval metrics identical |
+| Semantic decision | **go** |
+| Dimension decision | **not locked** — eligible nDCG spread **0.014** |
+
+### Holdout config summary
+
+| model | dims | judged | vs name (W/L/T) | vs keyword (W/L/T) | mean recall | mean nDCG | cold / warm p50 / p95 ms |
+|---|---:|---:|---|---|---:|---:|---:|
+| nomic-embed-text | 768 | 40 | 100% (32/0/8) | 28.6% (4/10/26) | 0.800 | 0.678 | 1051.6 / 26.6 / 31.1 |
+| nomic-embed-text | **512** | 40 | 100% (32/0/8) | 30.8% (4/9/27) | 0.800 | 0.691 | — / 25.7 / 28.9 |
+| nomic-embed-text | 384 | 40 | 100% (33/0/7) | 30.8% (4/9/27) | 0.825 | 0.692 | — / 22.9 / 24.8 |
+
+At 512d, 32 comparisons are decided and none are losses; the 95% Wilson lower
+bound is 89.3%. Code, PDFs, personal notes, and study notes have recall@10 of
+0.875, 1.000, 0.833, and 0.900 respectively. Public code-fragment queries are
+the clear limitation at 0.167 recall and 0.056 nDCG: five of six are ties where
+both semantic and name retrieval miss. Keyword search also wins more decided
+comparisons than semantic search, reinforcing the phase-5 hybrid requirement.
+
+The private database passes SQLite integrity and foreign-key checks and holds
+392 files, 2625 chunks, and 7875 embeddings. Full reports, the retained binary,
+and the repeat comparison remain under the private run directory. The
+sanitized aggregate is
+[`phase-0-bakeoff-summary.json`](phase-0-bakeoff-summary.json).
 
 ## anthonypc bake-off — mixed-v4b development set (2026-07-19)
 
@@ -105,21 +144,17 @@ Sanitized aggregate: [`phase-0-bakeoff-summary.json`](phase-0-bakeoff-summary.js
 
 | Setting | Value | Notes |
 |---|---|---|
-| Local model | `nomic-embed-text` | Pending independent holdout |
-| Dims | **512** | Candidate preferred over 768 (higher vs-name; nDCG not worse) |
+| Local model | `nomic-embed-text` | Semantic quality validated on the independent holdout |
+| Dims | **512 candidate** | Not locked; holdout nDCG spread is below 0.03 |
 | Embed runtime | Ollama on GPU box | `OLLAMA_HOST` normalized to `http://…` |
 
-## Required M0 closeout
+## Remaining M0 decision
 
-1. Freeze at least 40 new stratified meaning queries without inspecting
-   retrieval output.
-2. Evaluate nomic 768/512/384 from an exact source revision and retain the
-   executable used.
-3. Repeat evaluation against the same database, embeddings, model digest, and
-   query hash.
-4. Verify rankings and retrieval metrics are identical while reporting latency
-   variance separately.
-5. Publish the holdout outcome and limitations before locking DESIGN §15.
+All empirical gates except dimensionality are complete. The current rule says
+not to lock when eligible nDCG spread is below 0.03; the holdout spread is
+0.014. M0 therefore remains open until the dimension policy is resolved without
+retuning the frozen holdout. The evidence supports `nomic-embed-text`; it does
+not support claiming that 512d is measurably better than 384d or 768d.
 
 Mixed-v4b remains useful development evidence. It is not discarded, but it is
 not independent confirmation because its corrections followed review of the
@@ -161,5 +196,6 @@ name. Superseded by mixed-v4 / mixed-v4b for the M0 gate.
 ## Non-goals (confirmed)
 
 HNSW, int8, WAL, Tailscale auth in-app, product-grade RRF hybrid as an M0
-requirement, out-of-process extractors, OCR, dashboard, replication. RRF is a
-separate fallback experiment only if semantic-only retrieval fails the holdout.
+requirement, out-of-process extractors, OCR, dashboard, replication. The
+holdout confirms semantic value, while keyword results preserve hybrid fusion
+as a phase-5 product requirement rather than an M0 fallback.
