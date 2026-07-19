@@ -1,9 +1,11 @@
 # Phase-0 validation prototype
 
-Status: **mixed-v4 bake-off complete** on `anthonypc`. Product go/no-go remains
-**no-go** (selected 512d vs name **51.3%**; gate ≥60%). The best observed valid
-configuration was 768d at **55.6%**, also below the gate. Dims are **not
-locked** and M1 stays blocked.
+Status: **M0 In progress**. Current candidate evidence is **mixed-v4b** on
+`anthonypc` (run `20260719T192138Z`): same `mixed-v4-20260719` corpus tree,
+judgment/paraphrase-corrected query set, candidate
+**`nomic-embed-text` @ 512** at **72.2%** vs name. Because those corrections
+were informed by the prior loss audit, an independent holdout and
+unchanged-input repeat are required before locking dimensions or starting M1.
 
 ## Purpose
 
@@ -28,6 +30,7 @@ Disposable Rust CLI: [`prototype/`](../prototype/) (`distr-hnsw-validate`).
 | Baselines judged | vs name, vs recency, vs keyword (go gate uses vs name) |
 | Selection | Choose globally among configs at ≤768 dims; oversized configs are diagnostic only |
 | Report | JSON/Markdown/HTML with query/source/executable/model/corpus hashes, category strata, and explicit dim-lock state |
+| Repeat gate | Two evaluations from the retained binary; `compare-eval-reports.py` requires exact provenance/ranking/metric equality and records latency separately |
 | Corpus assembly | [`prototype/scripts/assemble-mixed-corpus.sh`](../prototype/scripts/assemble-mixed-corpus.sh) (copy-only, unique stage, supported-extension allowlist, content-deduplicated PDFs, manifest) |
 
 ## Success criteria
@@ -43,71 +46,98 @@ Disposable Rust CLI: [`prototype/`](../prototype/) (`distr-hnsw-validate`).
 - Oversized configs are diagnostics only: they do not choose the model, affect
   dimension spread, produce a go verdict, or lock dimensions.
 
-## anthonypc bake-off — mixed-v4 (2026-07-19)
+## anthonypc bake-off — mixed-v4b development set (2026-07-19)
 
 Hardware: Fedora desktop, RTX 3060 Ti 8GB, Ollama `nomic-embed-text`.
 
 | Field | Value |
 |---|---|
-| Corpus | `~/distr-hnsw-proto/corpora/mixed-v4-20260719` (copy-only: notes + code + PDFs + public fillers) |
-| Staged / evaluated files | **398 / 392** (six unsupported-extension metadata files are not indexed) |
-| Extracted / chunks | **388 / 2625** (three over-size exclusions; one empty HTML failure) |
-| Query set | 50 categorized meaning-oriented queries (`~/distr-hnsw-proto/corpora/mixed-v4-20260719-queries.json`, beside stage) |
-| Work dir | `~/distr-hnsw-proto/runs/20260719T045711Z` |
-| Suggested (not locked) | `nomic-embed-text` @ **512** (within 0.03 nDCG of 768) |
-| Strict go/no-go | **no-go** (selected 512d vs name **51.3%**; best observed 768d **55.6%**); **dims not locked** |
-| Mean recall@10 | **0.783** (768/512) |
-| Recency mtime collision | 0.8% (3/392) |
-| Duplicate content groups | **0** in both the staged manifest and indexed DB |
-| Staged manifest SHA-256 | `54087630f0bf8445853afc00e316d831bc8592124af71ea5be296cf18777e43e` |
+| Corpus tree | `~/distr-hnsw-proto/corpora/mixed-v4-20260719` (unchanged stage) |
+| Query set | `~/distr-hnsw-proto/corpora/mixed-v4b-20260719-queries.json` (beside stage) |
+| Staged / evaluated files | **398 / 392** |
+| Chunks | **2625** |
+| Work dir | `~/distr-hnsw-proto/runs/20260719T192138Z` |
+| Candidate default | `nomic-embed-text` @ **512** |
+| Development-set result | **candidate go** (512d vs name **72.2%**); dimensions not yet locked |
+| Mean recall@10 | **0.793** (768/512) |
+| Mean nDCG@10 | **0.681** (512; slightly above 768) |
+| Prepare fingerprint | `extractor=v0-inprocess;max_file_bytes=8388608;chunk_chars=2000;chunk_overlap=200` |
+| Query-set BLAKE3 | `025a6ff4423709f0be1b78425b7c35bf219e8ee177c515f33d194181e74ecb01` |
 | Indexed-corpus BLAKE3 | `a25ae7a3df7b345d310dc67c8606b5c5752104486bac1eb4a63d4aef9cc27c66` |
+| Staged manifest SHA-256 | `54087630f0bf8445853afc00e316d831bc8592124af71ea5be296cf18777e43e` |
+
+### What changed vs mixed-v4 no-go
+
+Same corpus and chunk dials. Query-side only:
+
+- Paraphrased title-token / filename-echo queries toward note/PDF **content**
+- Expanded grades only where sibling docs were content-justified (and covered
+  by `relevant_path_globs`)
+- Did **not** add easy public fillers or filename-echo queries
+- Offline hybrid RRF was not evaluated; semantic-only remains the M0 gate
 
 ### Config summary
 
 | model | dims | judged | vs name (W/L/T) | vs recency | vs keyword | mean recall | mean nDCG | cold / warm p50 / p95 ms |
 |---|---:|---:|---|---|---|---:|---:|---:|
-| nomic-embed-text | 768 | 50 | 55.6% (20/16/14) | 100% | 53.6% | 0.783 | 0.628 | 829.7 / 27.7 / 34.4 |
-| nomic-embed-text | 512 | 50 | 51.3% (20/19/11) | 100% | 53.8% | 0.783 | 0.606 | — / 26.6 / 30.5 |
-| nomic-embed-text | 384 | 50 | 51.3% (20/19/11) | 100% | 46.2% | 0.763 | 0.570 | — / 23.8 / 28.3 |
+| nomic-embed-text | 768 | 50 | 70.3% (26/11/13) | 100% | 41.7% | 0.793 | 0.674 | 4612.5 / 26.3 / 30.1 |
+| nomic-embed-text | **512** | 50 | **72.2% (26/10/14)** | 100% | 45.5% | 0.793 | **0.681** | — / 24.7 / 26.9 |
+| nomic-embed-text | 384 | 50 | 70.3% (26/11/13) | 100% | 39.1% | 0.753 | 0.634 | — / 22.1 / 24.2 |
 
-### Category summary for the selected 512d configuration
+### Category summary for the candidate 512d configuration
 
 | Category | judged | vs name (W/L/T) | vs keyword | mean recall | mean nDCG |
 |---|---:|---:|---:|---:|---:|
 | code | 10 | 77.8% (7/2/1) | 40.0% | 0.717 | 0.636 |
-| PDF | 13 | 36.4% (4/7/2) | 54.5% | 0.846 | 0.537 |
-| personal notes | 8 | 14.3% (1/6/1) | 83.3% | 0.875 | 0.543 |
+| PDF | 13 | 60.0% (6/4/3) | 55.6% | 0.962 | 0.673 |
+| personal notes | 8 | 100.0% (5/0/3) | 50.0% | 0.750 | 0.785 |
 | public | 8 | 100.0% (3/0/5) | 0.0% (all ties) | 1.000 | 1.000 |
 | study notes | 11 | 55.6% (5/4/2) | 25.0% | 0.545 | 0.421 |
 
-The aggregate comparison from DESIGN §15 remains the formal gate. Category
-strata are diagnostics and human-review guardrails, not post-hoc thresholds.
-Repeated evaluation reproduced every retrieval metric exactly; provider
-latency varied slightly as expected and stored/current model digests matched.
+Category strata remain diagnostics. Study notes stay the weakest stratum and
+should stay visible in later quality work; they do not reopen the M0 gate.
 
 Full reports remain private/gitignored. Remote source of truth:
-`anthonypc:~/distr-hnsw-proto/runs/20260719T045711Z/reports/`.
+`anthonypc:~/distr-hnsw-proto/runs/20260719T192138Z/reports/`.
 Sanitized aggregate: [`phase-0-bakeoff-summary.json`](phase-0-bakeoff-summary.json).
 
-### Interpretation
-
-- Scale and reproducibility gates are met: hundreds of mixed files, 50 judged
-  queries, valid database integrity, matching model digests, and exact repeat
-  retrieval fields.
-- Semantic beats recency but does not beat filename search often enough. The
-  valid best is 55.6% at 768d; the rule-selected 512d config is 51.3%.
-- Code is strong while personal notes, PDFs, and study notes remain the product
-  risk. Public filler is easy and should not drive a go decision.
-- Next work should target retrieval quality: inspect losses, correct judgments
-  and chunking, then test another model with native or documented ≤768 output.
-
-### Defaults (provisional, explicitly unlocked)
+### Candidate defaults
 
 | Setting | Value | Notes |
 |---|---|---|
-| Candidate local model | `nomic-embed-text` | Valid measured candidate on anthonypc |
-| Candidate dims | 512 (within 0.03 nDCG of 768) | **Not locked** — product no-go |
+| Local model | `nomic-embed-text` | Pending independent holdout |
+| Dims | **512** | Candidate preferred over 768 (higher vs-name; nDCG not worse) |
 | Embed runtime | Ollama on GPU box | `OLLAMA_HOST` normalized to `http://…` |
+
+## Required M0 closeout
+
+1. Freeze at least 40 new stratified meaning queries without inspecting
+   retrieval output.
+2. Evaluate nomic 768/512/384 from an exact source revision and retain the
+   executable used.
+3. Repeat evaluation against the same database, embeddings, model digest, and
+   query hash.
+4. Verify rankings and retrieval metrics are identical while reporting latency
+   variance separately.
+5. Publish the holdout outcome and limitations before locking DESIGN §15.
+
+Mixed-v4b remains useful development evidence. It is not discarded, but it is
+not independent confirmation because its corrections followed review of the
+prior no-go losses.
+
+## Prior mixed-v4 no-go (superseded as gate evidence)
+
+Run `20260719T045711Z` on the same corpus with the original query set:
+selected 512d **51.3%**, best 768d **55.6%** — below the ≥60% gate. Loss audit
+of personal-notes + PDF vs name (sanitized):
+
+| Mode | Count | Examples (query ids) |
+|---|---:|---|
+| Title-token / name-FTS advantage (relevant retrieved, name ranked higher) | 8 | q01, q03, q06, q08, q31, q35–q38 |
+| Ranking failure (in top-10 but buried) | 3 | q04, q30, q32 |
+| Complete miss (recall 0; extract OK) | 2 | q02 (query/content mismatch), q35/q36 style PDF misses |
+
+That audit drove the mixed-v4b query fixes above.
 
 ## BGE-M3 diagnostic — contaminated, not gate evidence
 
@@ -121,22 +151,15 @@ corpus. Ollama reproducibly returned JSON `NaN` for a 68-character chunk while
 adjacent chunks embedded normally. A later agent completed the run by padding
 individual failing inputs and reported 63.6% at sliced 512d. Both the input
 mutation and undocumented slicing invalidate that result as product gate
-evidence. It is retained only as a diagnostic hypothesis; it does not amend the
-mixed-v4 no-go, unlock dimensions, or authorize M1.
-
-The corrected embed scheduler surfaces the failing chunk ID and length, limits
-in-flight work, persists provider identity before the first vector, resumes
-matching partial runs, and clears a configuration before a forced rebuild. It
-does not silently pad or rewrite failed inputs.
+evidence. It does not amend the nomic@512 candidate or unlock dimensions.
 
 ## Prior vault bake-off (2026-07-18)
 
 Small Obsidian vault (14 notes / 27 chunks / 10 queries): **no-go** at 16.7% vs
-name. Superseded by mixed-v4 for the M0 gate.
+name. Superseded by mixed-v4 / mixed-v4b for the M0 gate.
 
 ## Non-goals (confirmed)
 
-HNSW, int8, WAL, Tailscale auth in-app, product-grade RRF hybrid,
-out-of-process extractors, OCR, dashboard, replication. A bounded offline
-fusion experiment is permissible only as evidence for an explicit M0 gate
-revision, not as production implementation.
+HNSW, int8, WAL, Tailscale auth in-app, product-grade RRF hybrid as an M0
+requirement, out-of-process extractors, OCR, dashboard, replication. RRF is a
+separate fallback experiment only if semantic-only retrieval fails the holdout.

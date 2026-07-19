@@ -851,11 +851,11 @@ against brute force from day one. Estimates are rough solo-effort scale
 markers, not commitments; they exist so that scope decisions are made against
 a calendar rather than in the abstract.
 
-0. **Validation prototype** (~days). A flat script: embed the operator's
-   real corpus into SQLite, brute-force search, and compare semantic
-   retrieval against filename/date retrieval on real queries. Output is a
-   go/no-go on the core UX bet plus the chosen default embedding model and
-   dimensionality (§15). No distributed anything; the code is disposable.
+0. **Validation prototype** (~days) — **in progress**. Disposable CLI under
+   `prototype/`: embed a representative corpus into SQLite, brute-force search,
+   compare semantic vs filename/date baselines. Current candidate:
+   `nomic-embed-text` @ 512 (§15); independent holdout and repeat evidence are
+   pending. No distributed machinery.
 1. **Blob plane + recovery foundation** (~2–3 months) — agent + chunk store +
    volumes/quotas; then portal-core commit state machine, placement, write
    quorum, delete, scrub/reconcile/move. Add offsite encrypted-object backup,
@@ -900,14 +900,15 @@ collections (§4), OCR extraction provider (§7.1).
 
 Each question is tagged with the phase (§14) that must resolve it.
 
-- **[phase 0] Default local embedding model and dimensionality** for the
-  file collections (≤768 dims per §6.5) — chosen empirically by the
-  validation prototype, not during phase 5. Current valid evidence (mixed-v4,
-  2026-07-19) is a no-go: the rule-selected `nomic-embed-text` 512d config
-  wins 51.3% of decided comparisons against filename search, while the best
-  observed 768d config wins 55.6%; neither clears the 60% gate. Dimensions
-  remain unlocked and phase 1 stays blocked; see
-  `docs/phase-0-validation.md`.
+- **[phase 0 — candidate] Default local embedding model and dimensionality**
+  for file collections (≤768 dims per §6.5): **`nomic-embed-text` @ 512**.
+  The mixed-v4b development bake-off on `anthonypc` (same
+  `mixed-v4-20260719` corpus tree; judgment/paraphrase-corrected 50-query set)
+  produced **72.2%** wins vs filename search (26/10/14), mean recall@10
+  **0.793**, and mean nDCG@10 **0.681**. Because those corrections followed a
+  loss audit, the model and dimensions remain unlocked until a frozen
+  independent holdout and unchanged-input repeat pass. Chunk dials remain
+  `chunk_chars=2000`, overlap `200`. See `docs/phase-0-validation.md`.
 - **[phase 1] Master key custody**: file vs. keychain vs. passphrase-unlock
   at portal start (unattended reboot tradeoff), plus the independent
   recovery ceremony.

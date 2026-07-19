@@ -57,6 +57,11 @@ measure provider cold start separately from warmed p50/p95 query latency. Full
 reports stay private/gitignored, while a sanitized aggregate summary lives
 under `docs/` for reproducible public review.
 
+Canonical bakeoffs must identify a clean source revision, retain the evaluated
+binary in the private run directory, evaluate twice against unchanged inputs,
+and pass `prototype/scripts/compare-eval-reports.py`. Retrieval evidence must
+match exactly; latency variance is reported separately.
+
 Only evaluate a model at its native dimension or at truncation dimensions the
 model explicitly documents as supported (for example, Matryoshka embeddings).
 Do not treat arbitrary vector slicing as a valid model configuration. Results
@@ -70,3 +75,8 @@ Assemble larger corpora with `prototype/scripts/assemble-mixed-corpus.sh`
 (copy-only onto `anthonypc:~/distr-hnsw-proto/corpora/…`). Keep the query JSON
 beside the stage tree, not inside it, so prepare does not index labels. Run
 `prototype/scripts/run-bakeoff-anthonypc.sh` for the matrix.
+
+**M0 status:** In progress. The mixed-v4b run on `anthonypc` is promising
+development-set evidence for `nomic-embed-text` @ 512, but an independent
+holdout and an unchanged-input repeat are still required
+(`docs/phase-0-validation.md`). M1 remains gated.

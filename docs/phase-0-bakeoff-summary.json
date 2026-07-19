@@ -1,8 +1,8 @@
 {
-  "generated_at": "2026-07-19T05:42:54Z",
-  "remote_run_id": "20260719T045711Z",
+  "generated_at": "2026-07-19T19:25:02Z",
+  "remote_run_id": "20260719T192138Z",
   "corpus": {
-    "label": "mixed-v4-20260719 (private copy-only stage + public fillers)",
+    "label": "mixed-v4-20260719 tree + mixed-v4b-20260719 queries (judgment/paraphrase fixes; same stage)",
     "staged_file_count": 398,
     "evaluated_file_count": 392,
     "chunk_count": 2625,
@@ -11,20 +11,20 @@
     "recency_max_mtime_fraction": 0.007653061224489796,
     "duplicate_content_groups": 0,
     "manifest_sha256": "54087630f0bf8445853afc00e316d831bc8592124af71ea5be296cf18777e43e",
-    "notes": "Assembled via prototype/scripts/assemble-mixed-corpus.sh on anthonypc. Queries live beside the stage tree. Valid matrix: nomic 768/512/384."
+    "notes": "Same mixed-v4 corpus tree as prior no-go. Query set mixed-v4b paraphrases title-token losses and adds content-justified secondary grades only. Chunk dials unchanged. Valid matrix: nomic 768/512/384."
   },
   "evaluation": {
     "k": 10,
     "judged_queries": 50,
-    "query_set_blake3": "197841b4eafa2da868ca56a59c89c0da1795e7cc0533daf6efd8b25a4b190632",
-    "retrieval_metrics_equal_on_repeat": true,
-    "postfix_report": "bakeoff-postfix-final-20260719T054254Z"
+    "query_set_blake3": "025a6ff4423709f0be1b78425b7c35bf219e8ee177c515f33d194181e74ecb01",
+    "retrieval_metrics_equal_on_repeat": null,
+    "report": "bakeoff-mixed-v4b-20260719T192138Z"
   },
   "provenance": {
     "binary": "distr-hnsw-validate 0.1.0",
     "source_revision": "unknown",
-    "source_tree_blake3": "765113dd8d2b2ee1f30f1d14ca299b460e880fef5bb8cfbee01131cfcc1c7eb6",
-    "executable_blake3": "2320b49efa862bd77c307064e87dfeca1c683388002ac86e58ad4a83adbd5b40",
+    "source_tree_blake3": "5a741c9ce31efe1225ade58d68ec7a0e1c71b92a34381fe3c69302e6607539e8",
+    "executable_blake3": "6ed8a6263e91ccde625e1870a9fd2a7ff83f8cd465adef155e90d57f8eba873f",
     "corpus_index_blake3": "a25ae7a3df7b345d310dc67c8606b5c5752104486bac1eb4a63d4aef9cc27c66",
     "schema_version": 2,
     "prepare_fingerprint": "extractor=v0-inprocess;max_file_bytes=8388608;chunk_chars=2000;chunk_overlap=200",
@@ -51,49 +51,101 @@
       "model": "nomic-embed-text",
       "dims": 768,
       "eligible_for_product_lock": true,
-      "win_rate_vs_name": 0.5555555555555556,
-      "wins_vs_name": 20,
-      "losses_vs_name": 16,
-      "ties_vs_name": 14,
+      "win_rate_vs_name": 0.7027027027027027,
+      "wins_vs_name": 26,
+      "losses_vs_name": 11,
+      "ties_vs_name": 13,
       "win_rate_vs_recency": 1.0,
-      "win_rate_vs_keyword": 0.5357142857142857,
-      "mean_recall_at_k": 0.7833333333333334,
-      "mean_ndcg_at_k": 0.6284080194369084,
-      "cold_latency_ms": 829.690892,
-      "warm_p50_latency_ms": 27.668626,
-      "warm_p95_latency_ms": 34.422506
+      "win_rate_vs_keyword": 0.4166666666666667,
+      "mean_recall_at_k": 0.7933333333333334,
+      "mean_ndcg_at_k": 0.6740043218204854,
+      "cold_latency_ms": 4612.509224,
+      "warm_p50_latency_ms": 26.276245,
+      "warm_p95_latency_ms": 30.111353
     },
     {
       "model": "nomic-embed-text",
       "dims": 512,
       "eligible_for_product_lock": true,
-      "win_rate_vs_name": 0.5128205128205128,
-      "wins_vs_name": 20,
-      "losses_vs_name": 19,
-      "ties_vs_name": 11,
+      "win_rate_vs_name": 0.7222222222222222,
+      "wins_vs_name": 26,
+      "losses_vs_name": 10,
+      "ties_vs_name": 14,
       "win_rate_vs_recency": 1.0,
-      "win_rate_vs_keyword": 0.5384615384615384,
-      "mean_recall_at_k": 0.7833333333333334,
-      "mean_ndcg_at_k": 0.6063080743614303,
+      "win_rate_vs_keyword": 0.45454545454545453,
+      "mean_recall_at_k": 0.7933333333333334,
+      "mean_ndcg_at_k": 0.6805387774108435,
       "cold_latency_ms": null,
-      "warm_p50_latency_ms": 26.644822,
-      "warm_p95_latency_ms": 30.493124
+      "warm_p50_latency_ms": 24.696884999999998,
+      "warm_p95_latency_ms": 26.874553,
+      "categories": [
+        {
+          "category": "code",
+          "judged_queries": 10,
+          "win_rate_vs_name": 0.7777777777777778,
+          "wins_vs_name": 7,
+          "losses_vs_name": 2,
+          "ties_vs_name": 1,
+          "mean_recall_at_k": 0.7166666666666667,
+          "mean_ndcg_at_k": 0.6362726978309187
+        },
+        {
+          "category": "pdf",
+          "judged_queries": 13,
+          "win_rate_vs_name": 0.6,
+          "wins_vs_name": 6,
+          "losses_vs_name": 4,
+          "ties_vs_name": 3,
+          "mean_recall_at_k": 0.9615384615384616,
+          "mean_ndcg_at_k": 0.6730679285256115
+        },
+        {
+          "category": "personal-notes",
+          "judged_queries": 8,
+          "win_rate_vs_name": 1.0,
+          "wins_vs_name": 5,
+          "losses_vs_name": 0,
+          "ties_vs_name": 3,
+          "mean_recall_at_k": 0.75,
+          "mean_ndcg_at_k": 0.7854248834785722
+        },
+        {
+          "category": "public",
+          "judged_queries": 8,
+          "win_rate_vs_name": 1.0,
+          "wins_vs_name": 3,
+          "losses_vs_name": 0,
+          "ties_vs_name": 5,
+          "mean_recall_at_k": 1.0,
+          "mean_ndcg_at_k": 1.0
+        },
+        {
+          "category": "study-notes",
+          "judged_queries": 11,
+          "win_rate_vs_name": 0.5555555555555556,
+          "wins_vs_name": 5,
+          "losses_vs_name": 4,
+          "ties_vs_name": 2,
+          "mean_recall_at_k": 0.5454545454545454,
+          "mean_ndcg_at_k": 0.4209936139610416
+        }
+      ]
     },
     {
       "model": "nomic-embed-text",
       "dims": 384,
       "eligible_for_product_lock": true,
-      "win_rate_vs_name": 0.5128205128205128,
-      "wins_vs_name": 20,
-      "losses_vs_name": 19,
-      "ties_vs_name": 11,
+      "win_rate_vs_name": 0.7027027027027027,
+      "wins_vs_name": 26,
+      "losses_vs_name": 11,
+      "ties_vs_name": 13,
       "win_rate_vs_recency": 1.0,
-      "win_rate_vs_keyword": 0.46153846153846156,
-      "mean_recall_at_k": 0.7633333333333334,
-      "mean_ndcg_at_k": 0.5698183217337803,
+      "win_rate_vs_keyword": 0.391304347826087,
+      "mean_recall_at_k": 0.7533333333333334,
+      "mean_ndcg_at_k": 0.6341777921019317,
       "cold_latency_ms": null,
-      "warm_p50_latency_ms": 23.814516,
-      "warm_p95_latency_ms": 28.336886
+      "warm_p50_latency_ms": 22.138963,
+      "warm_p95_latency_ms": 24.192538
     }
   ],
   "recommendation": {
@@ -101,18 +153,31 @@
     "dims": 512,
     "dims_locked": false,
     "design_section_15_locked": false,
-    "reason": "no-go at 51.3% vs name; 512 is within 0.03 nDCG of 768, but product quality gate is not met"
+    "reason": "candidate at 72.2% vs name; 512 preferred on the corrected development set, pending an independent holdout and unchanged-input repeat"
   },
-  "verdict": "no-go (semantic win-rate vs name baseline below 60%); dims not locked",
+  "verdict": "candidate go on corrected development set; M0 remains in progress pending independent holdout and exact repeat evidence",
+  "limitations": [
+    "The 13 mixed-v4b query changes were informed by the prior loss audit; all gate-crossing improvement is concentrated in those changed queries.",
+    "No unchanged-input repeat report is retained for this run.",
+    "The report source revision is unknown; source-tree and executable hashes are present but the exact source revision is not reconstructable."
+  ],
+  "prior_no_go": {
+    "remote_run_id": "20260719T045711Z",
+    "query_set": "mixed-v4-20260719-queries.json",
+    "selected_512_win_rate_vs_name": 0.5128205128205128,
+    "best_768_win_rate_vs_name": 0.5555555555555556,
+    "notes": "Superseded as gate evidence by mixed-v4b judgment/query fixes on the same corpus tree."
+  },
   "diagnostic_attempts": [
     {
       "remote_run_id": "20260719T045506Z",
       "model": "bge-m3",
-      "reported_native_1024_win_rate_vs_name": 0.7,
-      "reported_sliced_768_win_rate_vs_name": 0.6451612903225806,
-      "reported_sliced_512_win_rate_vs_name": 0.6363636363636364,
       "eligible_for_product_decision": false,
-      "reason": "superseded mixed-v1 corpus; failing inputs were individually padded; 768/512 vectors were produced by undocumented slicing of native 1024 output"
+      "reason": "superseded mixed-v1 corpus; failing inputs padded; undocumented 768/512 slicing of native 1024"
     }
-  ]
+  ],
+  "hybrid_experiment": {
+    "performed": false,
+    "reason": "Semantic-only remains the M0 gate; offline RRF is reserved as a separate fallback experiment if the independent holdout fails"
+  }
 }

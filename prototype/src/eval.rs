@@ -400,6 +400,13 @@ fn corpus_index_blake3(db: &Db) -> Result<String> {
 }
 
 fn git_head_revision() -> String {
+    if let Some(revision) = option_env!("DISTR_HNSW_SOURCE_REVISION")
+        .map(str::trim)
+        .filter(|revision| !revision.is_empty() && *revision != "unknown")
+    {
+        return revision.to_string();
+    }
+
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_dir = manifest_dir.parent().unwrap_or(&manifest_dir);
     let head = std::process::Command::new("git")
