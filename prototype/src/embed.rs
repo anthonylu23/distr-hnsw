@@ -286,4 +286,25 @@ mod tests {
         });
         assert_eq!(cands[0].0, 2);
     }
+
+    #[test]
+    fn prefixes_are_nomic_only() {
+        assert_eq!(
+            document_prefix("nomic-embed-text"),
+            Some("search_document: ")
+        );
+        assert_eq!(query_prefix("nomic-embed-text"), Some("search_query: "));
+        assert_eq!(
+            document_prefix("nomic-embed-text:latest"),
+            Some("search_document: ")
+        );
+        assert_eq!(
+            query_prefix("nomic-embed-text:latest"),
+            Some("search_query: ")
+        );
+        assert_eq!(document_prefix("bge-m3"), None);
+        assert_eq!(query_prefix("bge-m3"), None);
+        assert_eq!(document_prefix("bge-m3:latest"), None);
+        assert_eq!(query_prefix("bge-m3:latest"), None);
+    }
 }

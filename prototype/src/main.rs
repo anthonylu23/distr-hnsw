@@ -12,11 +12,43 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::config::{parse_model_dims, Cli, Command};
 use crate::db::Db;
 use crate::embed::EmbedClient;
+
+type EmbedBatchResult = Result<(Vec<i64>, Vec<Vec<f32>>)>;
+
+fn spawn_embed_batch(
+    join_set: &mut JoinSet<EmbedBatchResult>,
+    client: Arc<EmbedClient>,
+    model: Arc<String>,
+    prefix: Option<&'static str>,
+    batch: Vec<(i64, String)>,
+) {
+    join_set.spawn(async move {
+        let batch_context = batch
+            .iter()
+            .map(|(id, text)| format!("{id}({} chars)", text.chars().count()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let texts: Vec<&str> = batch.iter().map(|(_, text)| text.as_str()).collect();
+        let vectors = client
+            .embed_batch_with_prefix(model.as_str(), &texts, prefix)
+            .await
+            .with_context(|| format!("embed chunk batch [{batch_context}]"))?;
+        if vectors.len() != batch.len() {
+            anyhow::bail!(
+                "embedding count mismatch for chunk batch [{batch_context}]: got {} want {}",
+                vectors.len(),
+                batch.len()
+            );
+        }
+        let ids = batch.iter().map(|(id, _)| *id).collect();
+        Ok((ids, vectors))
+    });
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -131,7 +163,14 @@ async fn run_embed(
         );
     }
 
-    let chunks = db.chunks_needing_embed(model, dims, force)?;
+    if force {
+        let deleted = db.delete_embeddings_for_config(model, dims)?;
+        if deleted > 0 {
+            println!("cleared {deleted} existing vectors for model={model} dims={dims}");
+        }
+    }
+
+    let chunks = db.chunks_needing_embed(model, dims, false)?;
     println!(
         "embedding {} chunks with model={} dims={} digest={} concurrency={} batch_size={}",
         chunks.len(),
@@ -145,6 +184,11 @@ async fn run_embed(
         println!("nothing to do");
         return Ok(());
     }
+
+    // Persist provider identity before the first vector so an interrupted run
+    // can safely resume. Forced reruns cleared the old configuration above,
+    // preventing a failed rebuild from leaving mixed-provider vectors.
+    db.upsert_embedding_config(model, dims, &provider_digest)?;
 
     let concurrency = concurrency.max(1);
     let batch_size = batch_size.max(1);
@@ -163,29 +207,20 @@ async fn run_embed(
     let client = Arc::new(client.clone());
     let model_owned = Arc::new(model.to_string());
     let prefix = embed::document_prefix(model);
-    let sem = Arc::new(Semaphore::new(concurrency));
-    let mut join_set = tokio::task::JoinSet::new();
+    let mut batches = batches.into_iter();
+    let mut join_set = JoinSet::new();
 
-    for batch in batches {
-        let permit = sem.clone().acquire_owned().await.expect("semaphore");
-        let client = Arc::clone(&client);
-        let model_owned = Arc::clone(&model_owned);
-        join_set.spawn(async move {
-            let _permit = permit;
-            let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
-            let vectors = client
-                .embed_batch_with_prefix(model_owned.as_str(), &texts, prefix)
-                .await?;
-            if vectors.len() != batch.len() {
-                anyhow::bail!(
-                    "embedding count mismatch: got {} want {}",
-                    vectors.len(),
-                    batch.len()
-                );
-            }
-            let ids: Vec<i64> = batch.iter().map(|(id, _)| *id).collect();
-            Ok::<_, anyhow::Error>((ids, vectors))
-        });
+    for _ in 0..concurrency {
+        let Some(batch) = batches.next() else {
+            break;
+        };
+        spawn_embed_batch(
+            &mut join_set,
+            Arc::clone(&client),
+            Arc::clone(&model_owned),
+            prefix,
+            batch,
+        );
     }
 
     let mut done = 0usize;
@@ -199,6 +234,16 @@ async fn run_embed(
         }
         done += n;
         println!("embedded {done}/{total}");
+
+        if let Some(batch) = batches.next() {
+            spawn_embed_batch(
+                &mut join_set,
+                Arc::clone(&client),
+                Arc::clone(&model_owned),
+                prefix,
+                batch,
+            );
+        }
     }
 
     db.upsert_embedding_config(model, dims, &provider_digest)?;

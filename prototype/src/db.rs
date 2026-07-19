@@ -420,6 +420,13 @@ impl Db {
         Ok(())
     }
 
+    pub fn delete_embeddings_for_config(&self, model: &str, dims: usize) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM embeddings WHERE model = ?1 AND dims = ?2",
+            params![model, dims as i64],
+        )?)
+    }
+
     pub fn upsert_embedding_config(
         &self,
         model: &str,
@@ -527,5 +534,32 @@ mod tests {
                 .as_deref(),
             Some("digest-b")
         );
+    }
+
+    #[test]
+    fn deleting_one_embedding_config_preserves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        let file_id = db
+            .upsert_file(
+                "/corpus/note.md",
+                "note.md",
+                0,
+                1,
+                "hash",
+                "extracted",
+                Some("text"),
+                None,
+            )
+            .unwrap();
+        let chunk_id = db.insert_chunk(file_id, 0, "text", 0, 4).unwrap();
+        db.upsert_embedding(chunk_id, "model-a", 512, &[1, 2, 3, 4])
+            .unwrap();
+        db.upsert_embedding(chunk_id, "model-a", 768, &[5, 6, 7, 8])
+            .unwrap();
+
+        assert_eq!(db.delete_embeddings_for_config("model-a", 512).unwrap(), 1);
+        assert_eq!(db.count_embeddings("model-a", 512).unwrap(), 0);
+        assert_eq!(db.count_embeddings("model-a", 768).unwrap(), 1);
     }
 }
