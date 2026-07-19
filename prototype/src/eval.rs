@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -7,18 +7,21 @@ use serde::Deserialize;
 use crate::db::Db;
 use crate::embed::EmbedClient;
 use crate::report::{
-    self, BaselineWlt, ConfigMetrics, ModelProvenance, Provenance, QueryBreakdown, Report,
-    SideBySide,
+    self, BaselineWlt, CategoryMetrics, ConfigMetrics, ModelProvenance, Provenance, QueryBreakdown,
+    Report, SideBySide,
 };
 use crate::search::{self, RankedFile};
 
 const MIN_QUERIES_TO_LOCK_DIMS: u32 = 40;
 const DIM_NDCG_EPS: f64 = 0.03;
+const MAX_PRODUCT_DIMS: usize = 768;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuerySpec {
     pub id: String,
     pub text: String,
+    #[serde(default = "default_category")]
+    pub category: String,
     #[serde(default)]
     pub relevant_file_ids: Vec<i64>,
     #[serde(default)]
@@ -26,6 +29,10 @@ pub struct QuerySpec {
     /// Optional graded relevance: path or file id string -> grade 1..=2 (or higher)
     #[serde(default)]
     pub grades: HashMap<String, u32>,
+}
+
+fn default_category() -> String {
+    "uncategorized".into()
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +75,39 @@ impl WltAccum {
     }
 }
 
+#[derive(Debug, Default)]
+struct CategoryAccum {
+    judged: u32,
+    vs_name: WltAccum,
+    vs_recency: WltAccum,
+    vs_keyword: WltAccum,
+    recall_sum: f64,
+    ndcg_sum: f64,
+}
+
+impl CategoryAccum {
+    fn into_metrics(self, category: String) -> CategoryMetrics {
+        let judged = self.judged;
+        CategoryMetrics {
+            category,
+            judged_queries: judged,
+            vs_name: self.vs_name.into_metrics(),
+            vs_recency: self.vs_recency.into_metrics(),
+            vs_keyword: self.vs_keyword.into_metrics(),
+            mean_recall_at_k: if judged == 0 {
+                0.0
+            } else {
+                self.recall_sum / judged as f64
+            },
+            mean_ndcg_at_k: if judged == 0 {
+                0.0
+            } else {
+                self.ndcg_sum / judged as f64
+            },
+        }
+    }
+}
+
 pub fn load_queries(path: &Path) -> Result<Vec<QuerySpec>> {
     let data = std::fs::read_to_string(path)
         .with_context(|| format!("read queries {}", path.display()))?;
@@ -100,6 +140,7 @@ pub async fn run_eval(
         queries: Vec::new(),
         recommendation: String::new(),
         go_no_go: String::new(),
+        dims_locked: false,
     };
     // Ollama can produce a different first-session ranking immediately after a
     // model reload. Run one complete, unreported sweep across every config and
@@ -125,6 +166,7 @@ pub async fn run_eval(
         let mut ndcg_sum = 0f64;
         let mut judged = 0u32;
         let mut latencies = Vec::new();
+        let mut category_accums: BTreeMap<String, CategoryAccum> = BTreeMap::new();
 
         let cold_latency_ms = if cold_reported_models.insert(model.clone()) {
             cold_latency_by_model.get(model).copied()
@@ -150,16 +192,31 @@ pub async fn run_eval(
             if !relevant.ids.is_empty() {
                 judged += 1;
                 let sem_hit = first_hit_rank(&sem_ids, &relevant.ids);
-                vs_name.record(sem_hit, first_hit_rank(&name_ids, &relevant.ids));
-                vs_recency.record(sem_hit, first_hit_rank(&recency_ids, &relevant.ids));
-                vs_keyword.record(sem_hit, first_hit_rank(&keyword_ids, &relevant.ids));
-                recall_sum += recall_at_k(&sem_ids, &relevant.ids, k);
-                ndcg_sum += ndcg_at_k(&sem_ids, &relevant.grades, k);
+                let name_hit = first_hit_rank(&name_ids, &relevant.ids);
+                let recency_hit = first_hit_rank(&recency_ids, &relevant.ids);
+                let keyword_hit = first_hit_rank(&keyword_ids, &relevant.ids);
+                let recall = recall_at_k(&sem_ids, &relevant.ids, k);
+                let ndcg = ndcg_at_k(&sem_ids, &relevant.grades, k);
+                vs_name.record(sem_hit, name_hit);
+                vs_recency.record(sem_hit, recency_hit);
+                vs_keyword.record(sem_hit, keyword_hit);
+                recall_sum += recall;
+                ndcg_sum += ndcg;
+
+                let category = normalized_category(&q.category);
+                let category_accum = category_accums.entry(category).or_default();
+                category_accum.judged += 1;
+                category_accum.vs_name.record(sem_hit, name_hit);
+                category_accum.vs_recency.record(sem_hit, recency_hit);
+                category_accum.vs_keyword.record(sem_hit, keyword_hit);
+                category_accum.recall_sum += recall;
+                category_accum.ndcg_sum += ndcg;
             }
 
             report.queries.push(QueryBreakdown {
                 query_id: q.id.clone(),
                 query_text: q.text.clone(),
+                category: normalized_category(&q.category),
                 model: model.clone(),
                 dims: *dims,
                 semantic: side_by_side(&semantic),
@@ -225,13 +282,27 @@ pub async fn run_eval(
             cold_latency_ms,
             warm_p50_latency_ms,
             warm_p95_latency_ms,
+            categories: category_accums
+                .into_iter()
+                .map(|(category, accum)| accum.into_metrics(category))
+                .collect(),
         });
     }
 
-    let (rec, go) = recommend(&report.configs);
+    let (rec, go, dims_locked) = recommend(&report.configs);
     report.recommendation = rec;
     report.go_no_go = go;
+    report.dims_locked = dims_locked;
     Ok(report)
+}
+
+fn normalized_category(category: &str) -> String {
+    let category = category.trim();
+    if category.is_empty() {
+        default_category()
+    } else {
+        category.to_string()
+    }
 }
 
 fn side_by_side(rows: &[RankedFile]) -> Vec<SideBySide> {
@@ -287,12 +358,45 @@ async fn build_provenance(
         source_revision: git_head_revision(),
         source_tree_blake3: source_tree_blake3().ok(),
         executable_blake3: executable_blake3().ok(),
+        corpus_index_blake3: corpus_index_blake3(db)?,
         prepare_fingerprint: db.get_meta("prepare_fingerprint")?,
         prepared_at: db.get_meta("prepared_at")?,
         query_set_path: queries_path.display().to_string(),
         query_set_blake3,
         models: model_prov,
     })
+}
+
+fn corpus_index_blake3(db: &Db) -> Result<String> {
+    let corpus_root = db.get_meta("corpus_root")?.unwrap_or_default();
+    let root = Path::new(&corpus_root);
+    let mut stmt = db.conn.prepare(
+        "SELECT path, content_hash, extract_status, mtime, size FROM files ORDER BY path",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    for row in rows {
+        let (path, content_hash, extract_status, mtime, size) = row?;
+        let path = Path::new(&path);
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        hasher.update(relative.to_string_lossy().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(content_hash.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(extract_status.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&mtime.to_le_bytes());
+        hasher.update(&size.to_le_bytes());
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn git_head_revision() -> String {
@@ -388,25 +492,45 @@ fn resolve_relevant(db: &Db, q: &QuerySpec) -> Result<Relevant> {
         if let Ok(id) = key.parse::<i64>() {
             grades.insert(id, *grade);
             ids.insert(id);
-        } else if let Some(file) = db.file_by_path(key)? {
+        } else if Path::new(key).is_absolute() {
+            let file = db
+                .file_by_path(key)?
+                .with_context(|| format!("grade path does not exist for query {}: {key}", q.id))?;
             grades.insert(file.id, *grade);
             ids.insert(file.id);
         } else {
-            let mut stmt = db.conn.prepare("SELECT id FROM files WHERE path LIKE ?1")?;
-            let rows = stmt.query_map(rusqlite::params![format!("%{key}%")], |row| {
-                row.get::<_, i64>(0)
+            let mut stmt = db.conn.prepare("SELECT id, path FROM files ORDER BY id")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })?;
+            let mut matched = 0usize;
             for r in rows {
-                let id = r?;
-                grades.insert(id, *grade);
-                ids.insert(id);
+                let (id, path) = r?;
+                if ids.contains(&id) && grade_selector_matches(key, &path) {
+                    grades.insert(id, *grade);
+                    matched += 1;
+                }
             }
+            anyhow::ensure!(
+                matched > 0,
+                "grade selector matched no declared relevant files for query {}: {key}",
+                q.id
+            );
         }
     }
     for id in &ids {
         grades.entry(*id).or_insert(1);
     }
     Ok(Relevant { ids, grades })
+}
+
+fn grade_selector_matches(selector: &str, path: &str) -> bool {
+    let selector = selector.to_ascii_lowercase();
+    let path = path.to_ascii_lowercase();
+    path == selector
+        || path.ends_with(&format!("/{selector}"))
+        || path.contains(&format!("/{selector}/"))
+        || Path::new(&path).file_stem().and_then(|stem| stem.to_str()) == Some(selector.as_str())
 }
 
 fn glob_to_like(glob: &str) -> String {
@@ -467,36 +591,58 @@ pub fn ndcg_at_k(ranked: &[i64], grades: &HashMap<i64, u32>, k: usize) -> f64 {
     }
 }
 
-fn recommend(configs: &[ConfigMetrics]) -> (String, String) {
+fn recommend(configs: &[ConfigMetrics]) -> (String, String, bool) {
     if configs.is_empty() {
-        return ("No configs evaluated.".into(), "no-go (no configs)".into());
+        return (
+            "No configs evaluated.".into(),
+            "no-go (no configs); dims not locked".into(),
+            false,
+        );
     }
-    let mut best = configs[0].clone();
-    for c in configs.iter().skip(1) {
-        let better = c.mean_ndcg_at_k > best.mean_ndcg_at_k + 1e-9
-            || ((c.mean_ndcg_at_k - best.mean_ndcg_at_k).abs() < 1e-9
-                && c.win_rate_vs_name > best.win_rate_vs_name)
-            || ((c.mean_ndcg_at_k - best.mean_ndcg_at_k).abs() < 1e-9
-                && (c.win_rate_vs_name - best.win_rate_vs_name).abs() < 1e-9
-                && c.dims < best.dims);
+    // Configurations above the product cap are useful diagnostics, but cannot
+    // choose a model, influence dimensionality confidence, or produce a go.
+    let eligible: Vec<&ConfigMetrics> = configs
+        .iter()
+        .filter(|config| config.dims <= MAX_PRODUCT_DIMS)
+        .collect();
+    let Some(mut best) = eligible.first().copied() else {
+        return (
+            "No eligible configs at or below 768 dimensions; oversized configs are diagnostic only."
+                .into(),
+            "no-go (no configs satisfy product dimension cap); dims not locked".into(),
+            false,
+        );
+    };
+    for candidate in eligible.iter().copied().skip(1) {
+        let better = candidate.mean_ndcg_at_k > best.mean_ndcg_at_k + 1e-9
+            || ((candidate.mean_ndcg_at_k - best.mean_ndcg_at_k).abs() < 1e-9
+                && candidate.win_rate_vs_name > best.win_rate_vs_name)
+            || ((candidate.mean_ndcg_at_k - best.mean_ndcg_at_k).abs() < 1e-9
+                && (candidate.win_rate_vs_name - best.win_rate_vs_name).abs() < 1e-9
+                && candidate.dims < best.dims);
         if better {
-            best = c.clone();
+            best = candidate;
         }
     }
 
-    // Prefer 512 when within 0.03 nDCG of the best result for the same model.
-    let mut chosen = best.clone();
-    if let Some(c512) = configs
+    // Prefer 512 when it is within 0.03 nDCG of the best eligible result for
+    // the selected model.
+    let mut chosen = best;
+    if let Some(c512) = eligible
         .iter()
-        .find(|c| c.model == best.model && c.dims == 512)
+        .copied()
+        .find(|config| config.model == best.model && config.dims == 512)
     {
         if best.mean_ndcg_at_k - c512.mean_ndcg_at_k <= DIM_NDCG_EPS {
-            chosen = c512.clone();
+            chosen = c512;
         }
     }
 
-    let model_dims: Vec<&ConfigMetrics> =
-        configs.iter().filter(|c| c.model == chosen.model).collect();
+    let model_dims: Vec<&ConfigMetrics> = eligible
+        .iter()
+        .copied()
+        .filter(|config| config.model == chosen.model)
+        .collect();
     let (min_ndcg, max_ndcg) = model_dims
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), c| {
@@ -528,20 +674,33 @@ fn recommend(configs: &[ConfigMetrics]) -> (String, String) {
     }
 
     let decided = chosen.wins_vs_name + chosen.losses_vs_name;
-    let mut go = if chosen.judged_queries == 0 {
-        "no-go (no judged queries; add relevance labels)".to_string()
+    let (mut go, is_go) = if chosen.judged_queries == 0 {
+        (
+            "no-go (no judged queries; add relevance labels)".to_string(),
+            false,
+        )
     } else if decided == 0 && chosen.mean_ndcg_at_k >= 0.9 {
-        "go (inconclusive vs name: all ties; strong nDCG)".to_string()
+        (
+            "go (inconclusive vs name: all ties; strong nDCG)".to_string(),
+            true,
+        )
     } else if chosen.win_rate_vs_name >= 0.60 {
-        "go".to_string()
+        ("go".to_string(), true)
     } else {
-        "no-go (semantic win-rate vs name baseline below 60%)".to_string()
+        (
+            "no-go (semantic win-rate vs name baseline below 60%)".to_string(),
+            false,
+        )
     };
-    if dims_inconclusive {
+    let dims_locked = is_go && !dims_inconclusive;
+    if !is_go && !dims_inconclusive {
+        rec.push_str(". product no-go — do not lock dims");
+    }
+    if !dims_locked {
         go.push_str("; dims not locked");
     }
 
-    (rec, go)
+    (rec, go, dims_locked)
 }
 
 pub fn write_reports(
@@ -582,6 +741,7 @@ mod tests {
             cold_latency_ms: None,
             warm_p50_latency_ms: 9.0,
             warm_p95_latency_ms: 12.0,
+            categories: Vec::new(),
         }
     }
 
@@ -612,17 +772,232 @@ mod tests {
             cfg("nomic-embed-text", 512, 0.685, 0.3, 10),
             cfg("nomic-embed-text", 384, 0.693, 0.3, 10),
         ];
-        let (rec, go) = recommend(&configs);
+        let (rec, go, locked) = recommend(&configs);
         assert!(rec.contains("dims=512"), "expected prefer 512, got: {rec}");
         assert!(rec.contains("dims inconclusive"));
         assert!(go.contains("dims not locked"));
+        assert!(!locked);
     }
 
     #[test]
     fn low_query_count_marks_dims_inconclusive() {
         let configs = vec![cfg("nomic-embed-text", 768, 0.9, 0.7, 10)];
-        let (rec, go) = recommend(&configs);
+        let (rec, go, locked) = recommend(&configs);
         assert!(rec.contains("dims inconclusive"));
         assert!(go.contains("dims not locked"));
+        assert!(!locked);
+    }
+
+    #[test]
+    fn no_go_prevents_lock_even_when_dims_are_distinguishable() {
+        let configs = vec![
+            cfg("nomic-embed-text", 768, 0.90, 0.5, 50),
+            cfg("nomic-embed-text", 512, 0.80, 0.5, 50),
+        ];
+        let (rec, go, locked) = recommend(&configs);
+        assert!(rec.contains("product no-go — do not lock dims"));
+        assert!(go.ends_with("; dims not locked"));
+        assert!(!locked);
+    }
+
+    #[test]
+    fn strong_all_ties_go_can_lock_distinguishable_dims() {
+        let mut configs = vec![
+            cfg("nomic-embed-text", 768, 0.95, 0.0, 50),
+            cfg("nomic-embed-text", 512, 0.80, 0.0, 50),
+        ];
+        for config in &mut configs {
+            config.wins_vs_name = 0;
+            config.losses_vs_name = 0;
+            config.ties_vs_name = 50;
+            config.vs_name = BaselineWlt {
+                wins: 0,
+                losses: 0,
+                ties: 50,
+                win_rate: 0.0,
+            };
+        }
+        let (rec, go, locked) = recommend(&configs);
+        assert!(rec.contains("dims=768"), "got: {rec}");
+        assert!(go.starts_with("go (inconclusive vs name"), "got: {go}");
+        assert!(locked);
+    }
+
+    #[test]
+    fn selects_best_eligible_config_across_models() {
+        let configs = vec![
+            cfg("bge-m3", 1024, 0.95, 0.9, 50),
+            cfg("bge-m3", 768, 0.60, 0.3, 50),
+            cfg("nomic-embed-text", 768, 0.80, 0.7, 50),
+        ];
+        let (rec, go, locked) = recommend(&configs);
+        assert!(
+            rec.contains("model=`nomic-embed-text` dims=768"),
+            "expected globally best eligible config, got: {rec}"
+        );
+        assert!(go.starts_with("go"));
+        assert!(!locked, "one eligible dimension is not enough to lock dims");
+    }
+
+    #[test]
+    fn oversize_config_does_not_make_eligible_dim_spread_conclusive() {
+        let configs = vec![
+            cfg("bge-m3", 1024, 0.95, 0.7, 50),
+            cfg("bge-m3", 768, 0.80, 0.7, 50),
+            cfg("bge-m3", 512, 0.79, 0.7, 50),
+        ];
+        let (rec, go, locked) = recommend(&configs);
+        assert!(rec.contains("dims=512"), "got: {rec}");
+        assert!(rec.contains("dims inconclusive"), "got: {rec}");
+        assert!(rec.contains("nDCG spread across dims=0.010"), "got: {rec}");
+        assert!(go.starts_with("go"));
+        assert!(go.contains("dims not locked"));
+        assert!(!locked);
+    }
+
+    #[test]
+    fn oversize_only_matrix_is_an_explicit_no_go() {
+        let configs = vec![cfg("bge-m3", 1024, 0.95, 0.9, 50)];
+        let (rec, go, locked) = recommend(&configs);
+        assert_eq!(
+            rec,
+            "No eligible configs at or below 768 dimensions; oversized configs are diagnostic only."
+        );
+        assert_eq!(
+            go,
+            "no-go (no configs satisfy product dimension cap); dims not locked"
+        );
+        assert!(!locked);
+    }
+
+    #[test]
+    fn relative_grade_selector_only_grades_declared_relevance() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        let intended = db
+            .upsert_file(
+                "/corpus/a/lecture.pdf",
+                "lecture.pdf",
+                0,
+                1,
+                "hash-a",
+                "extracted",
+                Some("a"),
+                None,
+            )
+            .unwrap();
+        let unintended = db
+            .upsert_file(
+                "/corpus/b/lecture.pdf",
+                "lecture.pdf",
+                0,
+                1,
+                "hash-b",
+                "extracted",
+                Some("b"),
+                None,
+            )
+            .unwrap();
+        let query = QuerySpec {
+            id: "q".into(),
+            text: "lecture".into(),
+            category: "pdf".into(),
+            relevant_file_ids: vec![intended],
+            relevant_path_globs: Vec::new(),
+            grades: HashMap::from([("lecture.pdf".into(), 2)]),
+        };
+        let relevant = resolve_relevant(&db, &query).unwrap();
+        assert_eq!(relevant.ids, HashSet::from([intended]));
+        assert_eq!(relevant.grades, HashMap::from([(intended, 2)]));
+        assert!(!relevant.ids.contains(&unintended));
+    }
+
+    #[test]
+    fn unmatched_relative_grade_selector_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        let intended = db
+            .upsert_file(
+                "/corpus/a/lecture.pdf",
+                "lecture.pdf",
+                0,
+                1,
+                "hash-a",
+                "extracted",
+                Some("a"),
+                None,
+            )
+            .unwrap();
+        let query = QuerySpec {
+            id: "q".into(),
+            text: "lecture".into(),
+            category: default_category(),
+            relevant_file_ids: vec![intended],
+            relevant_path_globs: Vec::new(),
+            grades: HashMap::from([("missing.pdf".into(), 2)]),
+        };
+        let error = resolve_relevant(&db, &query).unwrap_err();
+        assert!(error.to_string().contains("matched no declared relevant"));
+    }
+
+    #[test]
+    fn filename_stem_grade_selector_grades_declared_relevance() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        let intended = db
+            .upsert_file(
+                "/corpus/notes/01-Pointers.md",
+                "01-Pointers.md",
+                0,
+                1,
+                "hash-a",
+                "extracted",
+                Some("a"),
+                None,
+            )
+            .unwrap();
+        let query = QuerySpec {
+            id: "q".into(),
+            text: "pointers".into(),
+            category: "study-notes".into(),
+            relevant_file_ids: vec![intended],
+            relevant_path_globs: Vec::new(),
+            grades: HashMap::from([("01-pointers".into(), 2)]),
+        };
+        let relevant = resolve_relevant(&db, &query).unwrap();
+        assert_eq!(relevant.ids, HashSet::from([intended]));
+        assert_eq!(relevant.grades, HashMap::from([(intended, 2)]));
+    }
+
+    #[test]
+    fn corpus_index_hash_captures_recency_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.set_meta("corpus_root", "/corpus").unwrap();
+        db.upsert_file(
+            "/corpus/note.md",
+            "note.md",
+            1,
+            10,
+            "same-content",
+            "extracted",
+            Some("same text"),
+            None,
+        )
+        .unwrap();
+        let before = corpus_index_blake3(&db).unwrap();
+        db.upsert_file(
+            "/corpus/note.md",
+            "note.md",
+            2,
+            10,
+            "same-content",
+            "extracted",
+            Some("same text"),
+            None,
+        )
+        .unwrap();
+        let after = corpus_index_blake3(&db).unwrap();
+        assert_ne!(before, after);
     }
 }

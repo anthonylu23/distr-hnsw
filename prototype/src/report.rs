@@ -16,6 +16,7 @@ pub struct SideBySide {
 pub struct QueryBreakdown {
     pub query_id: String,
     pub query_text: String,
+    pub category: String,
     pub model: String,
     pub dims: usize,
     pub semantic: Vec<SideBySide>,
@@ -24,6 +25,17 @@ pub struct QueryBreakdown {
     pub keyword_text: Vec<SideBySide>,
     pub semantic_recall_at_k: Option<f64>,
     pub semantic_ndcg_at_k: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CategoryMetrics {
+    pub category: String,
+    pub judged_queries: u32,
+    pub vs_name: BaselineWlt,
+    pub vs_recency: BaselineWlt,
+    pub vs_keyword: BaselineWlt,
+    pub mean_recall_at_k: f64,
+    pub mean_ndcg_at_k: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +69,7 @@ pub struct ConfigMetrics {
     pub cold_latency_ms: Option<f64>,
     pub warm_p50_latency_ms: f64,
     pub warm_p95_latency_ms: f64,
+    pub categories: Vec<CategoryMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,6 +88,7 @@ pub struct Provenance {
     pub source_revision: String,
     pub source_tree_blake3: Option<String>,
     pub executable_blake3: Option<String>,
+    pub corpus_index_blake3: String,
     pub prepare_fingerprint: Option<String>,
     pub prepared_at: Option<String>,
     pub query_set_path: String,
@@ -97,6 +111,7 @@ pub struct Report {
     pub queries: Vec<QueryBreakdown>,
     pub recommendation: String,
     pub go_no_go: String,
+    pub dims_locked: bool,
 }
 
 pub fn write_reports(work_dir: &Path, stem: &str, report: &Report) -> Result<(PathBuf, PathBuf)> {
@@ -154,6 +169,10 @@ pub fn render_markdown(report: &Report) -> String {
             .executable_blake3
             .as_deref()
             .unwrap_or("(unavailable)")
+    ));
+    out.push_str(&format!(
+        "- Corpus index blake3: `{}`\n",
+        report.provenance.corpus_index_blake3
     ));
     out.push_str(&format!(
         "- Prepare fingerprint: `{}`\n",
@@ -225,11 +244,43 @@ pub fn render_markdown(report: &Report) -> String {
     }
     out.push('\n');
 
+    out.push_str("## Category summary\n\n");
+    out.push_str(
+        "| model | dims | category | judged | vs name | vs recency | vs keyword | mean recall | mean nDCG |\n",
+    );
+    out.push_str("|---|---:|---|---:|---:|---:|---:|---:|---:|\n");
+    for c in &report.configs {
+        for category in &c.categories {
+            out.push_str(&format!(
+                "| `{}` | {} | `{}` | {} | {:.1}% ({}/{}/{}) | {:.1}% ({}/{}/{}) | {:.1}% ({}/{}/{}) | {:.3} | {:.3} |\n",
+                c.model,
+                c.dims,
+                category.category,
+                category.judged_queries,
+                category.vs_name.win_rate * 100.0,
+                category.vs_name.wins,
+                category.vs_name.losses,
+                category.vs_name.ties,
+                category.vs_recency.win_rate * 100.0,
+                category.vs_recency.wins,
+                category.vs_recency.losses,
+                category.vs_recency.ties,
+                category.vs_keyword.win_rate * 100.0,
+                category.vs_keyword.wins,
+                category.vs_keyword.losses,
+                category.vs_keyword.ties,
+                category.mean_recall_at_k,
+                category.mean_ndcg_at_k,
+            ));
+        }
+    }
+    out.push('\n');
+
     out.push_str("## Per-query side-by-side\n\n");
     for q in &report.queries {
         out.push_str(&format!(
-            "### {} — `{}` @ {}d\n\nQuery: {}\n\n",
-            q.query_id, q.model, q.dims, q.query_text
+            "### {} — `{}` @ {}d\n\nCategory: `{}`  \nQuery: {}\n\n",
+            q.query_id, q.model, q.dims, q.category, q.query_text
         ));
         if let Some(r) = q.semantic_recall_at_k {
             out.push_str(&format!("Recall@{}: {:.3}  \n", report.k, r));
