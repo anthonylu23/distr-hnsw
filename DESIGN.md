@@ -902,7 +902,12 @@ Each question is tagged with the phase (§14) that must resolve it.
 
 - **[phase 0] Default local embedding model and dimensionality** for the
   file collections (≤768 dims per §6.5) — chosen empirically by the
-  validation prototype, not during phase 5.
+  validation prototype, not during phase 5. Current valid evidence (mixed-v4,
+  2026-07-19) is a no-go: the rule-selected `nomic-embed-text` 512d config
+  wins 51.3% of decided comparisons against filename search, while the best
+  observed 768d config wins 55.6%; neither clears the 60% gate. Dimensions
+  remain unlocked and phase 1 stays blocked; see
+  `docs/phase-0-validation.md`.
 - **[phase 1] Master key custody**: file vs. keychain vs. passphrase-unlock
   at portal start (unattended reboot tradeoff), plus the independent
   recovery ceremony.

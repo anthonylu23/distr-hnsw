@@ -40,6 +40,7 @@ vector search. The full design is in `DESIGN.md`.
 - `DESIGN.md` — product and architecture specification.
 - `AGENTS.md` / `CLAUDE.md` — repository guidance.
 - `docs/` — living documentation (phase status, next steps).
+- `docs/roadmap.md` — gated milestones, acceptance criteria, and verification.
 - `prototype/` — **disposable** phase-0 validation CLI (`distr-hnsw-validate`).
   Not product code; do not grow it into the distributed service. See
   `docs/phase-0-validation.md`.
@@ -53,5 +54,19 @@ Phase-0 bakeoffs use a fresh run-scoped work directory. Persist the Ollama
 digest when embeddings are written and refuse evaluation if the query model no
 longer matches. Reports must include query, source-tree, and executable hashes;
 measure provider cold start separately from warmed p50/p95 query latency. Full
-vault reports stay private/gitignored, while a sanitized aggregate summary lives
+reports stay private/gitignored, while a sanitized aggregate summary lives
 under `docs/` for reproducible public review.
+
+Only evaluate a model at its native dimension or at truncation dimensions the
+model explicitly documents as supported (for example, Matryoshka embeddings).
+Do not treat arbitrary vector slicing as a valid model configuration. Results
+above the DESIGN product cap are diagnostic only: they cannot choose the
+default model, affect dimension-lock confidence, or produce a go verdict.
+Do not mask provider failures by silently padding or rewriting individual
+inputs; any text normalization must be an explicit, corpus-wide experiment so
+results remain comparable.
+
+Assemble larger corpora with `prototype/scripts/assemble-mixed-corpus.sh`
+(copy-only onto `anthonypc:~/distr-hnsw-proto/corpora/…`). Keep the query JSON
+beside the stage tree, not inside it, so prepare does not index labels. Run
+`prototype/scripts/run-bakeoff-anthonypc.sh` for the matrix.

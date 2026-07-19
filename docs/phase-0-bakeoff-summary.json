@@ -1,71 +1,118 @@
 {
-  "generated_at": "2026-07-18T21:59:05.724496048+00:00",
-  "remote_run_id": "20260718T215901Z",
+  "generated_at": "2026-07-19T05:42:54Z",
+  "remote_run_id": "20260719T045711Z",
   "corpus": {
-    "label": "private Obsidian vault",
-    "file_count": 14,
-    "chunk_count": 27,
-    "embedding_count": 81,
-    "recency_at_max_mtime": 5,
-    "recency_max_mtime_fraction": 0.35714285714285715
+    "label": "mixed-v4-20260719 (private copy-only stage + public fillers)",
+    "staged_file_count": 398,
+    "evaluated_file_count": 392,
+    "chunk_count": 2625,
+    "embedding_count": 7875,
+    "recency_at_max_mtime": 3,
+    "recency_max_mtime_fraction": 0.007653061224489796,
+    "duplicate_content_groups": 0,
+    "manifest_sha256": "54087630f0bf8445853afc00e316d831bc8592124af71ea5be296cf18777e43e",
+    "notes": "Assembled via prototype/scripts/assemble-mixed-corpus.sh on anthonypc. Queries live beside the stage tree. Valid matrix: nomic 768/512/384."
   },
   "evaluation": {
     "k": 10,
-    "judged_queries": 10,
-    "query_set_blake3": "ee7040128dc91a4eda30dbb91a38c292d4519f7969a79693b097b063dce81afa",
-    "retrieval_metrics_equal_on_repeat": true
+    "judged_queries": 50,
+    "query_set_blake3": "197841b4eafa2da868ca56a59c89c0da1795e7cc0533daf6efd8b25a4b190632",
+    "retrieval_metrics_equal_on_repeat": true,
+    "postfix_report": "bakeoff-postfix-final-20260719T054254Z"
   },
   "provenance": {
     "binary": "distr-hnsw-validate 0.1.0",
     "source_revision": "unknown",
-    "source_tree_blake3": "dcae7725367a38120adba03addfc2c42e8b391d27640ab8d000dec22004c2236",
-    "executable_blake3": "7b7c61a73951846e95fc51b2b7b39b92263eac1b4b7322215b8ff2873fe8dc35",
+    "source_tree_blake3": "765113dd8d2b2ee1f30f1d14ca299b460e880fef5bb8cfbee01131cfcc1c7eb6",
+    "executable_blake3": "2320b49efa862bd77c307064e87dfeca1c683388002ac86e58ad4a83adbd5b40",
+    "corpus_index_blake3": "a25ae7a3df7b345d310dc67c8606b5c5752104486bac1eb4a63d4aef9cc27c66",
     "schema_version": 2,
     "prepare_fingerprint": "extractor=v0-inprocess;max_file_bytes=8388608;chunk_chars=2000;chunk_overlap=200",
-    "ollama_model": "nomic-embed-text",
-    "embedding_time_ollama_digest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
-    "evaluation_time_ollama_digest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f"
+    "models": [
+      {
+        "name": "nomic-embed-text",
+        "dims": 768,
+        "ollama_digest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f"
+      },
+      {
+        "name": "nomic-embed-text",
+        "dims": 512,
+        "ollama_digest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f"
+      },
+      {
+        "name": "nomic-embed-text",
+        "dims": 384,
+        "ollama_digest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f"
+      }
+    ]
   },
   "configs": [
     {
+      "model": "nomic-embed-text",
       "dims": 768,
-      "win_rate_vs_name": 0.16666666666666666,
+      "eligible_for_product_lock": true,
+      "win_rate_vs_name": 0.5555555555555556,
+      "wins_vs_name": 20,
+      "losses_vs_name": 16,
+      "ties_vs_name": 14,
       "win_rate_vs_recency": 1.0,
-      "win_rate_vs_keyword": 0.625,
-      "mean_recall_at_k": 1.0,
-      "mean_ndcg_at_k": 0.7248996447822396,
-      "cold_latency_ms": 998.1465619999999,
-      "warm_p50_latency_ms": 14.003881,
-      "warm_p95_latency_ms": 14.567008
+      "win_rate_vs_keyword": 0.5357142857142857,
+      "mean_recall_at_k": 0.7833333333333334,
+      "mean_ndcg_at_k": 0.6284080194369084,
+      "cold_latency_ms": 829.690892,
+      "warm_p50_latency_ms": 27.668626,
+      "warm_p95_latency_ms": 34.422506
     },
     {
+      "model": "nomic-embed-text",
       "dims": 512,
-      "win_rate_vs_name": 0.16666666666666666,
+      "eligible_for_product_lock": true,
+      "win_rate_vs_name": 0.5128205128205128,
+      "wins_vs_name": 20,
+      "losses_vs_name": 19,
+      "ties_vs_name": 11,
       "win_rate_vs_recency": 1.0,
-      "win_rate_vs_keyword": 0.625,
-      "mean_recall_at_k": 1.0,
-      "mean_ndcg_at_k": 0.7095192840476248,
+      "win_rate_vs_keyword": 0.5384615384615384,
+      "mean_recall_at_k": 0.7833333333333334,
+      "mean_ndcg_at_k": 0.6063080743614303,
       "cold_latency_ms": null,
-      "warm_p50_latency_ms": 13.922320000000001,
-      "warm_p95_latency_ms": 15.899406
+      "warm_p50_latency_ms": 26.644822,
+      "warm_p95_latency_ms": 30.493124
     },
     {
+      "model": "nomic-embed-text",
       "dims": 384,
-      "win_rate_vs_name": 0.16666666666666666,
+      "eligible_for_product_lock": true,
+      "win_rate_vs_name": 0.5128205128205128,
+      "wins_vs_name": 20,
+      "losses_vs_name": 19,
+      "ties_vs_name": 11,
       "win_rate_vs_recency": 1.0,
-      "win_rate_vs_keyword": 0.5,
-      "mean_recall_at_k": 1.0,
-      "mean_ndcg_at_k": 0.7246141434859121,
+      "win_rate_vs_keyword": 0.46153846153846156,
+      "mean_recall_at_k": 0.7633333333333334,
+      "mean_ndcg_at_k": 0.5698183217337803,
       "cold_latency_ms": null,
-      "warm_p50_latency_ms": 13.743627,
-      "warm_p95_latency_ms": 15.47766
+      "warm_p50_latency_ms": 23.814516,
+      "warm_p95_latency_ms": 28.336886
     }
   ],
   "recommendation": {
     "model": "nomic-embed-text",
     "dims": 512,
     "dims_locked": false,
-    "reason": "judged query count is 10 and nDCG spread across dimensions is 0.015"
+    "design_section_15_locked": false,
+    "reason": "no-go at 51.3% vs name; 512 is within 0.03 nDCG of 768, but product quality gate is not met"
   },
-  "verdict": "no-go (semantic win-rate vs name baseline below 60%); dims not locked"
+  "verdict": "no-go (semantic win-rate vs name baseline below 60%); dims not locked",
+  "diagnostic_attempts": [
+    {
+      "remote_run_id": "20260719T045506Z",
+      "model": "bge-m3",
+      "reported_native_1024_win_rate_vs_name": 0.7,
+      "reported_sliced_768_win_rate_vs_name": 0.6451612903225806,
+      "reported_sliced_512_win_rate_vs_name": 0.6363636363636364,
+      "eligible_for_product_decision": false,
+      "reason": "superseded mixed-v1 corpus; failing inputs were individually padded; 768/512 vectors were produced by undocumented slicing of native 1024 output"
+    }
+  ]
 }
