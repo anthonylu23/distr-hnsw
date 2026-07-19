@@ -12,6 +12,7 @@ from typing import Any
 
 LATENCY_FIELDS = {
     "cold_latency_ms",
+    "mean_latency_ms",
     "warm_mean_latency_ms",
     "warm_p50_latency_ms",
     "warm_p95_latency_ms",
@@ -31,8 +32,9 @@ def retrieval_view(report: dict[str, Any]) -> dict[str, Any]:
     view = copy.deepcopy(report)
     view.pop("generated_at", None)
     for config in view.get("configs", []):
-        for field in LATENCY_FIELDS:
-            config.pop(field, None)
+        for field in tuple(config):
+            if field in LATENCY_FIELDS or field.endswith("_latency_ms"):
+                config.pop(field)
     return view
 
 

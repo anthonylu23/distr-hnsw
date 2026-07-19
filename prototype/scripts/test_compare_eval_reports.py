@@ -29,6 +29,7 @@ def report():
                 "dims": 512,
                 "wins_vs_name": 3,
                 "cold_latency_ms": 100.0,
+                "mean_latency_ms": 21.0,
                 "warm_mean_latency_ms": 20.0,
                 "warm_p50_latency_ms": 19.0,
                 "warm_p95_latency_ms": 25.0,
@@ -49,6 +50,7 @@ class CompareEvalReportsTests(unittest.TestCase):
         repeat = copy.deepcopy(first)
         repeat["generated_at"] = "2026-07-19T00:01:00Z"
         repeat["configs"][0]["cold_latency_ms"] = 120.0
+        repeat["configs"][0]["mean_latency_ms"] = 22.0
         repeat["configs"][0]["warm_p95_latency_ms"] = 29.0
 
         result = MODULE.compare_reports(first, repeat)
