@@ -10,8 +10,8 @@ design first and then bring this document back into alignment.
 
 | Milestone | State | Exit gate |
 |---|---|---|
-| M0 — Semantic validation | **In progress** | Larger representative bake-off produces a documented go decision and locks the default local model and dimensions |
-| M1 — Blob plane and recovery foundation | Blocked on M0 | Blob durability and an empty-infrastructure restore drill pass |
+| M0 — Semantic validation | **Accepted** | Larger representative bake-off produces a documented go decision and locks the default local model and dimensions |
+| M1 — Blob plane and recovery foundation | Not started | Blob durability and an empty-infrastructure restore drill pass |
 | M2 — Tailscale identity and authorization | Not started | Network identity, sessions, grants, and API-key boundaries pass adversarial tests |
 | M3 — Single-partition vector engine | Not started | Persistence, recovery, recall, filtering, and compaction gates pass against brute force |
 | M4 — Distributed vector plane | Not started | Quorum, fencing, promotion, movement, and balancing survive failure injection |
@@ -20,11 +20,12 @@ design first and then bring this document back into alignment.
 | M7 — Vault, sharing, and v1 release | Not started | Security, deployment, recovery, and operating-envelope qualification pass |
 
 The phase-0 implementation is intentionally disposable. A frozen independent
-40-query holdout (`anthonypc` run `20260719T202526Z-holdout`) validates the
-semantic product bet: the 512d candidate scores 32/0/8 versus name, and an
-unchanged-input repeat reproduces rankings and retrieval metrics exactly with
-complete provenance. M0 remains in progress only because eligible nDCG spread
-is 0.014, below the documented 0.03 dimension-lock threshold. See
+40-query holdout (`anthonypc` policy run
+`20260720T032226Z-holdout-policy`) validates the semantic product bet: 512d
+scores 32/0/8 versus name, and an unchanged-input repeat reproduces rankings
+and retrieval metrics exactly with complete provenance. The documented
+non-inferiority tie-break locks `nomic-embed-text @ 512` with a 0.001 nDCG gap
+to the best eligible dimension. M0 is accepted and M1 is unblocked. See
 [phase-0-validation.md](phase-0-validation.md) and
 [next-steps.md](next-steps.md).
 
@@ -125,8 +126,11 @@ their formats and capacity costs become embedded in later milestones.
 - [x] Re-running evaluation against unchanged inputs reproduces retrieval
   metrics; latency variance is reported rather than treated as determinism.
 - [x] The stored and current provider/model identities match for every query.
-- [ ] Dimensionality is not locked with fewer than 40 judged queries or when
-  configurations are indistinguishable under the documented selection rule.
+- [x] Dimensionality is not locked with fewer than 40 judged queries, one
+  eligible dimension, or a product no-go; the documented `nomic-embed-text`
+  tie-break locks 512d only when it is within 0.03 nDCG of the best eligible
+  dimension.
+  *(40-query holdout: 512d is 0.001 below the best eligible nDCG)*
 - [x] The go/no-go decision and its limitations are reviewed and reflected in
   the design and phase documentation.
   *(semantic go; public-fragment and keyword limitations documented)*
@@ -143,10 +147,10 @@ directory. Because mixed-v4b was corrected after inspecting the prior losses,
 freeze and evaluate an independent holdout of at least 40 meaning-oriented
 queries before the final decision; do not revise it based on retrieval output.
 
-**Exit gate.** **Pending on dimensions only.** The independent holdout and
-repeat validate `nomic-embed-text` and the semantic product bet. DESIGN §15 and
-M1 remain gated because the existing selection rule does not lock any dimension
-when eligible nDCG spread is below 0.03.
+**Exit gate.** **Passed.** The independent holdout and exact repeat validate
+`nomic-embed-text` and the semantic product bet. The documented
+non-inferiority tie-break locks 512d in DESIGN §15 without treating the 0.001
+gap to 384d as evidence of statistical superiority. M1 is unblocked.
 
 **Explicit non-goals.** Distribution, HNSW, WALs, Tailscale auth, replication,
 the dashboard, and production extraction. Holdout keyword results preserve

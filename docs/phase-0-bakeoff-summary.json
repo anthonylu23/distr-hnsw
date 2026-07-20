@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-07-19T20:28:15.576314238+00:00",
-  "remote_run_id": "20260719T202526Z-holdout",
+  "generated_at": "2026-07-20T03:22:49.401013766+00:00",
+  "remote_run_id": "20260720T032226Z-holdout-policy",
   "corpus": {
     "label": "mixed-v4-20260719 tree + frozen independent holdout queries",
     "staged_file_count": 398,
@@ -25,18 +25,22 @@
     },
     "query_set_sha256_before_run": "9ee8153dea157c823cb7a1f84416ba9d554691682d4b276f87cb6762448b5ec7",
     "query_set_blake3": "d37e55d895b974fce20fcf3498a831b47935dec2bde0c9fdddf36cff914dfb47",
+    "database_sha256": "478b5a8e78bb4854d24881634efec3b79f102842f6b1f3928483f9e0b41a50e6",
+    "database_lineage": "evaluation-only copy of the original frozen holdout database; no prepare, query, or embedding changes",
+    "repeat_comparison_passed": true,
+    "provenance_equal_and_complete": true,
     "retrieval_metrics_equal_on_repeat": true,
-    "first_report": "bakeoff-20260719T202526Z",
-    "repeat_report": "bakeoff-20260719T202526Z-repeat",
+    "first_report": "bakeoff-20260720T032226Z",
+    "repeat_report": "bakeoff-20260720T032226Z-repeat",
     "comparison_report": "repeat-comparison.json",
-    "comparison_tool_revision": "d4a98dfec09201ee2096e00fbda3c56f9683ace0"
+    "comparison_tool_revision": "d3a0db33364c6d92fcdd199c6b5c2d7e272d18f0"
   },
   "provenance": {
     "binary": "distr-hnsw-validate 0.1.0",
-    "source_revision": "3e18096757e426c06c567a78dc8f3ee8112783c1",
-    "source_tree_blake3": "5624c235cfc14e3b27aa25cb5501bc85d8e20c86b0c3664784446d5dccadfafd",
-    "executable_blake3": "3dfd78462f67963608bffd011efdca282966682c2b01f57acce2675cb349cf49",
-    "retained_executable_sha256": "33efe3f04417bb9763f635d951449c52ab1927f6900e23cbed3290f97fc8ffdf",
+    "source_revision": "d3a0db33364c6d92fcdd199c6b5c2d7e272d18f0",
+    "source_tree_blake3": "7c8cb56289a8a67e4b1201a310435af60c3d525bd8b962584c13ee4ae416211f",
+    "executable_blake3": "81eed9446ea4bff23bcf2d4d95cefb164916fc0ddd450b4748bcec85d6b2084d",
+    "retained_executable_sha256": "c995456fe633a83d9b66b0d1529c41b937c904b4ac8f7f5833e0c3a16f7bab40",
     "corpus_index_blake3": "a25ae7a3df7b345d310dc67c8606b5c5752104486bac1eb4a63d4aef9cc27c66",
     "schema_version": 2,
     "prepare_fingerprint": "extractor=v0-inprocess;max_file_bytes=8388608;chunk_chars=2000;chunk_overlap=200",
@@ -73,9 +77,9 @@
       "ties_vs_keyword": 26,
       "mean_recall_at_k": 0.8,
       "mean_ndcg_at_k": 0.6781837706853755,
-      "cold_latency_ms": 1051.642537,
-      "warm_p50_latency_ms": 26.556242,
-      "warm_p95_latency_ms": 31.12413
+      "cold_latency_ms": 1101.964418,
+      "warm_p50_latency_ms": 26.104669,
+      "warm_p95_latency_ms": 28.465599
     },
     {
       "model": "nomic-embed-text",
@@ -92,8 +96,8 @@
       "mean_recall_at_k": 0.8,
       "mean_ndcg_at_k": 0.6910984023200145,
       "cold_latency_ms": null,
-      "warm_p50_latency_ms": 25.728301,
-      "warm_p95_latency_ms": 28.934462,
+      "warm_p50_latency_ms": 24.783402,
+      "warm_p95_latency_ms": 26.557394000000002,
       "categories": [
         {
           "category": "code",
@@ -157,22 +161,22 @@
       "mean_recall_at_k": 0.825,
       "mean_ndcg_at_k": 0.6922230993195388,
       "cold_latency_ms": null,
-      "warm_p50_latency_ms": 22.870274,
-      "warm_p95_latency_ms": 24.750457
+      "warm_p50_latency_ms": 23.380723,
+      "warm_p95_latency_ms": 27.228053
     }
   ],
   "recommendation": {
     "model": "nomic-embed-text",
     "dims": 512,
-    "dims_locked": false,
-    "design_section_15_locked": false,
-    "reason": "semantic go on the independent holdout; 512 remains the policy-preferred candidate, but the 0.014 eligible nDCG spread is below the documented 0.03 dimension-lock threshold"
+    "dims_locked": true,
+    "design_section_15_locked": true,
+    "reason": "semantic go on the independent holdout; the documented non-inferiority tie-break locks the predeclared 512d capacity/quality choice because it is 0.001 nDCG below the best eligible dimension and within the 0.03 band"
   },
-  "verdict": "go on the semantic product bet; dimensions not locked, so M0 remains in progress",
+  "verdict": "M0 accepted: semantic product bet passes and nomic-embed-text @ 512 is locked by the documented non-inferiority tie-break",
   "limitations": [
     "Public code-fragment queries remain weak at 512d: recall@10 0.167 and nDCG@10 0.056; five of six are ties where both semantic and name miss.",
     "Semantic retrieval loses more decided comparisons to keyword text search than it wins (4/9/27 at 512d); hybrid retrieval remains a phase-5 product requirement.",
-    "The holdout does not distinguish eligible dimensions: nDCG spread is 0.014, below the documented 0.03 lock threshold."
+    "The holdout does not establish dimensional superiority: eligible nDCG spread is 0.014 and 512d is 0.001 below 384d; 512d is a documented capacity/quality policy choice."
   ],
   "development_candidate": {
     "remote_run_id": "20260719T192138Z",

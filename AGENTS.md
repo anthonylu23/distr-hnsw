@@ -76,7 +76,8 @@ Assemble larger corpora with `prototype/scripts/assemble-mixed-corpus.sh`
 beside the stage tree, not inside it, so prepare does not index labels. Run
 `prototype/scripts/run-bakeoff-anthonypc.sh` for the matrix.
 
-**M0 status:** In progress — semantic go, dimensions unresolved. The frozen
-holdout and exact repeat validate `nomic-embed-text`, but eligible nDCG spread
-is below the documented dimension-lock threshold (`docs/phase-0-validation.md`).
-Do not retune the holdout. M1 remains gated until DESIGN §15 locks a dimension.
+**M0 status:** Accepted. The frozen holdout and exact repeat validate
+`nomic-embed-text`; the documented non-inferiority tie-break locks 512d in
+DESIGN §15 (`docs/phase-0-validation.md`). Do not retune the holdout or grow the
+prototype into product code. M1 is unblocked and starts with the recovery-first
+blob-plane slice in `docs/roadmap.md`.

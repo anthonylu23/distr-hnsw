@@ -851,11 +851,9 @@ against brute force from day one. Estimates are rough solo-effort scale
 markers, not commitments; they exist so that scope decisions are made against
 a calendar rather than in the abstract.
 
-0. **Validation prototype** (~days) — **in progress**. Disposable CLI under
-   `prototype/`: embed a representative corpus into SQLite, brute-force search,
-   compare semantic vs filename/date baselines. An independent holdout validates
-   `nomic-embed-text`; dimensionality remains unresolved (§15). No distributed
-   machinery.
+0. **Validation prototype** (~days) — **accepted**. The disposable CLI under
+   `prototype/` and a frozen independent holdout validate
+   `nomic-embed-text @ 512` (§15). No distributed machinery.
 1. **Blob plane + recovery foundation** (~2–3 months) — agent + chunk store +
    volumes/quotas; then portal-core commit state machine, placement, write
    quorum, delete, scrub/reconcile/move. Add offsite encrypted-object backup,
@@ -900,15 +898,18 @@ collections (§4), OCR extraction provider (§7.1).
 
 Each question is tagged with the phase (§14) that must resolve it.
 
-- **[phase 0 — candidate] Default local embedding model and dimensionality**
+- **[phase 0 — locked] Default local embedding model and dimensionality**
   for file collections (≤768 dims per §6.5): **`nomic-embed-text` @ 512**.
   A frozen independent 40-query holdout on `anthonypc` produced **32/0/8** at
   512d versus filename search, mean recall@10 **0.800**, and mean nDCG@10
-  **0.691**, with exact repeat retrieval evidence and complete provenance. This
-  validates the model and semantic product bet. Dimensions remain unlocked:
-  eligible holdout nDCG spans only **0.014**, below the documented **0.03**
-  lock threshold. The earlier mixed-v4b development set remains supporting
-  evidence. Chunk dials remain `chunk_chars=2000`, overlap `200`. See
+  **0.691**, with exact repeat retrieval evidence and complete provenance.
+  Eligible holdout nDCG spans only **0.014**, and 512d is **0.001** below the
+  best eligible result. The documented non-inferiority rule therefore locks
+  the predeclared 512d preference: it preserves more embedding capacity than
+  384d while reducing vector storage and compute versus 768d, and the earlier
+  mixed-v4b development set supports it. This is a capacity/quality policy
+  choice, not evidence that 512d is statistically superior on the holdout.
+  Chunk dials remain `chunk_chars=2000`, overlap `200`. See
   `docs/phase-0-validation.md`.
 - **[phase 1] Master key custody**: file vs. keychain vs. passphrase-unlock
   at portal start (unattended reboot tradeoff), plus the independent

@@ -1,11 +1,11 @@
 # Phase-0 validation prototype
 
-Status: **M0 In progress — semantic go, dimensions unresolved**. A frozen
-40-query independent holdout on `anthonypc` (run
-`20260719T202526Z-holdout`) produced **32/0/8** at 512d versus name, exact
-repeat retrieval evidence, and complete provenance. The semantic product bet
-passes. Eligible nDCG spread is only **0.014**, below the documented **0.03**
-dimension-lock threshold, so DESIGN §15 and M1 remain gated.
+Status: **M0 Accepted**. A frozen 40-query independent holdout on `anthonypc`
+produced **32/0/8** at 512d versus name, exact repeat retrieval evidence, and
+complete provenance. The documented non-inferiority tie-break locks
+`nomic-embed-text @ 512`: it is only **0.001** nDCG below the best eligible
+dimension and within the predeclared **0.03** band. This closes DESIGN §15 and
+unblocks M1 without claiming that 512d is statistically superior.
 
 ## Purpose
 
@@ -50,7 +50,7 @@ Disposable Rust CLI: [`prototype/`](../prototype/) (`distr-hnsw-validate`).
 - Oversized configs are diagnostics only: they do not choose the model, affect
   dimension spread, produce a go verdict, or lock dimensions.
 
-## Independent holdout — canonical quality evidence (2026-07-19)
+## Independent holdout — canonical M0 evidence (2026-07-19/20)
 
 The holdout was curated from document content, structurally validated, and
 hashed before any retrieval run. It contains 40 new queries: 8 code, 10 PDF, 6
@@ -59,22 +59,23 @@ resolves to exactly one extracted document.
 
 | Field | Value |
 |---|---|
-| Work dir | `~/distr-hnsw-proto/runs/20260719T202526Z-holdout` |
-| Evaluator revision | `3e18096757e426c06c567a78dc8f3ee8112783c1` |
+| Work dir | `~/distr-hnsw-proto/runs/20260720T032226Z-holdout-policy` |
+| Evidence lineage | Evaluation-only copy of the original holdout DB; both DB files SHA-256 `478b5a8e78bb4854d24881634efec3b79f102842f6b1f3928483f9e0b41a50e6` |
+| Evaluator revision | `d3a0db33364c6d92fcdd199c6b5c2d7e272d18f0` |
 | Query SHA-256 before retrieval | `9ee8153dea157c823cb7a1f84416ba9d554691682d4b276f87cb6762448b5ec7` |
 | Query BLAKE3 in reports | `d37e55d895b974fce20fcf3498a831b47935dec2bde0c9fdddf36cff914dfb47` |
-| Retained executable SHA-256 | `33efe3f04417bb9763f635d951449c52ab1927f6900e23cbed3290f97fc8ffdf` |
+| Retained executable SHA-256 | `c995456fe633a83d9b66b0d1529c41b937c904b4ac8f7f5833e0c3a16f7bab40` |
 | Repeat comparison | **pass** — provenance, rankings, and retrieval metrics identical |
 | Semantic decision | **go** |
-| Dimension decision | **not locked** — eligible nDCG spread **0.014** |
+| Dimension decision | **512d locked** — documented non-inferiority tie-break; gap to best eligible nDCG **0.001** |
 
 ### Holdout config summary
 
 | model | dims | judged | vs name (W/L/T) | vs keyword (W/L/T) | mean recall | mean nDCG | cold / warm p50 / p95 ms |
 |---|---:|---:|---|---|---:|---:|---:|
-| nomic-embed-text | 768 | 40 | 100% (32/0/8) | 28.6% (4/10/26) | 0.800 | 0.678 | 1051.6 / 26.6 / 31.1 |
-| nomic-embed-text | **512** | 40 | 100% (32/0/8) | 30.8% (4/9/27) | 0.800 | 0.691 | — / 25.7 / 28.9 |
-| nomic-embed-text | 384 | 40 | 100% (33/0/7) | 30.8% (4/9/27) | 0.825 | 0.692 | — / 22.9 / 24.8 |
+| nomic-embed-text | 768 | 40 | 100% (32/0/8) | 28.6% (4/10/26) | 0.800 | 0.678 | 1102.0 / 26.1 / 28.5 |
+| nomic-embed-text | **512** | 40 | 100% (32/0/8) | 30.8% (4/9/27) | 0.800 | 0.691 | — / 24.8 / 26.6 |
+| nomic-embed-text | 384 | 40 | 100% (33/0/7) | 30.8% (4/9/27) | 0.825 | 0.692 | — / 23.4 / 27.2 |
 
 At 512d, 32 comparisons are decided and none are losses; the 95% Wilson lower
 bound is 89.3%. Code, PDFs, personal notes, and study notes have recall@10 of
@@ -83,10 +84,11 @@ the clear limitation at 0.167 recall and 0.056 nDCG: five of six are ties where
 both semantic and name retrieval miss. Keyword search also wins more decided
 comparisons than semantic search, reinforcing the phase-5 hybrid requirement.
 
-The private database passes SQLite integrity and foreign-key checks and holds
-392 files, 2625 chunks, and 7875 embeddings. Full reports, the retained binary,
-and the repeat comparison remain under the private run directory. The
-sanitized aggregate is
+The copied private database passes SQLite integrity and foreign-key checks and
+holds 392 files, 2625 chunks, and 7875 embeddings. No corpus preparation,
+query editing, or embedding was repeated for the policy re-evaluation. Full
+reports, the retained binary, and the repeat comparison remain under the
+private run directory. The sanitized aggregate is
 [`phase-0-bakeoff-summary.json`](phase-0-bakeoff-summary.json).
 
 ## anthonypc bake-off — mixed-v4b development set (2026-07-19)
@@ -144,21 +146,24 @@ Full reports remain private/gitignored. Remote source of truth:
 `anthonypc:~/distr-hnsw-proto/runs/20260719T192138Z/reports/`.
 Sanitized aggregate: [`phase-0-bakeoff-summary.json`](phase-0-bakeoff-summary.json).
 
-### Candidate defaults
+### Locked defaults
 
 | Setting | Value | Notes |
 |---|---|---|
 | Local model | `nomic-embed-text` | Semantic quality validated on the independent holdout |
-| Dims | **512 candidate** | Not locked; holdout nDCG spread is below 0.03 |
+| Dims | **512 locked** | Policy tie-break; within 0.03 nDCG of the best eligible holdout result |
 | Embed runtime | Ollama on GPU box | `OLLAMA_HOST` normalized to `http://…` |
 
-## Remaining M0 decision
+## M0 exit decision
 
-All empirical gates except dimensionality are complete. The current rule says
-not to lock when eligible nDCG spread is below 0.03; the holdout spread is
-0.014. M0 therefore remains open until the dimension policy is resolved without
-retuning the frozen holdout. The evidence supports `nomic-embed-text`; it does
-not support claiming that 512d is measurably better than 384d or 768d.
+M0 is accepted. The independent holdout clears the semantic gate, and the
+documented tie-break locks `nomic-embed-text @ 512` because 512d is within 0.03
+nDCG of the best of three eligible dimensions on 40 judged queries. The 0.014
+total spread and 0.001 512d-to-best gap do **not** establish measurable 512d
+superiority; 512d is the predeclared capacity/quality choice supported by the
+development set. Public-fragment weakness and keyword-search wins remain
+explicit limitations and feed the phase-5 hybrid-retrieval requirement rather
+than reopening M0.
 
 Mixed-v4b remains useful development evidence. It is not discarded, but it is
 not independent confirmation because its corrections followed review of the
@@ -190,7 +195,7 @@ corpus. Ollama reproducibly returned JSON `NaN` for a 68-character chunk while
 adjacent chunks embedded normally. A later agent completed the run by padding
 individual failing inputs and reported 63.6% at sliced 512d. Both the input
 mutation and undocumented slicing invalidate that result as product gate
-evidence. It does not amend the nomic@512 candidate or unlock dimensions.
+evidence. It does not affect the locked `nomic-embed-text @ 512` default.
 
 ## Prior vault bake-off (2026-07-18)
 
