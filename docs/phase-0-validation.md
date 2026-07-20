@@ -28,7 +28,7 @@ Disposable Rust CLI: [`prototype/`](../prototype/) (`distr-hnsw-validate`).
 | Prepare | Fingerprint; prune/root switch only after a clean walk; `--fresh` |
 | Name FTS | Column filter grouped: `{name} : (t1 OR t2 …)` |
 | Baselines judged | vs name, vs recency, vs keyword (go gate uses vs name) |
-| Selection | Choose globally among configs at ≤768 dims; oversized configs are diagnostic only |
+| Selection | Choose globally among configs at ≤768 dims; for `nomic-embed-text`, prefer and lock 512d as the documented capacity/quality tie-break when it is non-inferior to the best eligible dimension |
 | Report | JSON/Markdown/HTML with query/source/executable/model/corpus hashes, category strata, and explicit dim-lock state |
 | Repeat gate | Two evaluations from the retained binary; `compare-eval-reports.py` requires exact provenance/ranking/metric equality and records latency separately |
 | Corpus assembly | [`prototype/scripts/assemble-mixed-corpus.sh`](../prototype/scripts/assemble-mixed-corpus.sh) (copy-only, unique stage, supported-extension allowlist, content-deduplicated PDFs, manifest) |
@@ -38,9 +38,13 @@ Disposable Rust CLI: [`prototype/`](../prototype/) (`distr-hnsw-validate`).
 - Semantic win-rate vs name baseline ≥ ~60% of decided (non-tie) queries, **or**
   clear qualitative dominance on meaning queries
 - Usable provider cold start and warmed p50/p95 query latency on the GPU box
-- Prefer dims 512 if within ~0.03 nDCG of the best eligible config for that
-  model; **do not lock dims** when judged queries &lt; 40 or eligible nDCG spread
-  across dims &lt; 0.03
+- For `nomic-embed-text`, prefer and lock 512d when at least two eligible
+  dimensions were evaluated on at least 40 judged queries, 512d is within 0.03
+  nDCG of the best eligible dimension, and the semantic go gate passes. This is
+  a documented capacity/quality tie-break, not a claim of statistical
+  superiority. Otherwise require an eligible nDCG spread of at least 0.03.
+- **Do not lock dims** with fewer than 40 judged queries, only one eligible
+  dimension, or a product no-go.
 - Evaluate native dimensions or model-documented truncations only. Arbitrary
   vector slicing is not a valid model configuration.
 - Oversized configs are diagnostics only: they do not choose the model, affect

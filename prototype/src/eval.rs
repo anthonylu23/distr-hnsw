@@ -15,6 +15,8 @@ use crate::search::{self, RankedFile};
 const MIN_QUERIES_TO_LOCK_DIMS: u32 = 40;
 const DIM_NDCG_EPS: f64 = 0.03;
 const MAX_PRODUCT_DIMS: usize = 768;
+const PREFERRED_LOCAL_MODEL: &str = "nomic-embed-text";
+const PREFERRED_LOCAL_DIMS: usize = 512;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuerySpec {
@@ -660,8 +662,17 @@ fn recommend(configs: &[ConfigMetrics]) -> (String, String, bool) {
     } else {
         max_ndcg - min_ndcg
     };
-    let dims_inconclusive =
-        chosen.judged_queries < MIN_QUERIES_TO_LOCK_DIMS || dims_spread < DIM_NDCG_EPS;
+    // The phase-0 policy predeclares nomic@512 as the capacity/quality
+    // tie-break when at least two eligible dimensions were evaluated and it
+    // is non-inferior to the best result. This is not evidence that 512d is
+    // statistically superior; it makes the existing selection preference a
+    // lockable decision once the independent sample is large enough.
+    let preferred_noninferior = model_dims.len() >= 2
+        && chosen.model == PREFERRED_LOCAL_MODEL
+        && chosen.dims == PREFERRED_LOCAL_DIMS
+        && max_ndcg - chosen.mean_ndcg_at_k <= DIM_NDCG_EPS;
+    let dims_inconclusive = chosen.judged_queries < MIN_QUERIES_TO_LOCK_DIMS
+        || (dims_spread < DIM_NDCG_EPS && !preferred_noninferior);
 
     let mut rec = format!(
         "Suggested model=`{}` dims={} (win-rate vs name={:.1}%, vs recency={:.1}%, mean nDCG={:.3}, warm latency p50/p95={:.0}/{:.0}ms)",
@@ -677,6 +688,12 @@ fn recommend(configs: &[ConfigMetrics]) -> (String, String, bool) {
         rec.push_str(&format!(
             ". dims inconclusive — do not lock (judged={}, nDCG spread across dims={:.3})",
             chosen.judged_queries, dims_spread
+        ));
+    } else if preferred_noninferior {
+        rec.push_str(&format!(
+            ". dims locked by documented non-inferiority tie-break (512d within {:.3} nDCG of the best eligible dimension; observed gap={:.3})",
+            DIM_NDCG_EPS,
+            max_ndcg - chosen.mean_ndcg_at_k
         ));
     }
 
@@ -775,21 +792,27 @@ mod tests {
     #[test]
     fn prefer_512_when_within_eps_of_384_best() {
         let configs = vec![
-            cfg("nomic-embed-text", 768, 0.680, 0.3, 10),
-            cfg("nomic-embed-text", 512, 0.685, 0.3, 10),
-            cfg("nomic-embed-text", 384, 0.693, 0.3, 10),
+            cfg("nomic-embed-text", 768, 0.680, 0.7, 50),
+            cfg("nomic-embed-text", 512, 0.685, 0.7, 50),
+            cfg("nomic-embed-text", 384, 0.693, 0.7, 50),
         ];
         let (rec, go, locked) = recommend(&configs);
         assert!(rec.contains("dims=512"), "expected prefer 512, got: {rec}");
-        assert!(rec.contains("dims inconclusive"));
-        assert!(go.contains("dims not locked"));
-        assert!(!locked);
+        assert!(rec.contains("dims locked by documented non-inferiority tie-break"));
+        assert!(rec.contains("observed gap=0.008"), "got: {rec}");
+        assert_eq!(go, "go");
+        assert!(locked);
     }
 
     #[test]
     fn low_query_count_marks_dims_inconclusive() {
-        let configs = vec![cfg("nomic-embed-text", 768, 0.9, 0.7, 10)];
+        let configs = vec![
+            cfg("nomic-embed-text", 768, 0.690, 0.7, 10),
+            cfg("nomic-embed-text", 512, 0.685, 0.7, 10),
+            cfg("nomic-embed-text", 384, 0.693, 0.7, 10),
+        ];
         let (rec, go, locked) = recommend(&configs);
+        assert!(rec.contains("dims=512"), "got: {rec}");
         assert!(rec.contains("dims inconclusive"));
         assert!(go.contains("dims not locked"));
         assert!(!locked);
@@ -844,6 +867,16 @@ mod tests {
         );
         assert!(go.starts_with("go"));
         assert!(!locked, "one eligible dimension is not enough to lock dims");
+    }
+
+    #[test]
+    fn preferred_dimension_requires_an_eligible_comparison() {
+        let configs = vec![cfg("nomic-embed-text", 512, 0.80, 0.7, 50)];
+        let (rec, go, locked) = recommend(&configs);
+        assert!(rec.contains("dims=512"), "got: {rec}");
+        assert!(rec.contains("dims inconclusive"), "got: {rec}");
+        assert!(go.contains("dims not locked"), "got: {go}");
+        assert!(!locked);
     }
 
     #[test]
