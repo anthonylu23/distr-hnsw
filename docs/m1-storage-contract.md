@@ -51,6 +51,10 @@ before encryption. Each chunk is rehashed and compared with its persisted plan
 immediately before encryption, preventing key/nonce reuse if the source changes
 between the initial prehash and dispatch.
 
+SQLite schema v2 persists the per-chunk envelope version. Opening a Pass 1
+schema-v1 database atomically adds version `1` to existing chunk plans; v1 AAD
+bytes remain unchanged, so previously committed chunks stay downloadable.
+
 Chunk AAD authenticates the envelope version, file id, ordinal, and plaintext
 length. Ciphertext, including the Poly1305 tag, is the stored chunk object.
 

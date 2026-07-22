@@ -130,8 +130,10 @@ impl Database {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != 0 && version != SCHEMA_VERSION {
-            return Err(MetadataError::UnsupportedSchemaVersion(version));
+        match version {
+            0 | SCHEMA_VERSION => {}
+            1 => migrate_v1_to_v2(&connection)?,
+            _ => return Err(MetadataError::UnsupportedSchemaVersion(version)),
         }
         connection.execute_batch(SCHEMA)?;
         if let Some(parent) = path.parent() {
@@ -698,6 +700,20 @@ CREATE TABLE IF NOT EXISTS files (
 PRAGMA user_version = 2;
 "#;
 
+fn migrate_v1_to_v2(connection: &Connection) -> Result<(), MetadataError> {
+    connection.execute_batch(
+        r#"
+BEGIN IMMEDIATE;
+ALTER TABLE upload_chunks
+    ADD COLUMN envelope_version INTEGER NOT NULL DEFAULT 1
+    CHECK(envelope_version > 0);
+PRAGMA user_version = 2;
+COMMIT;
+"#,
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum MetadataError {
     #[error("invalid upload state: {0}")]
@@ -745,5 +761,53 @@ mod tests {
         assert!(!UploadState::Staging.permits(UploadState::Committed));
         assert!(!UploadState::ReplicatingManifest.permits(UploadState::ReplicatingChunks));
         assert!(UploadState::Committed.permits(UploadState::Committed));
+    }
+
+    #[test]
+    fn schema_v1_migrates_chunk_plans_to_envelope_v1() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+CREATE TABLE upload_chunks (
+    upload_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    plaintext_len INTEGER NOT NULL,
+    plaintext_hash BLOB NOT NULL,
+    nonce BLOB NOT NULL,
+    ciphertext_hash TEXT,
+    ciphertext_len INTEGER,
+    PRIMARY KEY(upload_id, ordinal)
+);
+PRAGMA user_version = 1;
+"#,
+            )
+            .unwrap();
+        let upload_id = Uuid::new_v4();
+        connection
+            .execute(
+                "INSERT INTO upload_chunks
+                 (upload_id, ordinal, plaintext_len, plaintext_hash, nonce)
+                 VALUES (?1, 0, 3, ?2, ?3)",
+                params![
+                    upload_id.to_string(),
+                    [4_u8; 32].as_slice(),
+                    [5_u8; NONCE_LEN].as_slice(),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        let chunks = database.chunks(upload_id).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].envelope_version, 1);
+        let version: i64 = database
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 }

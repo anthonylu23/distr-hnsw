@@ -333,7 +333,7 @@ async fn rf2_succeeds_when_an_extra_agent_rejects() {
     let mut portal = Portal::open(
         &database_path,
         key,
-        vec![agent_a.target.clone(), agent_b.target.clone(), agent_c],
+        vec![agent_c, agent_a.target.clone(), agent_b.target.clone()],
     )
     .unwrap();
     let file_id = portal.upload(&source, "extra-agent").await.unwrap();
@@ -341,6 +341,38 @@ async fn rf2_succeeds_when_an_extra_agent_rejects() {
     portal.download(file_id, &destination).await.unwrap();
     assert_eq!(fs::read(destination).unwrap(), expected);
     rejecting_task.abort();
+}
+
+#[tokio::test]
+async fn rf2_succeeds_when_an_extra_agent_is_unavailable() {
+    let agent_a = start_agent("agent-a", "host-a").await;
+    let agent_b = start_agent("agent-b", "host-b").await;
+    let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_address = unavailable_listener.local_addr().unwrap();
+    drop(unavailable_listener);
+    let unavailable = AgentTarget {
+        id: "agent-c".to_owned(),
+        failure_domain: "host-c".to_owned(),
+        base_url: format!("http://{unavailable_address}"),
+    };
+    let workspace = tempfile::tempdir().unwrap();
+    let key_path = workspace.path().join("master.key");
+    let database_path = workspace.path().join("portal.sqlite");
+    let source = workspace.path().join("source.bin");
+    let expected = write_source(&source);
+    MasterKey::create(&key_path).unwrap();
+
+    let key = MasterKey::load(&key_path).unwrap();
+    let mut portal = Portal::open(
+        &database_path,
+        key,
+        vec![unavailable, agent_a.target.clone(), agent_b.target.clone()],
+    )
+    .unwrap();
+    let file_id = portal.upload(&source, "unavailable-extra").await.unwrap();
+    let destination = workspace.path().join("unavailable-extra.download");
+    portal.download(file_id, &destination).await.unwrap();
+    assert_eq!(fs::read(destination).unwrap(), expected);
 }
 
 #[tokio::test]

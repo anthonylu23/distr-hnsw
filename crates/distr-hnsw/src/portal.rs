@@ -133,7 +133,7 @@ impl Portal {
     ) -> Result<Uuid, PortalError> {
         let mut upload = match self.database.upload_by_idempotency(idempotency_key)? {
             Some(existing) if existing.state == UploadState::Committed => {
-                if source.is_file() {
+                if source.exists() {
                     let inspection = inspect_source(source)?;
                     let fingerprint = request_fingerprint(&inspection, STORAGE_CLASS);
                     if existing.request_fingerprint != fingerprint {
@@ -358,6 +358,7 @@ impl Portal {
         first_replica_failpoint: Failpoint,
         confirmation_count: &mut usize,
     ) -> Result<(), PortalError> {
+        let mut last_failure = None;
         for agent in self.agents.clone() {
             if self.database.placement_confirmed(kind, hash, &agent.id)? {
                 continue;
@@ -365,17 +366,20 @@ impl Portal {
             self.database
                 .ensure_pending_placement(kind, hash, &agent.id, &agent.failure_domain)?;
             let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
-            let response = self.client.put(url).body(bytes.to_vec()).send().await?;
-            if !response.status().is_success() {
-                if self.database.confirmed_domains(kind, hash)? >= MINIMUM_REPLICAS {
-                    // RF2 is already satisfied; extra agents are best-effort.
+            let response = match self.client.put(url).body(bytes.to_vec()).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    last_failure = Some(PortalError::Http(error));
                     continue;
                 }
-                return Err(PortalError::AgentRejected {
+            };
+            if !response.status().is_success() {
+                last_failure = Some(PortalError::AgentRejected {
                     agent: agent.id.clone(),
                     status: response.status().as_u16(),
                     body: response.text().await.unwrap_or_default(),
                 });
+                continue;
             }
             self.database.confirm_placement(kind, hash, &agent.id)?;
             *confirmation_count += 1;
@@ -384,10 +388,12 @@ impl Portal {
             }
         }
         if self.database.confirmed_domains(kind, hash)? < MINIMUM_REPLICAS {
-            return Err(PortalError::ReplicaFloorNotMet {
-                kind,
-                hash: hash.clone(),
-            });
+            return Err(
+                last_failure.unwrap_or_else(|| PortalError::ReplicaFloorNotMet {
+                    kind,
+                    hash: hash.clone(),
+                }),
+            );
         }
         Ok(())
     }
@@ -491,23 +497,37 @@ impl Portal {
     }
 
     async fn verify_remote_agents(&self) -> Result<(), PortalError> {
+        let mut live_domains = HashSet::new();
+        let mut last_failure = None;
         for agent in &self.agents {
-            let response = self
+            let response = match self
                 .client
                 .get(format!("{}/v1/health", agent.base_url))
                 .send()
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    last_failure = Some(PortalError::Http(error));
+                    continue;
+                }
+            };
             if !response.status().is_success() {
-                return Err(PortalError::AgentRejected {
+                last_failure = Some(PortalError::AgentRejected {
                     agent: agent.id.clone(),
                     status: response.status().as_u16(),
                     body: response.text().await.unwrap_or_default(),
                 });
+                continue;
             }
             let identity: RemoteAgentIdentity = response.json().await?;
             if identity.id != agent.id || identity.failure_domain != agent.failure_domain {
                 return Err(PortalError::AgentIdentityMismatch(agent.id.clone()));
             }
+            live_domains.insert(agent.failure_domain.as_str());
+        }
+        if live_domains.len() < MINIMUM_REPLICAS {
+            return Err(last_failure.unwrap_or(PortalError::InsufficientFailureDomains));
         }
         Ok(())
     }

@@ -18,8 +18,9 @@ with pre-commit invisibility checks.
 
 This is not M1 acceptance. Linux filesystem review, delete/lifecycle work,
 inventory reconstruction, independent recovery, and the blank-infrastructure
-drill remain open. SQLite schema version is 2 (per-chunk `envelope_version`).
-Pass 1 databases from schema v1 are not migrated.
+drill remain open. SQLite schema version is 2 (per-chunk `envelope_version`);
+schema-v1 Pass 1 databases migrate atomically with existing chunks retaining
+the byte-compatible v1 AAD contract.
 
 ## Pass 1 — commit spine
 
