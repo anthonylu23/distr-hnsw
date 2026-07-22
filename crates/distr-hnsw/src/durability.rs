@@ -106,7 +106,7 @@ impl DurableStore {
     }
 }
 
-fn sync_regular_file(file: &File) -> io::Result<()> {
+pub(crate) fn sync_regular_file(file: &File) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd;

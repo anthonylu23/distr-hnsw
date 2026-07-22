@@ -19,18 +19,11 @@ Public code fragments remain weak and keyword search wins more decided
 comparisons than semantic search, so hybrid fusion remains a phase-5 product
 requirement.
 
-## Phase 1 — start here
+## Phase 1 — in progress
 
-Start the blob plane + recovery foundation per DESIGN.md §14 and
+M1 Pass 1 (commit spine) is implemented under `crates/distr-hnsw/`. Continue
+the blob plane + recovery foundation per DESIGN.md §14 and
 [roadmap.md](roadmap.md#m1--build-the-blob-plane-and-recovery-foundation).
-Before implementation, pin object formats, SQLite transitions, fsync
-boundaries, master-key custody, backup defaults, and the crash-test matrix.
-Then build the smallest recovery-first slice:
-
-1. One regular-file class with 4 MiB encrypted chunks.
-2. RF2 across two local agents with a file-backed master key.
-3. Durable portal commit state machine and immutable recovery objects.
-4. Failure injection and an empty-infrastructure restore drill.
 
 The implemented first-pass contract and implementation dependency graph are in
 [m1-storage-contract.md](m1-storage-contract.md) and

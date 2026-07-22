@@ -13,7 +13,7 @@ use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::durability::{ensure_directory, sync_directory};
+use crate::durability::{ensure_directory, sync_directory, sync_regular_file};
 
 pub const ENVELOPE_VERSION: u16 = 1;
 pub const KEY_LEN: usize = 32;
@@ -38,7 +38,7 @@ impl MasterKey {
             .mode(0o600)
             .open(path)?;
         file.write_all(&bytes)?;
-        file.sync_all()?;
+        sync_regular_file(&file)?;
         if let Some(parent) = path.parent() {
             sync_directory(parent)?;
         }
@@ -126,6 +126,7 @@ pub fn unwrap_key(
 
 pub fn encrypt_chunk(
     key: &[u8; KEY_LEN],
+    envelope_version: u16,
     file_id: Uuid,
     ordinal: u32,
     plaintext_len: u32,
@@ -135,7 +136,10 @@ pub fn encrypt_chunk(
     if plaintext.len() != plaintext_len as usize {
         return Err(CryptoError::PlaintextLengthMismatch);
     }
-    let aad = chunk_aad(file_id, ordinal, plaintext_len);
+    if envelope_version != ENVELOPE_VERSION {
+        return Err(CryptoError::UnsupportedEnvelopeVersion(envelope_version));
+    }
+    let aad = chunk_aad(envelope_version, file_id, ordinal, plaintext_len);
     let cipher = XChaCha20Poly1305::new(key.into());
     Ok(cipher.encrypt(
         XNonce::from_slice(nonce),
@@ -148,13 +152,17 @@ pub fn encrypt_chunk(
 
 pub fn decrypt_chunk(
     key: &[u8; KEY_LEN],
+    envelope_version: u16,
     file_id: Uuid,
     ordinal: u32,
     plaintext_len: u32,
     nonce: &[u8; NONCE_LEN],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let aad = chunk_aad(file_id, ordinal, plaintext_len);
+    if envelope_version != ENVELOPE_VERSION {
+        return Err(CryptoError::UnsupportedEnvelopeVersion(envelope_version));
+    }
+    let aad = chunk_aad(envelope_version, file_id, ordinal, plaintext_len);
     let cipher = XChaCha20Poly1305::new(key.into());
     let plaintext = cipher.decrypt(
         XNonce::from_slice(nonce),
@@ -177,8 +185,9 @@ fn key_aad(purpose: &[u8], file_id: Uuid, generation: u64) -> Vec<u8> {
     aad
 }
 
-fn chunk_aad(file_id: Uuid, ordinal: u32, plaintext_len: u32) -> Vec<u8> {
-    let mut aad = b"distr-hnsw:chunk:v1".to_vec();
+fn chunk_aad(envelope_version: u16, file_id: Uuid, ordinal: u32, plaintext_len: u32) -> Vec<u8> {
+    let mut aad = b"distr-hnsw:chunk:".to_vec();
+    aad.extend_from_slice(&envelope_version.to_le_bytes());
     aad.extend_from_slice(file_id.as_bytes());
     aad.extend_from_slice(&ordinal.to_le_bytes());
     aad.extend_from_slice(&plaintext_len.to_le_bytes());
@@ -195,6 +204,8 @@ pub enum CryptoError {
     InvalidKeyLength,
     #[error("plaintext length does not match authenticated chunk metadata")]
     PlaintextLengthMismatch,
+    #[error("unsupported envelope version {0}")]
+    UnsupportedEnvelopeVersion(u16),
     #[error("authenticated encryption or decryption failed")]
     Aead,
     #[error(transparent)]

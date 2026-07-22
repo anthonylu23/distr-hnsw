@@ -5,12 +5,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    crypto::{WrappedKey, NONCE_LEN},
+    crypto::{WrappedKey, ENVELOPE_VERSION, NONCE_LEN},
     durability::{ensure_directory, sync_directory},
     object::{ObjectHash, ObjectKind},
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UploadState {
@@ -72,6 +72,7 @@ pub struct NewUpload {
 #[derive(Clone, Debug)]
 pub struct NewChunk {
     pub ordinal: u32,
+    pub envelope_version: u16,
     pub plaintext_len: u32,
     pub plaintext_hash: [u8; 32],
     pub nonce: [u8; NONCE_LEN],
@@ -97,6 +98,7 @@ pub struct UploadRecord {
 #[derive(Clone, Debug)]
 pub struct ChunkPlan {
     pub ordinal: u32,
+    pub envelope_version: u16,
     pub plaintext_len: u32,
     pub plaintext_hash: [u8; 32],
     pub nonce: [u8; NONCE_LEN],
@@ -160,13 +162,19 @@ impl Database {
             ],
         )?;
         for chunk in &upload.chunks {
+            if chunk.envelope_version != ENVELOPE_VERSION {
+                return Err(MetadataError::UnsupportedEnvelopeVersion(
+                    chunk.envelope_version,
+                ));
+            }
             transaction.execute(
                 "INSERT INTO upload_chunks
-                 (upload_id, ordinal, plaintext_len, plaintext_hash, nonce)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (upload_id, ordinal, envelope_version, plaintext_len, plaintext_hash, nonce)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     upload.upload_id.to_string(),
                     chunk.ordinal,
+                    chunk.envelope_version,
                     chunk.plaintext_len,
                     chunk.plaintext_hash.as_slice(),
                     chunk.nonce.as_slice(),
@@ -197,27 +205,37 @@ impl Database {
 
     pub fn chunks(&self, upload_id: Uuid) -> Result<Vec<ChunkPlan>, MetadataError> {
         let mut statement = self.connection.prepare(
-            "SELECT ordinal, plaintext_len, plaintext_hash, nonce,
+            "SELECT ordinal, envelope_version, plaintext_len, plaintext_hash, nonce,
                     ciphertext_hash, ciphertext_len
              FROM upload_chunks WHERE upload_id = ?1 ORDER BY ordinal",
         )?;
         let rows = statement.query_map([upload_id.to_string()], |row| {
-            let plaintext_hash: Vec<u8> = row.get(2)?;
-            let nonce: Vec<u8> = row.get(3)?;
-            let hash: Option<String> = row.get(4)?;
+            let plaintext_hash: Vec<u8> = row.get(3)?;
+            let nonce: Vec<u8> = row.get(4)?;
+            let hash: Option<String> = row.get(5)?;
             Ok((
                 row.get::<_, u32>(0)?,
-                row.get::<_, u32>(1)?,
+                row.get::<_, u16>(1)?,
+                row.get::<_, u32>(2)?,
                 plaintext_hash,
                 nonce,
                 hash,
-                row.get::<_, Option<u32>>(5)?,
+                row.get::<_, Option<u32>>(6)?,
             ))
         })?;
         rows.map(|row| {
-            let (ordinal, plaintext_len, plaintext_hash, nonce, hash, ciphertext_len) = row?;
+            let (
+                ordinal,
+                envelope_version,
+                plaintext_len,
+                plaintext_hash,
+                nonce,
+                hash,
+                ciphertext_len,
+            ) = row?;
             Ok(ChunkPlan {
                 ordinal,
+                envelope_version,
                 plaintext_len,
                 plaintext_hash: fixed_bytes(&plaintext_hash, "chunk plaintext hash")?,
                 nonce: fixed_bytes(&nonce, "chunk nonce")?,
@@ -645,6 +663,7 @@ CREATE TABLE IF NOT EXISTS uploads (
 CREATE TABLE IF NOT EXISTS upload_chunks (
     upload_id TEXT NOT NULL REFERENCES uploads(upload_id),
     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    envelope_version INTEGER NOT NULL CHECK(envelope_version > 0),
     plaintext_len INTEGER NOT NULL CHECK(plaintext_len >= 0),
     plaintext_hash BLOB NOT NULL CHECK(length(plaintext_hash) = 32),
     nonce BLOB NOT NULL CHECK(length(nonce) = 24),
@@ -676,7 +695,7 @@ CREATE TABLE IF NOT EXISTS files (
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 "#;
 
 #[derive(Debug, Error)]
@@ -706,6 +725,8 @@ pub enum MetadataError {
     NumericOverflow,
     #[error("unsupported SQLite schema version {0}")]
     UnsupportedSchemaVersion(i64),
+    #[error("unsupported envelope version {0}")]
+    UnsupportedEnvelopeVersion(u16),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]

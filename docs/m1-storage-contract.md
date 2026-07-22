@@ -8,8 +8,9 @@ extends these rules without weakening them.
 
 The first pass supports one regular-file class, seekable local input, fixed
 4 MiB plaintext chunks, a file-backed master key, and RF2 across two agents in
-distinct configured failure domains. Agents and the portal bind to loopback for
-development. Tailscale identity and production authorization remain M2 work.
+distinct configured failure domains. Agents bind to loopback for development;
+the portal is a local CLI and should be pointed only at those loopback agent
+URLs. Tailscale identity and production authorization remain M2 work.
 
 Delete markers, repair, movement, garbage collection, offsite backup, and
 empty-infrastructure restore are later M1 passes. Until the full M1 exit gate
@@ -72,7 +73,10 @@ gate.
 
 Only the SQLite `committed` state is visible or downloadable. A transaction
 that exposes the file is permitted only after the manifest and every referenced
-chunk have two confirmed placements in distinct failure domains.
+chunk have two confirmed placements in distinct failure domains, and the portal
+has revalidated those placements with live GET + hash checks. SQLite
+`confirmed` rows alone are not sufficient to commit: missing or corrupt
+replicas must fail closed until scrub/repair exists.
 
 ## State transitions
 
