@@ -359,4 +359,52 @@ mod tests {
         assert_eq!(hex::encode(&encoded), expected);
         assert_eq!(decode_payload(&encoded).unwrap(), payload);
     }
+
+    #[test]
+    fn decode_rejects_bad_magic_unsupported_version_and_trailing_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let master = MasterKey::create(&directory.path().join("master.key")).unwrap();
+        let file_id = Uuid::new_v4();
+        let payload = ManifestPayload {
+            name: "example.bin".to_owned(),
+            plaintext_len: 0,
+            plaintext_hash: [0; 32],
+            content_key: wrap_key(&master, b"content", file_id, 1, &[9_u8; KEY_LEN]).unwrap(),
+            chunks: Vec::new(),
+        };
+        let encoded = encode_manifest(&master, file_id, 1, &payload).unwrap();
+
+        let mut bad_magic = encoded.clone();
+        bad_magic[0] ^= 1;
+        assert!(matches!(
+            decode_manifest(&master, &bad_magic),
+            Err(FormatError::BadMagic)
+        ));
+
+        let mut unsupported = encoded.clone();
+        unsupported[4] = 2;
+        unsupported[5] = 0;
+        assert!(matches!(
+            decode_manifest(&master, &unsupported),
+            Err(FormatError::UnsupportedVersion(2))
+        ));
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(matches!(
+            decode_manifest(&master, &trailing),
+            Err(FormatError::TrailingBytes)
+        ));
+    }
+
+    #[test]
+    fn decode_payload_rejects_unreasonable_lengths() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&((MAX_FIELD_LEN as u32) + 1).to_le_bytes());
+        encoded.extend_from_slice(&[0_u8; 8]);
+        assert!(matches!(
+            decode_payload(&encoded),
+            Err(FormatError::FieldTooLarge)
+        ));
+    }
 }

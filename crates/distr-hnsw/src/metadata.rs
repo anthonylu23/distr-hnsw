@@ -5,12 +5,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    crypto::{WrappedKey, NONCE_LEN},
+    crypto::{WrappedKey, ENVELOPE_VERSION, NONCE_LEN},
     durability::{ensure_directory, sync_directory},
     object::{ObjectHash, ObjectKind},
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UploadState {
@@ -72,6 +72,7 @@ pub struct NewUpload {
 #[derive(Clone, Debug)]
 pub struct NewChunk {
     pub ordinal: u32,
+    pub envelope_version: u16,
     pub plaintext_len: u32,
     pub plaintext_hash: [u8; 32],
     pub nonce: [u8; NONCE_LEN],
@@ -97,6 +98,7 @@ pub struct UploadRecord {
 #[derive(Clone, Debug)]
 pub struct ChunkPlan {
     pub ordinal: u32,
+    pub envelope_version: u16,
     pub plaintext_len: u32,
     pub plaintext_hash: [u8; 32],
     pub nonce: [u8; NONCE_LEN],
@@ -128,8 +130,10 @@ impl Database {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != 0 && version != SCHEMA_VERSION {
-            return Err(MetadataError::UnsupportedSchemaVersion(version));
+        match version {
+            0 | SCHEMA_VERSION => {}
+            1 => migrate_v1_to_v2(&connection)?,
+            _ => return Err(MetadataError::UnsupportedSchemaVersion(version)),
         }
         connection.execute_batch(SCHEMA)?;
         if let Some(parent) = path.parent() {
@@ -160,13 +164,19 @@ impl Database {
             ],
         )?;
         for chunk in &upload.chunks {
+            if chunk.envelope_version != ENVELOPE_VERSION {
+                return Err(MetadataError::UnsupportedEnvelopeVersion(
+                    chunk.envelope_version,
+                ));
+            }
             transaction.execute(
                 "INSERT INTO upload_chunks
-                 (upload_id, ordinal, plaintext_len, plaintext_hash, nonce)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (upload_id, ordinal, envelope_version, plaintext_len, plaintext_hash, nonce)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     upload.upload_id.to_string(),
                     chunk.ordinal,
+                    chunk.envelope_version,
                     chunk.plaintext_len,
                     chunk.plaintext_hash.as_slice(),
                     chunk.nonce.as_slice(),
@@ -197,27 +207,37 @@ impl Database {
 
     pub fn chunks(&self, upload_id: Uuid) -> Result<Vec<ChunkPlan>, MetadataError> {
         let mut statement = self.connection.prepare(
-            "SELECT ordinal, plaintext_len, plaintext_hash, nonce,
+            "SELECT ordinal, envelope_version, plaintext_len, plaintext_hash, nonce,
                     ciphertext_hash, ciphertext_len
              FROM upload_chunks WHERE upload_id = ?1 ORDER BY ordinal",
         )?;
         let rows = statement.query_map([upload_id.to_string()], |row| {
-            let plaintext_hash: Vec<u8> = row.get(2)?;
-            let nonce: Vec<u8> = row.get(3)?;
-            let hash: Option<String> = row.get(4)?;
+            let plaintext_hash: Vec<u8> = row.get(3)?;
+            let nonce: Vec<u8> = row.get(4)?;
+            let hash: Option<String> = row.get(5)?;
             Ok((
                 row.get::<_, u32>(0)?,
-                row.get::<_, u32>(1)?,
+                row.get::<_, u16>(1)?,
+                row.get::<_, u32>(2)?,
                 plaintext_hash,
                 nonce,
                 hash,
-                row.get::<_, Option<u32>>(5)?,
+                row.get::<_, Option<u32>>(6)?,
             ))
         })?;
         rows.map(|row| {
-            let (ordinal, plaintext_len, plaintext_hash, nonce, hash, ciphertext_len) = row?;
+            let (
+                ordinal,
+                envelope_version,
+                plaintext_len,
+                plaintext_hash,
+                nonce,
+                hash,
+                ciphertext_len,
+            ) = row?;
             Ok(ChunkPlan {
                 ordinal,
+                envelope_version,
                 plaintext_len,
                 plaintext_hash: fixed_bytes(&plaintext_hash, "chunk plaintext hash")?,
                 nonce: fixed_bytes(&nonce, "chunk nonce")?,
@@ -645,6 +665,7 @@ CREATE TABLE IF NOT EXISTS uploads (
 CREATE TABLE IF NOT EXISTS upload_chunks (
     upload_id TEXT NOT NULL REFERENCES uploads(upload_id),
     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    envelope_version INTEGER NOT NULL CHECK(envelope_version > 0),
     plaintext_len INTEGER NOT NULL CHECK(plaintext_len >= 0),
     plaintext_hash BLOB NOT NULL CHECK(length(plaintext_hash) = 32),
     nonce BLOB NOT NULL CHECK(length(nonce) = 24),
@@ -676,8 +697,22 @@ CREATE TABLE IF NOT EXISTS files (
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 "#;
+
+fn migrate_v1_to_v2(connection: &Connection) -> Result<(), MetadataError> {
+    connection.execute_batch(
+        r#"
+BEGIN IMMEDIATE;
+ALTER TABLE upload_chunks
+    ADD COLUMN envelope_version INTEGER NOT NULL DEFAULT 1
+    CHECK(envelope_version > 0);
+PRAGMA user_version = 2;
+COMMIT;
+"#,
+    )?;
+    Ok(())
+}
 
 #[derive(Debug, Error)]
 pub enum MetadataError {
@@ -706,6 +741,8 @@ pub enum MetadataError {
     NumericOverflow,
     #[error("unsupported SQLite schema version {0}")]
     UnsupportedSchemaVersion(i64),
+    #[error("unsupported envelope version {0}")]
+    UnsupportedEnvelopeVersion(u16),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -724,5 +761,53 @@ mod tests {
         assert!(!UploadState::Staging.permits(UploadState::Committed));
         assert!(!UploadState::ReplicatingManifest.permits(UploadState::ReplicatingChunks));
         assert!(UploadState::Committed.permits(UploadState::Committed));
+    }
+
+    #[test]
+    fn schema_v1_migrates_chunk_plans_to_envelope_v1() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+CREATE TABLE upload_chunks (
+    upload_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    plaintext_len INTEGER NOT NULL,
+    plaintext_hash BLOB NOT NULL,
+    nonce BLOB NOT NULL,
+    ciphertext_hash TEXT,
+    ciphertext_len INTEGER,
+    PRIMARY KEY(upload_id, ordinal)
+);
+PRAGMA user_version = 1;
+"#,
+            )
+            .unwrap();
+        let upload_id = Uuid::new_v4();
+        connection
+            .execute(
+                "INSERT INTO upload_chunks
+                 (upload_id, ordinal, plaintext_len, plaintext_hash, nonce)
+                 VALUES (?1, 0, 3, ?2, ?3)",
+                params![
+                    upload_id.to_string(),
+                    [4_u8; 32].as_slice(),
+                    [5_u8; NONCE_LEN].as_slice(),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        let chunks = database.chunks(upload_id).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].envelope_version, 1);
+        let version: i64 = database
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 }

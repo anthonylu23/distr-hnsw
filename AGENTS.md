@@ -1,8 +1,9 @@
 # distr-hnsw
 
-Pre-implementation design for a self-hosted, Tailscale-native distributed
-semantic storage service: replicated encrypted blobs plus distributed HNSW
-vector search. The full design is in `DESIGN.md`.
+Self-hosted, Tailscale-native distributed semantic storage service: replicated
+encrypted blobs plus distributed HNSW vector search. Product design lives in
+`DESIGN.md`. M0 is accepted; M1 Pass 1 (blob-plane commit spine) is implemented
+under `crates/distr-hnsw/` and is still short of the full M1 exit gate.
 
 
 ## Stack

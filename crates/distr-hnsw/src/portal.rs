@@ -13,7 +13,9 @@ use uuid::Uuid;
 use crate::{
     crypto::{
         decrypt_chunk, encrypt_chunk, random_key, random_nonce, unwrap_key, wrap_key, MasterKey,
+        ENVELOPE_VERSION,
     },
+    durability::sync_directory,
     format::{decode_manifest, encode_manifest, ChunkRecord, ManifestPayload},
     metadata::{Database, FileRecord, NewChunk, NewUpload, UploadState},
     object::{ObjectHash, ObjectKind},
@@ -129,23 +131,32 @@ impl Portal {
         source: &Path,
         idempotency_key: &str,
     ) -> Result<Uuid, PortalError> {
-        self.verify_remote_agents().await?;
-        let inspection = inspect_source(source)?;
-        let fingerprint = request_fingerprint(&inspection, STORAGE_CLASS);
         let mut upload = match self.database.upload_by_idempotency(idempotency_key)? {
+            Some(existing) if existing.state == UploadState::Committed => {
+                if source.exists() {
+                    let inspection = inspect_source(source)?;
+                    let fingerprint = request_fingerprint(&inspection, STORAGE_CLASS);
+                    if existing.request_fingerprint != fingerprint {
+                        return Err(PortalError::IdempotencyConflict);
+                    }
+                }
+                return Ok(existing.file_id);
+            }
             Some(existing) => {
+                self.verify_remote_agents().await?;
+                let inspection = inspect_source(source)?;
+                let fingerprint = request_fingerprint(&inspection, STORAGE_CLASS);
                 if existing.request_fingerprint != fingerprint {
                     return Err(PortalError::IdempotencyConflict);
                 }
                 existing
             }
             None => {
-                let upload = new_upload(
-                    idempotency_key,
-                    inspection.clone(),
-                    fingerprint,
-                    &self.master_key,
-                )?;
+                self.verify_remote_agents().await?;
+                let inspection = inspect_source(source)?;
+                let fingerprint = request_fingerprint(&inspection, STORAGE_CLASS);
+                let upload =
+                    new_upload(idempotency_key, inspection, fingerprint, &self.master_key)?;
                 self.database.create_upload(&upload)?;
                 self.database
                     .upload_by_idempotency(idempotency_key)?
@@ -153,9 +164,6 @@ impl Portal {
             }
         };
 
-        if upload.state == UploadState::Committed {
-            return Ok(upload.file_id);
-        }
         self.hit(Failpoint::AfterPlan)?;
 
         if upload.state == UploadState::Staging {
@@ -176,12 +184,13 @@ impl Portal {
         let mut chunk_records = Vec::new();
         for plan in self.database.chunks(upload.upload_id)? {
             let mut plaintext = vec![0_u8; plan.plaintext_len as usize];
-            source_file.read_exact(&mut plaintext)?;
+            read_exact_or_source_changed(&mut source_file, &mut plaintext)?;
             if blake3::hash(&plaintext).as_bytes() != &plan.plaintext_hash {
                 return Err(PortalError::SourceChanged);
             }
             let ciphertext = encrypt_chunk(
                 &content_key,
+                plan.envelope_version,
                 upload.file_id,
                 plan.ordinal,
                 plan.plaintext_len,
@@ -253,6 +262,8 @@ impl Portal {
         )
         .await?;
         self.hit(Failpoint::AfterManifestDurable)?;
+        self.ensure_live_replica_floor(upload.upload_id, &manifest_hash)
+            .await?;
         self.hit(Failpoint::BeforeCommit)?;
         let file = self
             .database
@@ -302,6 +313,7 @@ impl Portal {
                 }
                 let plaintext = decrypt_chunk(
                     &content_key,
+                    ENVELOPE_VERSION,
                     manifest.file_id,
                     chunk.ordinal,
                     chunk.plaintext_len,
@@ -322,6 +334,9 @@ impl Portal {
             output.sync_all()?;
             drop(output);
             fs::rename(&temporary, destination)?;
+            if let Some(parent) = destination.parent() {
+                sync_directory(parent)?;
+            }
             Ok(())
         }
         .await;
@@ -343,20 +358,28 @@ impl Portal {
         first_replica_failpoint: Failpoint,
         confirmation_count: &mut usize,
     ) -> Result<(), PortalError> {
-        for agent in &self.agents {
+        let mut last_failure = None;
+        for agent in self.agents.clone() {
             if self.database.placement_confirmed(kind, hash, &agent.id)? {
                 continue;
             }
             self.database
                 .ensure_pending_placement(kind, hash, &agent.id, &agent.failure_domain)?;
             let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
-            let response = self.client.put(url).body(bytes.to_vec()).send().await?;
+            let response = match self.client.put(url).body(bytes.to_vec()).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    last_failure = Some(PortalError::Http(error));
+                    continue;
+                }
+            };
             if !response.status().is_success() {
-                return Err(PortalError::AgentRejected {
+                last_failure = Some(PortalError::AgentRejected {
                     agent: agent.id.clone(),
                     status: response.status().as_u16(),
                     body: response.text().await.unwrap_or_default(),
                 });
+                continue;
             }
             self.database.confirm_placement(kind, hash, &agent.id)?;
             *confirmation_count += 1;
@@ -365,9 +388,74 @@ impl Portal {
             }
         }
         if self.database.confirmed_domains(kind, hash)? < MINIMUM_REPLICAS {
-            return Err(PortalError::ReplicaFloorNotMet {
+            return Err(
+                last_failure.unwrap_or_else(|| PortalError::ReplicaFloorNotMet {
+                    kind,
+                    hash: hash.clone(),
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    async fn ensure_live_replica_floor(
+        &self,
+        upload_id: Uuid,
+        manifest_hash: &ObjectHash,
+    ) -> Result<(), PortalError> {
+        self.require_live_domains(ObjectKind::Manifest, manifest_hash)
+            .await?;
+        for chunk in self.database.chunks(upload_id)? {
+            let hash = chunk
+                .ciphertext_hash
+                .ok_or(PortalError::MissingChunkObject)?;
+            self.require_live_domains(ObjectKind::Chunk, &hash).await?;
+        }
+        Ok(())
+    }
+
+    async fn require_live_domains(
+        &self,
+        kind: ObjectKind,
+        hash: &ObjectHash,
+    ) -> Result<(), PortalError> {
+        let agent_map: HashMap<_, _> = self
+            .agents
+            .iter()
+            .map(|agent| (agent.id.as_str(), agent))
+            .collect();
+        let mut live_domains = HashSet::new();
+        let mut last_error = None;
+        for agent_id in self.database.confirmed_agents(kind, hash)? {
+            let Some(agent) = agent_map.get(agent_id.as_str()) else {
+                continue;
+            };
+            let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
+            match self.client.get(url).send().await {
+                Ok(response) if response.status().is_success() => match response.bytes().await {
+                    Ok(bytes) if ObjectHash::digest(&bytes) == *hash => {
+                        live_domains.insert(agent.failure_domain.as_str());
+                    }
+                    Ok(_) => last_error = Some("portal hash verification failed".to_owned()),
+                    Err(error) => last_error = Some(error.to_string()),
+                },
+                Ok(response) => {
+                    last_error = Some(format!("agent returned HTTP {}", response.status()))
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        if live_domains.len() < MINIMUM_REPLICAS {
+            return Err(PortalError::NoValidReplica {
                 kind,
                 hash: hash.clone(),
+                detail: last_error.unwrap_or_else(|| {
+                    format!(
+                        "live replica floor not met ({}/{})",
+                        live_domains.len(),
+                        MINIMUM_REPLICAS
+                    )
+                }),
             });
         }
         Ok(())
@@ -409,23 +497,37 @@ impl Portal {
     }
 
     async fn verify_remote_agents(&self) -> Result<(), PortalError> {
+        let mut live_domains = HashSet::new();
+        let mut last_failure = None;
         for agent in &self.agents {
-            let response = self
+            let response = match self
                 .client
                 .get(format!("{}/v1/health", agent.base_url))
                 .send()
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    last_failure = Some(PortalError::Http(error));
+                    continue;
+                }
+            };
             if !response.status().is_success() {
-                return Err(PortalError::AgentRejected {
+                last_failure = Some(PortalError::AgentRejected {
                     agent: agent.id.clone(),
                     status: response.status().as_u16(),
                     body: response.text().await.unwrap_or_default(),
                 });
+                continue;
             }
             let identity: RemoteAgentIdentity = response.json().await?;
             if identity.id != agent.id || identity.failure_domain != agent.failure_domain {
                 return Err(PortalError::AgentIdentityMismatch(agent.id.clone()));
             }
+            live_domains.insert(agent.failure_domain.as_str());
+        }
+        if live_domains.len() < MINIMUM_REPLICAS {
+            return Err(last_failure.unwrap_or(PortalError::InsufficientFailureDomains));
         }
         Ok(())
     }
@@ -537,6 +639,7 @@ fn new_upload(
     for (ordinal, inspected) in (0..chunk_count).zip(inspection.chunks) {
         chunks.push(NewChunk {
             ordinal,
+            envelope_version: ENVELOPE_VERSION,
             plaintext_len: inspected.plaintext_len,
             plaintext_hash: inspected.plaintext_hash,
             nonce: random_nonce(),
@@ -586,6 +689,19 @@ fn validate_manifest_file(
     Ok(())
 }
 
+fn read_exact_or_source_changed(
+    file: &mut impl Read,
+    buffer: &mut [u8],
+) -> Result<(), PortalError> {
+    match file.read_exact(buffer) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(PortalError::SourceChanged)
+        }
+        Err(error) => Err(PortalError::Io(error)),
+    }
+}
+
 #[derive(Deserialize)]
 struct RemoteAgentIdentity {
     id: String,
@@ -612,6 +728,8 @@ pub enum PortalError {
     IdempotencyConflict,
     #[error("persisted upload disappeared")]
     MissingUpload,
+    #[error("chunk object plan is incomplete")]
+    MissingChunkObject,
     #[error("file is not committed or visible: {0}")]
     FileNotVisible(Uuid),
     #[error("download destination already exists: {0}")]
@@ -652,4 +770,20 @@ pub enum PortalError {
     Http(#[from] reqwest::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn unexpected_eof_while_reading_chunks_is_source_changed() {
+        let mut cursor = Cursor::new(vec![1_u8, 2, 3]);
+        let mut buffer = [0_u8; 8];
+        assert!(matches!(
+            read_exact_or_source_changed(&mut cursor, &mut buffer),
+            Err(PortalError::SourceChanged)
+        ));
+    }
 }

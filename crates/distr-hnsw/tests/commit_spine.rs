@@ -268,3 +268,215 @@ async fn empty_file_commits_as_a_manifest_without_chunks() {
     portal.download(file_id, &destination).await.unwrap();
     assert_eq!(fs::read(destination).unwrap(), Vec::<u8>::new());
 }
+
+#[tokio::test]
+async fn committed_retry_does_not_require_agents_or_source() {
+    let agent_a = start_agent("agent-a", "host-a").await;
+    let agent_b = start_agent("agent-b", "host-b").await;
+    let workspace = tempfile::tempdir().unwrap();
+    let key_path = workspace.path().join("master.key");
+    let database_path = workspace.path().join("portal.sqlite");
+    let source = workspace.path().join("source.bin");
+    write_source(&source);
+    MasterKey::create(&key_path).unwrap();
+
+    let key = MasterKey::load(&key_path).unwrap();
+    let mut portal = Portal::open(
+        &database_path,
+        key,
+        vec![agent_a.target.clone(), agent_b.target.clone()],
+    )
+    .unwrap();
+    let file_id = portal.upload(&source, "already-committed").await.unwrap();
+    drop(portal);
+    drop(agent_a);
+    drop(agent_b);
+    fs::remove_file(&source).unwrap();
+
+    let key = MasterKey::load(&key_path).unwrap();
+    let mut portal = Portal::open(
+        &database_path,
+        key,
+        vec![
+            AgentTarget {
+                id: "gone-a".to_owned(),
+                failure_domain: "gone-a".to_owned(),
+                base_url: "http://127.0.0.1:1".to_owned(),
+            },
+            AgentTarget {
+                id: "gone-b".to_owned(),
+                failure_domain: "gone-b".to_owned(),
+                base_url: "http://127.0.0.1:2".to_owned(),
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        portal.upload(&source, "already-committed").await.unwrap(),
+        file_id
+    );
+}
+
+#[tokio::test]
+async fn rf2_succeeds_when_an_extra_agent_rejects() {
+    let agent_a = start_agent("agent-a", "host-a").await;
+    let agent_b = start_agent("agent-b", "host-b").await;
+    let (agent_c, rejecting_task) = start_rejecting_agent("agent-c", "host-c").await;
+    let workspace = tempfile::tempdir().unwrap();
+    let key_path = workspace.path().join("master.key");
+    let database_path = workspace.path().join("portal.sqlite");
+    let source = workspace.path().join("source.bin");
+    let expected = write_source(&source);
+    MasterKey::create(&key_path).unwrap();
+
+    let key = MasterKey::load(&key_path).unwrap();
+    let mut portal = Portal::open(
+        &database_path,
+        key,
+        vec![agent_c, agent_a.target.clone(), agent_b.target.clone()],
+    )
+    .unwrap();
+    let file_id = portal.upload(&source, "extra-agent").await.unwrap();
+    let destination = workspace.path().join("extra.download");
+    portal.download(file_id, &destination).await.unwrap();
+    assert_eq!(fs::read(destination).unwrap(), expected);
+    rejecting_task.abort();
+}
+
+#[tokio::test]
+async fn rf2_succeeds_when_an_extra_agent_is_unavailable() {
+    let agent_a = start_agent("agent-a", "host-a").await;
+    let agent_b = start_agent("agent-b", "host-b").await;
+    let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_address = unavailable_listener.local_addr().unwrap();
+    drop(unavailable_listener);
+    let unavailable = AgentTarget {
+        id: "agent-c".to_owned(),
+        failure_domain: "host-c".to_owned(),
+        base_url: format!("http://{unavailable_address}"),
+    };
+    let workspace = tempfile::tempdir().unwrap();
+    let key_path = workspace.path().join("master.key");
+    let database_path = workspace.path().join("portal.sqlite");
+    let source = workspace.path().join("source.bin");
+    let expected = write_source(&source);
+    MasterKey::create(&key_path).unwrap();
+
+    let key = MasterKey::load(&key_path).unwrap();
+    let mut portal = Portal::open(
+        &database_path,
+        key,
+        vec![unavailable, agent_a.target.clone(), agent_b.target.clone()],
+    )
+    .unwrap();
+    let file_id = portal.upload(&source, "unavailable-extra").await.unwrap();
+    let destination = workspace.path().join("unavailable-extra.download");
+    portal.download(file_id, &destination).await.unwrap();
+    assert_eq!(fs::read(destination).unwrap(), expected);
+}
+
+#[tokio::test]
+async fn changed_source_on_retry_is_idempotency_conflict() {
+    let agent_a = start_agent("agent-a", "host-a").await;
+    let agent_b = start_agent("agent-b", "host-b").await;
+    let workspace = tempfile::tempdir().unwrap();
+    let key_path = workspace.path().join("master.key");
+    let database_path = workspace.path().join("portal.sqlite");
+    let source = workspace.path().join("source.bin");
+    write_source(&source);
+    MasterKey::create(&key_path).unwrap();
+
+    let key = MasterKey::load(&key_path).unwrap();
+    let mut portal = Portal::open(
+        &database_path,
+        key,
+        vec![agent_a.target.clone(), agent_b.target.clone()],
+    )
+    .unwrap()
+    .with_failpoint(Failpoint::AfterPlan, FailpointAction::ReturnError);
+    assert!(matches!(
+        portal.upload(&source, "shrink-source").await,
+        Err(PortalError::InjectedFailure(Failpoint::AfterPlan))
+    ));
+    drop(portal);
+
+    fs::write(&source, b"tiny").unwrap();
+    let key = MasterKey::load(&key_path).unwrap();
+    let mut portal = Portal::open(
+        &database_path,
+        key,
+        vec![agent_a.target.clone(), agent_b.target.clone()],
+    )
+    .unwrap();
+    assert!(matches!(
+        portal.upload(&source, "shrink-source").await,
+        Err(PortalError::IdempotencyConflict)
+    ));
+}
+
+#[tokio::test]
+async fn commit_refuses_when_confirmed_replicas_are_gone() {
+    let agent_a = start_agent("agent-a", "host-a").await;
+    let agent_b = start_agent("agent-b", "host-b").await;
+    let workspace = tempfile::tempdir().unwrap();
+    let key_path = workspace.path().join("master.key");
+    let database_path = workspace.path().join("portal.sqlite");
+    let source = workspace.path().join("source.bin");
+    write_source(&source);
+    MasterKey::create(&key_path).unwrap();
+
+    let key = MasterKey::load(&key_path).unwrap();
+    let mut portal = Portal::open(
+        &database_path,
+        key,
+        vec![agent_a.target.clone(), agent_b.target.clone()],
+    )
+    .unwrap()
+    .with_failpoint(
+        Failpoint::AfterManifestDurable,
+        FailpointAction::ReturnError,
+    );
+    assert!(matches!(
+        portal.upload(&source, "missing-replicas").await,
+        Err(PortalError::InjectedFailure(
+            Failpoint::AfterManifestDurable
+        ))
+    ));
+    drop(portal);
+
+    let database = Database::open(&database_path).unwrap();
+    let upload = database
+        .upload_by_idempotency("missing-replicas")
+        .unwrap()
+        .unwrap();
+    let manifest_hash = upload.manifest_hash.clone().unwrap();
+    let chunk_hashes: Vec<_> = database
+        .chunks(upload.upload_id)
+        .unwrap()
+        .into_iter()
+        .filter_map(|chunk| chunk.ciphertext_hash)
+        .collect();
+    drop(database);
+
+    let store_a = DurableStore::open(agent_a.volume.path()).unwrap();
+    let store_b = DurableStore::open(agent_b.volume.path()).unwrap();
+    for hash in chunk_hashes.iter().chain(std::iter::once(&manifest_hash)) {
+        let _ = fs::remove_file(store_a.object_path(ObjectKind::Chunk, hash));
+        let _ = fs::remove_file(store_a.object_path(ObjectKind::Manifest, hash));
+        let _ = fs::remove_file(store_b.object_path(ObjectKind::Chunk, hash));
+        let _ = fs::remove_file(store_b.object_path(ObjectKind::Manifest, hash));
+    }
+
+    let key = MasterKey::load(&key_path).unwrap();
+    let mut portal = Portal::open(
+        &database_path,
+        key,
+        vec![agent_a.target.clone(), agent_b.target.clone()],
+    )
+    .unwrap();
+    assert!(matches!(
+        portal.upload(&source, "missing-replicas").await,
+        Err(PortalError::NoValidReplica { .. })
+    ));
+    assert!(!portal.is_visible(upload.file_id).unwrap());
+}

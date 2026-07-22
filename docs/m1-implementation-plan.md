@@ -8,14 +8,19 @@ the current first pass.
 
 Pass 1 is implemented locally. The product crate under `crates/distr-hnsw`
 provides loopback agent processes plus portal `init`, `put`, and `get` commands.
-Tests cover canonical authenticated manifests, durable object idempotency and
-hash verification, state-transition legality, conflicting upload idempotency,
-RF2 refusal, partial visibility, corrupt-replica fallback/fail-closed behavior,
-and abrupt portal exit at every named boundary.
+Tests cover canonical authenticated manifests (including decoder negatives),
+durable object idempotency and hash verification, state-transition legality,
+conflicting upload idempotency, RF2 refusal, RF2 success with a rejecting
+extra agent, committed idempotent retry without live agents/source, live
+replica revalidation before commit, partial visibility, corrupt-replica
+fallback/fail-closed behavior, and abrupt portal exit at every named boundary
+with pre-commit invisibility checks.
 
 This is not M1 acceptance. Linux filesystem review, delete/lifecycle work,
 inventory reconstruction, independent recovery, and the blank-infrastructure
-drill remain open.
+drill remain open. SQLite schema version is 2 (per-chunk `envelope_version`);
+schema-v1 Pass 1 databases migrate atomically with existing chunks retaining
+the byte-compatible v1 AAD contract.
 
 ## Pass 1 — commit spine
 
