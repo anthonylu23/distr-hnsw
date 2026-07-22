@@ -32,6 +32,15 @@ Then build the smallest recovery-first slice:
 3. Durable portal commit state machine and immutable recovery objects.
 4. Failure injection and an empty-infrastructure restore drill.
 
+The implemented first-pass contract and implementation dependency graph are in
+[m1-storage-contract.md](m1-storage-contract.md) and
+[m1-implementation-plan.md](m1-implementation-plan.md). Pass 1 provides the
+commit spine through restart-safe RF2 upload and byte-identical download;
+M1 remains **In progress**. The next pass should pin and implement deletion
+markers plus inventory-driven reconstruction before repair/GC. Backup,
+independent key recovery, supported-filesystem review, and the
+blank-infrastructure restore remain later M1 gates.
+
 ## Ops notes
 
 - `ssh anthonylu@anthonypc` may require a one-time Tailscale SSH browser check.

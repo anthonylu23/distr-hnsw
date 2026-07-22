@@ -1,0 +1,31 @@
+[package]
+name = "distr-hnsw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Self-hosted distributed semantic storage service"
+publish = false
+
+[[bin]]
+name = "distr-hnsw"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+blake3 = "1"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+libc = "0.2"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

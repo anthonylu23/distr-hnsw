@@ -41,6 +41,11 @@ vector search. The full design is in `DESIGN.md`.
 - `AGENTS.md` / `CLAUDE.md` — repository guidance.
 - `docs/` — living documentation (phase status, next steps).
 - `docs/roadmap.md` — gated milestones, acceptance criteria, and verification.
+- `docs/m1-storage-contract.md` — persistent-format and durability contract for
+  the active M1 implementation pass.
+- `docs/m1-implementation-plan.md` — M1 work packages and dependency order.
+- `crates/distr-hnsw/` — product service and CLI; keep this separate from the
+  disposable phase-0 prototype.
 - `prototype/` — **disposable** phase-0 validation CLI (`distr-hnsw-validate`).
   Not product code; do not grow it into the distributed service. See
   `docs/phase-0-validation.md`.

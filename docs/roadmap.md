@@ -11,7 +11,7 @@ design first and then bring this document back into alignment.
 | Milestone | State | Exit gate |
 |---|---|---|
 | M0 — Semantic validation | **Accepted** | Larger representative bake-off produces a documented go decision and locks the default local model and dimensions |
-| M1 — Blob plane and recovery foundation | Not started | Blob durability and an empty-infrastructure restore drill pass |
+| M1 — Blob plane and recovery foundation | **In progress** | Blob durability and an empty-infrastructure restore drill pass |
 | M2 — Tailscale identity and authorization | Not started | Network identity, sessions, grants, and API-key boundaries pass adversarial tests |
 | M3 — Single-partition vector engine | Not started | Persistence, recovery, recall, filtering, and compaction gates pass against brute force |
 | M4 — Distributed vector plane | Not started | Quorum, fencing, promotion, movement, and balancing survive failure injection |
@@ -28,6 +28,14 @@ non-inferiority tie-break locks `nomic-embed-text @ 512` with a 0.001 nDCG gap
 to the best eligible dimension. M0 is accepted and M1 is unblocked. See
 [phase-0-validation.md](phase-0-validation.md) and
 [next-steps.md](next-steps.md).
+
+M1 pass 1 now implements the loopback-only RF2 commit spine: durable opaque
+agent writes, versioned encrypted chunks/manifests, a restart-safe SQLite state
+machine, and byte-identical download. The full M1 gate remains open pending
+delete/lifecycle correctness, offsite backup and independent key recovery,
+inventory reconstruction, supported-filesystem review, and the
+empty-infrastructure restore drill. See
+[m1-implementation-plan.md](m1-implementation-plan.md).
 
 ## How milestones are governed
 
