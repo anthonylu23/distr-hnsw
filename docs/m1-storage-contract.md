@@ -1,101 +1,116 @@
 # M1 storage contract
 
-This document pins the first implementation pass for the M1 blob-plane commit
-spine. It is subordinate to `DESIGN.md` and `docs/roadmap.md`; later M1 work
-extends these rules without weakening them.
+This document pins the implemented M1 blob-plane contract through pass 2. It
+is subordinate to `DESIGN.md` and `docs/roadmap.md`; later M1 work may extend
+these rules but must not weaken their durability or recovery invariants.
 
-## First-pass boundary
+## Implemented boundary
 
-The first pass supports one regular-file class, seekable local input, fixed
-4 MiB plaintext chunks, a file-backed master key, and RF2 across two agents in
-distinct configured failure domains. Agents and the portal bind to loopback for
-development. Tailscale identity and production authorization remain M2 work.
+The product supports one regular-file class, seekable local input, fixed 4 MiB
+plaintext chunks, a file-backed master key, and RF2 across two agents in
+distinct configured failure domains. It now includes restart-safe logical
+deletion, paginated agent inventories, deterministic recovery planning, and
+explicit recovery application with recovery-only repair.
 
-Delete markers, repair, movement, garbage collection, offsite backup, and
-empty-infrastructure restore are later M1 passes. Until the full M1 exit gate
-passes, the service must not hold the only copy of a file or claim recovery
-readiness.
+Agents remain loopback-only and unauthenticated for M1 development. Physical
+deletion, continuous reconciliation, movement, node retirement, quotas, GC,
+offsite backup, independent key recovery, and blank-infrastructure restore are
+not implemented. Until the full M1 exit gate passes, the service must not hold
+the only copy of a file or claim recovery readiness.
 
-## Object identities and namespaces
+## Immutable object namespaces
 
 Every stored object is immutable and addressed by the lowercase hexadecimal
-BLAKE3 digest of its complete stored bytes. Agents maintain distinct `chunk`
-and `manifest` namespaces, each fanned out by the first four hash digits:
+BLAKE3 digest of its complete stored bytes. Agents maintain distinct `chunk`,
+`manifest`, and `deletion_marker` namespaces:
 
 ```text
 objects/<kind>/<hash[0..2]>/<hash[2..4]>/<hash>
 ```
 
-Agents treat bytes as opaque. They verify the supplied digest before a PUT is
-acknowledged and verify stored bytes on GET. Acknowledgement follows a
+Agents treat bytes as opaque. PUT verifies the supplied digest before
+acknowledgement; GET verifies stored bytes. Acknowledgement follows a
 same-directory temporary write, file sync, atomic rename, and parent-directory
 sync. Linux uses `fsync`; macOS requests `F_FULLFSYNC` for regular files and
 uses directory `fsync` for rename persistence.
 
-## Encryption plan
+`GET /v1/inventory/{kind}?after=<hash>&limit=<n>` returns hash-sorted
+`{objects:[{hash,size}],next_after}` pages. The cursor is exclusive and the
+default and maximum page size are 1,000. Malformed fanout entries fail the
+page; recovery never silently omits them.
 
-Before any chunk is dispatched, the portal prehashes the seekable source and
-persists:
+## Upload and manifest commit
 
-- file and upload identifiers;
-- plaintext BLAKE3 digest and length;
-- the idempotency request fingerprint;
-- the wrapped per-file content key;
-- envelope version, plaintext digest, and one random nonce per chunk;
-- the selected storage class.
+Before dispatch, the portal prehashes the source and durably records the file
+and upload identifiers, request fingerprint, wrapped per-file content key,
+plaintext digest and length, chunk nonces, and storage class. The fingerprint
+covers plaintext digest, size, display name, and storage class. Reusing a key
+for another request conflicts. Each chunk is rehashed immediately before
+encryption to prevent nonce reuse if the source changes.
 
-The request fingerprint covers the plaintext digest, size, display name, and
-storage class. Reusing an idempotency key with another fingerprint is rejected
-before encryption. Each chunk is rehashed and compared with its persisted plan
-immediately before encryption, preventing key/nonce reuse if the source changes
-between the initial prehash and dispatch.
+The manifest v1 envelope retains its existing format: a clear magic, version,
+file id, and generation header authenticates an encrypted payload containing
+file metadata, wrapped content key, and ordered chunk records. Decoders reject
+trailing bytes, unsupported versions, invalid lengths, tampering, and wrong
+keys.
 
-Chunk AAD authenticates the envelope version, file id, ordinal, and plaintext
-length. Ciphertext, including the Poly1305 tag, is the stored chunk object.
+The portal persists exact manifest bytes and hash before dispatch. A file is
+visible only after its manifest and all referenced chunks have confirmed RF2
+placements in distinct failure domains and SQLite commits the projection.
 
-## Manifest format and commit decision
+## Logical deletion
 
-The manifest is a versioned binary envelope with a minimal cleartext header
-containing magic, envelope version, file id, and generation. Its encrypted
-payload contains the display name, original length and digest, wrapped content
-key, and the ordered chunk nonce/hash/length records. Integer fields are
-little-endian and strings/byte arrays are length-prefixed; decoders reject
-trailing bytes, unsupported versions, and unreasonable lengths.
+`portal delete --idempotency-key <key> <file-id>` creates generation
+`current_generation + 1`. Deletion marker v1 uses a clear magic, version, file
+id, and generation header plus an authenticated encrypted `deleted_at`
+payload. Exact bytes and hash are persisted before replication.
 
-After every chunk reaches RF2, the portal constructs and persists the exact
-manifest bytes and hash before manifest dispatch. From that point the upload is
-irrevocable commit intent: restart recovery must retry the same manifest to RF2
-and finish the SQLite commit. Chunks without a persisted manifest remain
-uncommitted staging objects. This first pass does not reconstruct an upload
-from agent inventories alone; that is required before the full M1 recovery
-gate.
+The marker must reach RF2 before one SQLite transaction inserts its immutable
+generation record, changes the current file projection to `deleted`, and marks
+the operation committed. Downloads remain available before that transaction
+and are denied afterward. Reusing the same key resumes or returns the same
+success. A key reused for another file conflicts; a new key for an already
+deleted file returns `AlreadyDeleted`. Logical deletion never calls agent
+DELETE and never removes older manifests or chunks.
 
-Only the SQLite `committed` state is visible or downloadable. A transaction
-that exposes the file is permitted only after the manifest and every referenced
-chunk have two confirmed placements in distinct failure domains.
+## SQLite schema v2
 
-## State transitions
+Schema v2 stores `files` as the current projection with generation and
+`committed`, `deleted`, or `recovery_blocked` state. It adds immutable
+`file_manifests`, `file_chunks`, `deletion_markers`, restartable
+`delete_operations`, and `recovery_issues`; placements accept all three object
+kinds. Opening a v1 database migrates it in one transaction, preserving
+committed uploads, chunks, placements, and the exact existing manifest bytes.
+Unknown future schema versions are rejected.
 
-```text
-staging -> replicating_chunks -> replicating_manifest -> committed
-```
+## Recovery contract
 
-Retries may remain in the same state or advance. Regression is illegal.
-Placements independently transition from `pending` to `confirmed`; a failed
-attempt stays pending and can be retried. The later lifecycle pass adds
-`orphaned` after its cleanup and retirement rules are pinned.
+`portal recover` is read-only planning; `portal recover --apply` is the only
+recovery mutation path. Both emit deterministic `RecoveryReportV1` JSON with
+mode, inventory digest, agent summaries, per-file decisions, repairs, issues,
+conflicts, and totals. Exit status is 0 when converged, 2 when files remain
+blocked, and 1 for a global operational or trust failure.
 
-## First-pass crash points
+Recovery inventories every configured agent, verifies listed sizes and object
+hashes, decrypts manifests and markers, merges immutable evidence with SQLite,
+and chooses the highest generation per file. Different immutable objects or a
+manifest/marker collision at the same winning generation block the file and
+are never exposed.
 
-The test harness injects process-equivalent failure after:
+Apply converges per file. A winning manifest requires itself and every
+referenced chunk at RF2; a winning marker requires the marker at RF2. A valid
+source copy is repaired to deterministic missing agents in distinct failure
+domains before SQLite exposure. Older generations remain untouched. Missing
+or corrupt required objects persist a recovery issue and make a live winner
+`recovery_blocked`; an existing or winning deletion remains unreadable even
+when its marker cannot regain RF2. Wrong keys, malformed inventories,
+unavailable agents, or another untrustworthy global scan abort without
+mutation.
 
-1. encryption-plan persistence;
-2. the first confirmed chunk replica;
-3. all chunks reach RF2;
-4. the first confirmed manifest replica;
-5. the manifest reaches RF2;
-6. immediately before the committing transaction;
-7. immediately after that transaction.
+## Named crash boundaries
 
-Restart with the same idempotency key must converge on one file id and one set
-of ciphertext objects. No pre-commit state may be read through the file API.
+Upload tests abruptly stop after plan persistence, first chunk replica, chunks
+at RF2, first manifest replica, manifest at RF2, before commit, and after
+commit. Delete tests stop after plan persistence, first marker replica, marker
+at RF2, before tombstone commit, and after commit. Retrying with the same
+idempotency key must converge without premature visibility changes.

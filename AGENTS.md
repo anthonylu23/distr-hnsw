@@ -42,7 +42,7 @@ vector search. The full design is in `DESIGN.md`.
 - `docs/` — living documentation (phase status, next steps).
 - `docs/roadmap.md` — gated milestones, acceptance criteria, and verification.
 - `docs/m1-storage-contract.md` — persistent-format and durability contract for
-  the active M1 implementation pass.
+  the implemented M1 blob-plane passes.
 - `docs/m1-implementation-plan.md` — M1 work packages and dependency order.
 - `crates/distr-hnsw/` — product service and CLI; keep this separate from the
   disposable phase-0 prototype.
@@ -86,3 +86,9 @@ beside the stage tree, not inside it, so prepare does not index labels. Run
 DESIGN §15 (`docs/phase-0-validation.md`). Do not retune the holdout or grow the
 prototype into product code. M1 is unblocked and starts with the recovery-first
 blob-plane slice in `docs/roadmap.md`.
+
+**M1 status:** In progress. Passes 1 and 2 implement the RF2 commit spine,
+logical deletion, strict inventories, SQLite v2 migration, and explicit
+plan/apply recovery with recovery-only repair. Do not add agent DELETE or GC
+until node observation, retention, and retirement invariants are pinned. Large
+storage/recovery matrices remain `anthonypc` work.

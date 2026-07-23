@@ -315,7 +315,8 @@ garbage eligible for later collection—never a visible partial file.
 
 Delete first replicates an immutable deletion marker `(file_id, generation,
 deleted_at)` to the file's durability floor, then commits the SQLite tombstone
-and revokes active shares. Reads and index results stop immediately. During
+and revokes active shares. Reads remain available until that final transaction
+and stop afterward. During
 recovery, the highest manifest/deletion generation wins, so stale metadata does
 not resurrect a deleted file.
 
@@ -862,6 +863,12 @@ a calendar rather than in the abstract.
    remains first because everything above it—snapshots, WALs, and source
    documents—stands on it. distr-hnsw may not hold the only copy of a file until
    this recovery gate passes.
+
+   Current implementation status: passes 1 and 2 provide the RF2 upload spine,
+   logical deletion without agent DELETE, strict object inventories, SQLite v2
+   migration, and explicit plan/apply recovery with recovery-only repair. M1
+   remains in progress; reconciliation, lifecycle/GC, backup/key recovery, and
+   the empty-infrastructure restore gate are still open.
 2. **Tailscale auth + sessions + API keys** (~2–4 weeks) — WhoIs provider,
    certs, bind discipline, ACL docs.
 3. **Single-partition vector engine** (~1–2 months) — HNSW

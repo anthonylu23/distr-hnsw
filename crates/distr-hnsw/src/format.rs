@@ -13,9 +13,11 @@ use crate::{
     object::ObjectHash,
 };
 
-const MAGIC: &[u8; 4] = b"DHMF";
+const MANIFEST_MAGIC: &[u8; 4] = b"DHMF";
+const DELETION_MARKER_MAGIC: &[u8; 4] = b"DHDM";
 const MAX_FIELD_LEN: usize = 16 * 1024 * 1024;
 const MANIFEST_KEY_PURPOSE: &[u8] = b"manifest";
+const DELETION_MARKER_KEY_PURPOSE: &[u8] = b"deletion-marker";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChunkRecord {
@@ -42,6 +44,13 @@ pub struct DecodedManifest {
     pub payload: ManifestPayload,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeletionMarker {
+    pub file_id: Uuid,
+    pub generation: u64,
+    pub deleted_at: i64,
+}
+
 pub fn encode_manifest(
     master: &MasterKey,
     file_id: Uuid,
@@ -57,7 +66,7 @@ pub fn encode_manifest(
         &manifest_key,
     )?;
     let payload_nonce = random_nonce();
-    let clear_header = clear_header(file_id, generation);
+    let clear_header = clear_header(MANIFEST_MAGIC, file_id, generation);
     let payload_bytes = encode_payload(payload)?;
     let cipher = XChaCha20Poly1305::new((&manifest_key).into());
     let encrypted_payload = cipher.encrypt(
@@ -78,7 +87,7 @@ pub fn encode_manifest(
 
 pub fn decode_manifest(master: &MasterKey, bytes: &[u8]) -> Result<DecodedManifest, FormatError> {
     let mut reader = Reader::new(bytes);
-    if reader.take(4)? != MAGIC {
+    if reader.take(4)? != MANIFEST_MAGIC {
         return Err(FormatError::BadMagic);
     }
     let version = reader.u16()?;
@@ -119,9 +128,94 @@ pub fn decode_manifest(master: &MasterKey, bytes: &[u8]) -> Result<DecodedManife
     })
 }
 
-fn clear_header(file_id: Uuid, generation: u64) -> Vec<u8> {
+pub fn encode_deletion_marker(
+    master: &MasterKey,
+    file_id: Uuid,
+    generation: u64,
+    deleted_at: i64,
+) -> Result<Vec<u8>, FormatError> {
+    let marker_key = random_key();
+    let wrapped_marker_key = wrap_key(
+        master,
+        DELETION_MARKER_KEY_PURPOSE,
+        file_id,
+        generation,
+        &marker_key,
+    )?;
+    let payload_nonce = random_nonce();
+    let clear_header = clear_header(DELETION_MARKER_MAGIC, file_id, generation);
+    let payload = deleted_at.to_le_bytes();
+    let cipher = XChaCha20Poly1305::new((&marker_key).into());
+    let encrypted_payload = cipher.encrypt(
+        XNonce::from_slice(&payload_nonce),
+        Payload {
+            msg: &payload,
+            aad: &clear_header,
+        },
+    )?;
+
+    let mut output = clear_header;
+    output.extend_from_slice(&wrapped_marker_key.nonce);
+    push_bytes(&mut output, &wrapped_marker_key.ciphertext)?;
+    output.extend_from_slice(&payload_nonce);
+    push_bytes(&mut output, &encrypted_payload)?;
+    Ok(output)
+}
+
+pub fn decode_deletion_marker(
+    master: &MasterKey,
+    bytes: &[u8],
+) -> Result<DeletionMarker, FormatError> {
+    let mut reader = Reader::new(bytes);
+    if reader.take(4)? != DELETION_MARKER_MAGIC {
+        return Err(FormatError::BadMagic);
+    }
+    let version = reader.u16()?;
+    if version != ENVELOPE_VERSION {
+        return Err(FormatError::UnsupportedVersion(version));
+    }
+    let file_id = Uuid::from_slice(reader.take(16)?).map_err(|_| FormatError::InvalidUuid)?;
+    let generation = reader.u64()?;
+    let clear_header_len = reader.position();
+    let wrapped_marker_key = WrappedKey {
+        nonce: reader.array()?,
+        ciphertext: reader.bytes()?.to_vec(),
+    };
+    let payload_nonce: [u8; NONCE_LEN] = reader.array()?;
+    let encrypted_payload = reader.bytes()?;
+    reader.finish()?;
+
+    let marker_key = unwrap_key(
+        master,
+        DELETION_MARKER_KEY_PURPOSE,
+        file_id,
+        generation,
+        &wrapped_marker_key,
+    )?;
+    let cipher = XChaCha20Poly1305::new((&marker_key).into());
+    let plaintext = cipher.decrypt(
+        XNonce::from_slice(&payload_nonce),
+        Payload {
+            msg: encrypted_payload,
+            aad: &bytes[..clear_header_len],
+        },
+    )?;
+    let deleted_at = i64::from_le_bytes(
+        plaintext
+            .as_slice()
+            .try_into()
+            .map_err(|_| FormatError::InvalidDeletionPayload)?,
+    );
+    Ok(DeletionMarker {
+        file_id,
+        generation,
+        deleted_at,
+    })
+}
+
+fn clear_header(magic: &[u8; 4], file_id: Uuid, generation: u64) -> Vec<u8> {
     let mut output = Vec::with_capacity(30);
-    output.extend_from_slice(MAGIC);
+    output.extend_from_slice(magic);
     output.extend_from_slice(&ENVELOPE_VERSION.to_le_bytes());
     output.extend_from_slice(file_id.as_bytes());
     output.extend_from_slice(&generation.to_le_bytes());
@@ -277,6 +371,8 @@ pub enum FormatError {
     InvalidUuid,
     #[error("manifest chunk ordinals are not canonical")]
     NonCanonicalOrdinal,
+    #[error("deletion-marker payload is invalid")]
+    InvalidDeletionPayload,
     #[error(transparent)]
     Crypto(#[from] CryptoError),
     #[error("authenticated manifest encryption or decryption failed")]
@@ -358,5 +454,65 @@ mod tests {
         let encoded = encode_payload(&payload).unwrap();
         assert_eq!(hex::encode(&encoded), expected);
         assert_eq!(decode_payload(&encoded).unwrap(), payload);
+    }
+
+    #[test]
+    fn deletion_marker_v1_round_trip_and_clear_header_golden_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let master = MasterKey::create(&directory.path().join("master.key")).unwrap();
+        let file_id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let encoded = encode_deletion_marker(&master, file_id, 9, -123).unwrap();
+        assert_eq!(
+            hex::encode(&encoded[..30]),
+            "4448444d010000112233445566778899aabbccddeeff0900000000000000"
+        );
+        assert_eq!(
+            decode_deletion_marker(&master, &encoded).unwrap(),
+            DeletionMarker {
+                file_id,
+                generation: 9,
+                deleted_at: -123,
+            }
+        );
+    }
+
+    #[test]
+    fn deletion_marker_rejects_wrong_key_tamper_and_trailing_bytes() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let master = MasterKey::create(&first.path().join("master.key")).unwrap();
+        let wrong = MasterKey::create(&second.path().join("master.key")).unwrap();
+        let file_id = Uuid::new_v4();
+        let encoded = encode_deletion_marker(&master, file_id, 2, 1234).unwrap();
+        assert!(decode_deletion_marker(&wrong, &encoded).is_err());
+
+        let mut tampered = encoded.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(decode_deletion_marker(&master, &tampered).is_err());
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(matches!(
+            decode_deletion_marker(&master, &trailing),
+            Err(FormatError::TrailingBytes)
+        ));
+    }
+
+    #[test]
+    fn deletion_marker_generations_order_numerically() {
+        let directory = tempfile::tempdir().unwrap();
+        let master = MasterKey::create(&directory.path().join("master.key")).unwrap();
+        let file_id = Uuid::new_v4();
+        let first = decode_deletion_marker(
+            &master,
+            &encode_deletion_marker(&master, file_id, 2, 10).unwrap(),
+        )
+        .unwrap();
+        let second = decode_deletion_marker(
+            &master,
+            &encode_deletion_marker(&master, file_id, 11, 20).unwrap(),
+        )
+        .unwrap();
+        assert!(second.generation > first.generation);
     }
 }

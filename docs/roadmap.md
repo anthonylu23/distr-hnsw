@@ -29,12 +29,12 @@ to the best eligible dimension. M0 is accepted and M1 is unblocked. See
 [phase-0-validation.md](phase-0-validation.md) and
 [next-steps.md](next-steps.md).
 
-M1 pass 1 now implements the loopback-only RF2 commit spine: durable opaque
-agent writes, versioned encrypted chunks/manifests, a restart-safe SQLite state
-machine, and byte-identical download. The full M1 gate remains open pending
-delete/lifecycle correctness, offsite backup and independent key recovery,
-inventory reconstruction, supported-filesystem review, and the
-empty-infrastructure restore drill. See
+M1 passes 1 and 2 now implement the loopback-only RF2 commit spine, durable
+logical deletion, strict paginated inventories, SQLite v2 migration, and
+explicit plan/apply recovery with recovery-only RF2 repair. The full M1 gate
+remains open pending physical lifecycle correctness, continuous reconciliation,
+offsite backup and independent key recovery, supported-filesystem review, and
+the empty-infrastructure restore drill. See
 [m1-implementation-plan.md](m1-implementation-plan.md).
 
 ## How milestones are governed
@@ -186,8 +186,9 @@ master key, and no dashboard or user auth.
 
 Implement the milestone in this recovery-first sequence:
 
-1. **Durable opaque-object agent.** Implement PUT, GET, DELETE, inventory,
-   scrub, and health over configured volumes. A successful PUT requires a
+1. **Durable opaque-object agent.** Implement PUT, GET, inventory, scrub, and
+   health over configured volumes; physical DELETE waits for the lifecycle
+   proof. A successful PUT requires a
    temporary write, file sync, atomic rename, and parent-directory sync.
    Agents do not make placement or policy decisions.
 2. **Portal commit state machine.** Persist an idempotent staging/encryption
@@ -219,19 +220,19 @@ working defaults, not unreviewed permanent contracts.
 
 - [ ] Acknowledged object writes survive immediate process and host restart on
   each supported storage platform.
-- [ ] Identical retries converge on the same ciphertext objects and one file
+- [x] Identical retries converge on the same ciphertext objects and one file
   record; conflicting reuse of an idempotency key is rejected.
-- [ ] No staging or partially replicated file is visible or downloadable.
-- [ ] A committed file has a durable replicated manifest and every referenced
+- [x] No staging or partially replicated file is visible or downloadable.
+- [x] A committed file has a durable replicated manifest and every referenced
   chunk meets `minimum_write_replicas` across distinct failure domains.
-- [ ] RF2 stops accepting new writes when both required durable copies cannot
+- [x] RF2 stops accepting new writes when both required durable copies cannot
   be established; the system never silently falls back to one copy.
 - [ ] Policy shortfalls remain visible as degraded even when the durability
   floor permits acknowledgement.
 
 #### Delete, repair, and capacity safety
 
-- [ ] Delete makes a file unreadable only after its deletion marker is durable;
+- [x] Delete makes a file unreadable only after its deletion marker is durable;
   a stale SQLite restore or returning stale node cannot resurrect it.
 - [ ] Repair, rebalance, quota changes, and garbage collection never remove an
   old copy before a replacement is durable and confirmed.
@@ -244,10 +245,10 @@ working defaults, not unreviewed permanent contracts.
 
 #### Recovery
 
-- [ ] A portal crash at every boundary in the commit and delete protocols
+- [x] A portal crash at every boundary in the commit and delete protocols
   recovers to either one complete committed state or harmless collectible
   garbage—never a visible partial file.
-- [ ] Core file records newer than an older SQLite restore point can be
+- [x] Core file records newer than an older SQLite restore point can be
   reconstructed from manifests, deletion markers, and inventories.
 - [ ] The master key can be recovered without relying on any surviving cluster
   machine, and wrong or missing key material fails closed.

@@ -69,6 +69,29 @@ enum PortalCommand {
         file_id: Uuid,
         destination: PathBuf,
     },
+    /// Durably mark a committed file as logically deleted.
+    Delete {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
+        #[arg(long = "agent", required = true)]
+        agents: Vec<AgentTarget>,
+        #[arg(long)]
+        idempotency_key: String,
+        file_id: Uuid,
+    },
+    /// Plan recovery from agent inventories, optionally repairing and applying it.
+    Recover {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
+        #[arg(long = "agent", required = true)]
+        agents: Vec<AgentTarget>,
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[tokio::main]
@@ -132,6 +155,38 @@ async fn main() -> anyhow::Result<()> {
                 let portal = Portal::open(&database, key, agents)?;
                 portal.download(file_id, &destination).await?;
                 println!("{}", destination.display());
+                Ok(())
+            }
+            PortalCommand::Delete {
+                database,
+                master_key,
+                agents,
+                idempotency_key,
+                file_id,
+            } => {
+                let key = MasterKey::load(&master_key)?;
+                let mut portal = Portal::open(&database, key, agents)?;
+                if let Ok(value) = std::env::var("DISTR_HNSW_FAILPOINT") {
+                    portal = portal
+                        .with_failpoint(Failpoint::from_str(&value)?, FailpointAction::ExitProcess);
+                }
+                let operation = portal.delete(file_id, &idempotency_key).await?;
+                println!("{}", operation.marker_hash);
+                Ok(())
+            }
+            PortalCommand::Recover {
+                database,
+                master_key,
+                agents,
+                apply,
+            } => {
+                let key = MasterKey::load(&master_key)?;
+                let mut portal = Portal::open(&database, key, agents)?;
+                let report = portal.recover(apply).await?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.exit_code() == 2 {
+                    std::process::exit(2);
+                }
                 Ok(())
             }
         },

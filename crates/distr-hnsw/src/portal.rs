@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::Deserialize;
@@ -14,8 +15,13 @@ use crate::{
     crypto::{
         decrypt_chunk, encrypt_chunk, random_key, random_nonce, unwrap_key, wrap_key, MasterKey,
     },
-    format::{decode_manifest, encode_manifest, ChunkRecord, ManifestPayload},
-    metadata::{Database, FileRecord, NewChunk, NewUpload, UploadState},
+    format::{
+        decode_manifest, encode_deletion_marker, encode_manifest, ChunkRecord, ManifestPayload,
+    },
+    metadata::{
+        Database, DeleteOperation, DeleteState, FileRecord, FileState, NewChunk,
+        NewDeleteOperation, NewUpload, UploadState,
+    },
     object::{ObjectHash, ObjectKind},
     CHUNK_SIZE,
 };
@@ -56,6 +62,11 @@ pub enum Failpoint {
     AfterManifestDurable,
     BeforeCommit,
     AfterCommit,
+    AfterDeletePlan,
+    AfterFirstMarkerReplica,
+    AfterMarkerDurable,
+    BeforeDeleteCommit,
+    AfterDeleteCommit,
 }
 
 impl Failpoint {
@@ -68,6 +79,11 @@ impl Failpoint {
             Self::AfterManifestDurable => "after_manifest_durable",
             Self::BeforeCommit => "before_commit",
             Self::AfterCommit => "after_commit",
+            Self::AfterDeletePlan => "after_delete_plan",
+            Self::AfterFirstMarkerReplica => "after_first_marker_replica",
+            Self::AfterMarkerDurable => "after_marker_durable",
+            Self::BeforeDeleteCommit => "before_delete_commit",
+            Self::AfterDeleteCommit => "after_delete_commit",
         }
     }
 }
@@ -84,6 +100,11 @@ impl FromStr for Failpoint {
             "after_manifest_durable" => Ok(Self::AfterManifestDurable),
             "before_commit" => Ok(Self::BeforeCommit),
             "after_commit" => Ok(Self::AfterCommit),
+            "after_delete_plan" => Ok(Self::AfterDeletePlan),
+            "after_first_marker_replica" => Ok(Self::AfterFirstMarkerReplica),
+            "after_marker_durable" => Ok(Self::AfterMarkerDurable),
+            "before_delete_commit" => Ok(Self::BeforeDeleteCommit),
+            "after_delete_commit" => Ok(Self::AfterDeleteCommit),
             _ => Err(PortalError::InvalidFailpoint(value.to_owned())),
         }
     }
@@ -96,10 +117,10 @@ pub enum FailpointAction {
 }
 
 pub struct Portal {
-    database: Database,
-    master_key: MasterKey,
-    agents: Vec<AgentTarget>,
-    client: reqwest::Client,
+    pub(crate) database: Database,
+    pub(crate) master_key: MasterKey,
+    pub(crate) agents: Vec<AgentTarget>,
+    pub(crate) client: reqwest::Client,
     failpoint: Option<(Failpoint, FailpointAction)>,
 }
 
@@ -107,9 +128,10 @@ impl Portal {
     pub fn open(
         database_path: &Path,
         master_key: MasterKey,
-        agents: Vec<AgentTarget>,
+        mut agents: Vec<AgentTarget>,
     ) -> Result<Self, PortalError> {
         validate_agent_set(&agents)?;
+        agents.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(Self {
             database: Database::open(database_path)?,
             master_key,
@@ -122,6 +144,24 @@ impl Portal {
     pub fn with_failpoint(mut self, failpoint: Failpoint, action: FailpointAction) -> Self {
         self.failpoint = Some((failpoint, action));
         self
+    }
+
+    pub async fn recover(
+        &mut self,
+        apply: bool,
+    ) -> Result<crate::recovery::RecoveryReportV1, crate::recovery::RecoveryError> {
+        crate::recovery::recover(
+            &mut self.database,
+            &self.master_key,
+            &self.agents,
+            &self.client,
+            if apply {
+                crate::recovery::RecoveryMode::Apply
+            } else {
+                crate::recovery::RecoveryMode::Plan
+            },
+        )
+        .await
     }
 
     pub async fn upload(
@@ -259,6 +299,82 @@ impl Portal {
             .commit_file(upload.upload_id, MINIMUM_REPLICAS)?;
         self.hit(Failpoint::AfterCommit)?;
         Ok(file.file_id)
+    }
+
+    pub async fn delete(
+        &mut self,
+        file_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<DeleteOperation, PortalError> {
+        let mut operation = match self.database.delete_by_idempotency(idempotency_key)? {
+            Some(existing) => {
+                if existing.file_id != file_id {
+                    return Err(PortalError::IdempotencyConflict);
+                }
+                if existing.state == DeleteState::Committed {
+                    return Ok(existing);
+                }
+                existing
+            }
+            None => {
+                let projection = self
+                    .database
+                    .file_projection(file_id)?
+                    .ok_or(PortalError::FileNotVisible(file_id))?;
+                match projection.state {
+                    FileState::Deleted => return Err(PortalError::AlreadyDeleted(file_id)),
+                    FileState::RecoveryBlocked => {
+                        return Err(PortalError::FileNotVisible(file_id));
+                    }
+                    FileState::Committed => {}
+                }
+                let generation = projection
+                    .generation
+                    .checked_add(1)
+                    .ok_or(PortalError::NumericOverflow)?;
+                let deleted_at = i64::try_from(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|_| PortalError::SystemClockBeforeEpoch)?
+                        .as_secs(),
+                )
+                .map_err(|_| PortalError::NumericOverflow)?;
+                let marker_bytes =
+                    encode_deletion_marker(&self.master_key, file_id, generation, deleted_at)?;
+                let marker_hash = ObjectHash::digest(&marker_bytes);
+                self.database.create_delete_operation(&NewDeleteOperation {
+                    operation_id: Uuid::new_v4(),
+                    idempotency_key: idempotency_key.to_owned(),
+                    file_id,
+                    generation,
+                    deleted_at,
+                    marker_hash,
+                    marker_bytes,
+                })?;
+                self.database
+                    .delete_by_idempotency(idempotency_key)?
+                    .ok_or(PortalError::MissingDeleteOperation)?
+            }
+        };
+
+        self.hit(Failpoint::AfterDeletePlan)?;
+        self.verify_remote_agents().await?;
+        let mut confirmations = 0_usize;
+        self.replicate(
+            ObjectKind::DeletionMarker,
+            &operation.marker_hash,
+            &operation.marker_bytes,
+            Failpoint::AfterFirstMarkerReplica,
+            &mut confirmations,
+        )
+        .await?;
+        self.hit(Failpoint::AfterMarkerDurable)?;
+        self.hit(Failpoint::BeforeDeleteCommit)?;
+        operation = self
+            .database
+            .commit_delete(operation.operation_id, MINIMUM_REPLICAS)?;
+        self.hit(Failpoint::AfterDeleteCommit)?;
+        Ok(operation)
     }
 
     pub async fn download(&self, file_id: Uuid, destination: &Path) -> Result<(), PortalError> {
@@ -612,6 +728,10 @@ pub enum PortalError {
     IdempotencyConflict,
     #[error("persisted upload disappeared")]
     MissingUpload,
+    #[error("persisted delete operation disappeared")]
+    MissingDeleteOperation,
+    #[error("file is already deleted: {0}")]
+    AlreadyDeleted(Uuid),
     #[error("file is not committed or visible: {0}")]
     FileNotVisible(Uuid),
     #[error("download destination already exists: {0}")]
@@ -624,6 +744,8 @@ pub enum PortalError {
     TooManyChunks,
     #[error("numeric conversion overflow")]
     NumericOverflow,
+    #[error("system clock is before the Unix epoch")]
+    SystemClockBeforeEpoch,
     #[error("invalid failpoint: {0}")]
     InvalidFailpoint(String),
     #[error("injected failure at {}", .0.as_str())]

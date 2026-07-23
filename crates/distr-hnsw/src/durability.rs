@@ -9,6 +9,20 @@ use uuid::Uuid;
 
 use crate::object::{ObjectHash, ObjectKind};
 
+pub const MAX_INVENTORY_PAGE: usize = 1_000;
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct InventoryObject {
+    pub hash: ObjectHash,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct InventoryPage {
+    pub objects: Vec<InventoryObject>,
+    pub next_after: Option<ObjectHash>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DurableStore {
     root: PathBuf,
@@ -20,8 +34,9 @@ impl DurableStore {
         ensure_directory(&root)?;
         let objects = root.join("objects");
         ensure_child_directory(&root, &objects)?;
-        ensure_child_directory(&objects, &objects.join("chunk"))?;
-        ensure_child_directory(&objects, &objects.join("manifest"))?;
+        for kind in ObjectKind::ALL {
+            ensure_child_directory(&objects, &objects.join(kind.as_str()))?;
+        }
         Ok(Self { root })
     }
 
@@ -104,6 +119,85 @@ impl DurableStore {
             .join(&value[2..4])
             .join(value)
     }
+
+    pub fn inventory(
+        &self,
+        kind: ObjectKind,
+        after: Option<&ObjectHash>,
+        limit: usize,
+    ) -> Result<InventoryPage, StoreError> {
+        if limit == 0 {
+            return Err(StoreError::InvalidInventoryLimit(limit));
+        }
+        let limit = limit.min(MAX_INVENTORY_PAGE);
+        let namespace = self.root.join("objects").join(kind.as_str());
+        let mut objects = Vec::with_capacity(limit);
+        let mut has_more = false;
+
+        'prefixes: for first in sorted_entries(&namespace)? {
+            if !first.path().is_dir() || !is_hex_prefix(&first.file_name()) {
+                return Err(StoreError::MalformedInventoryEntry(first.path()));
+            }
+            for second in sorted_entries(&first.path())? {
+                if !second.path().is_dir() || !is_hex_prefix(&second.file_name()) {
+                    return Err(StoreError::MalformedInventoryEntry(second.path()));
+                }
+                for entry in sorted_entries(&second.path())? {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with('.') && name.ends_with(".tmp") {
+                        continue;
+                    }
+                    if !entry.path().is_file() {
+                        return Err(StoreError::MalformedInventoryEntry(entry.path()));
+                    }
+                    let hash = ObjectHash::parse(name.as_ref())
+                        .map_err(|_| StoreError::MalformedInventoryEntry(entry.path()))?;
+                    let expected_first = first.file_name();
+                    let expected_second = second.file_name();
+                    if expected_first.to_string_lossy() != hash.as_str()[0..2]
+                        || expected_second.to_string_lossy() != hash.as_str()[2..4]
+                    {
+                        return Err(StoreError::MalformedInventoryEntry(entry.path()));
+                    }
+                    if after.is_some_and(|cursor| hash.as_str() <= cursor.as_str()) {
+                        continue;
+                    }
+                    if objects.len() == limit {
+                        has_more = true;
+                        break 'prefixes;
+                    }
+                    objects.push(InventoryObject {
+                        hash,
+                        size: entry.metadata()?.len(),
+                    });
+                }
+            }
+        }
+        let next_after = has_more
+            .then(|| objects.last().map(|object| object.hash.clone()))
+            .flatten();
+        Ok(InventoryPage {
+            objects,
+            next_after,
+        })
+    }
+}
+
+fn sorted_entries(path: &Path) -> io::Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
+}
+
+fn is_hex_prefix(value: &std::ffi::OsStr) -> bool {
+    value.to_str().is_some_and(|value| {
+        value.len() == 2
+            && value
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    })
 }
 
 fn sync_regular_file(file: &File) -> io::Result<()> {
@@ -170,6 +264,10 @@ pub enum StoreError {
     },
     #[error("invalid object path: {0}")]
     InvalidPath(PathBuf),
+    #[error("inventory limit must be greater than zero, got {0}")]
+    InvalidInventoryLimit(usize),
+    #[error("malformed object-store inventory entry: {0}")]
+    MalformedInventoryEntry(PathBuf),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -193,6 +291,54 @@ mod tests {
         assert!(matches!(
             store.get(ObjectKind::Chunk, &hash),
             Err(StoreError::HashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn inventory_paginates_exclusively_without_gaps_or_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(directory.path()).unwrap();
+        let mut expected = Vec::new();
+        for bytes in [b"first".as_slice(), b"second", b"third"] {
+            let hash = ObjectHash::digest(bytes);
+            store.put(ObjectKind::Manifest, &hash, bytes).unwrap();
+            expected.push(hash);
+        }
+        expected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+        let first = store.inventory(ObjectKind::Manifest, None, 2).unwrap();
+        assert_eq!(first.objects.len(), 2);
+        assert_eq!(first.next_after.as_ref(), Some(&first.objects[1].hash));
+        let second = store
+            .inventory(ObjectKind::Manifest, first.next_after.as_ref(), 2)
+            .unwrap();
+        assert_eq!(second.objects.len(), 1);
+        assert!(second.next_after.is_none());
+        let actual: Vec<_> = first
+            .objects
+            .into_iter()
+            .chain(second.objects)
+            .map(|object| object.hash)
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(matches!(
+            store.inventory(ObjectKind::Manifest, None, 0),
+            Err(StoreError::InvalidInventoryLimit(0))
+        ));
+        assert!(store
+            .inventory(ObjectKind::Manifest, None, MAX_INVENTORY_PAGE + 1)
+            .is_ok());
+    }
+
+    #[test]
+    fn malformed_inventory_entries_fail_the_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(directory.path()).unwrap();
+        let malformed = directory.path().join("objects/manifest/not-hex");
+        fs::create_dir(&malformed).unwrap();
+        assert!(matches!(
+            store.inventory(ObjectKind::Manifest, None, 10),
+            Err(StoreError::MalformedInventoryEntry(_))
         ));
     }
 }

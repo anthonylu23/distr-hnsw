@@ -1,21 +1,21 @@
 # M1 implementation plan
 
 The canonical milestone scope and acceptance gate remain in
-[`roadmap.md`](roadmap.md). This page records implementation dependencies for
-the current first pass.
+[`roadmap.md`](roadmap.md). This page records the implemented passes and the
+next dependency boundary.
 
 ## Current status
 
-Pass 1 is implemented locally. The product crate under `crates/distr-hnsw`
-provides loopback agent processes plus portal `init`, `put`, and `get` commands.
-Tests cover canonical authenticated manifests, durable object idempotency and
-hash verification, state-transition legality, conflicting upload idempotency,
-RF2 refusal, partial visibility, corrupt-replica fallback/fail-closed behavior,
-and abrupt portal exit at every named boundary.
+Passes 1 and 2 are implemented locally. The product crate provides loopback
+agents plus portal `init`, `put`, `get`, `delete`, and `recover` commands.
+Pass 2 adds deletion-marker v1, SQLite schema v2 with atomic v1 migration,
+paginated inventories, plan/apply recovery reports, highest-generation
+selection, recovery-only RF2 repair, per-file convergence, and fail-closed
+recovery issues.
 
-This is not M1 acceptance. Linux filesystem review, delete/lifecycle work,
-inventory reconstruction, independent recovery, and the blank-infrastructure
-drill remain open.
+This is not M1 acceptance. Physical lifecycle work, continuous reconciliation,
+supported-filesystem review, offsite backup, independent key recovery, portal
+metadata restore, and the blank-infrastructure drill remain open.
 
 ## Pass 1 — commit spine
 
@@ -31,6 +31,22 @@ drill remain open.
 Pass 1 exits when a multi-chunk file survives injected failure at every commit
 boundary and downloads with the original plaintext hash.
 
+## Pass 2 — deletion and inventory recovery
+
+1. Add authenticated immutable deletion markers and restartable keyed delete
+   operations without physical object removal.
+2. Atomically migrate SQLite v1 to the versioned v2 projection/history schema.
+3. Add strict, cursor-based inventories for all object namespaces.
+4. Implement deterministic plan/apply recovery, highest-generation conflict
+   handling, recovery-only RF2 repair, and per-file blocked state.
+5. Exercise marker format attacks, delete process crashes, inventory failures,
+   stale/blank SQLite, one-copy repair, marker tombstones, conflicts, missing
+   objects, wrong keys, repeat apply, and partial convergence.
+
+Pass 2 exits when newer immutable evidence can safely rebuild stale SQLite,
+required objects can be restored to RF2, and no blocked or deleted file becomes
+downloadable. Those gates now pass in the light local matrix.
+
 ### Validation
 
 Run on the development machine:
@@ -45,25 +61,19 @@ The process-level test launches two real agent children and abruptly exits the
 portal at each crash boundary. Larger future storage matrices belong on
 `anthonypc`.
 
-## Parallel lanes after contract review
+## Parallel lanes for the next pass
 
-- Agent durable storage can proceed alongside SQLite and pure state-machine
-  work once object identifiers and the durable-PUT contract are fixed.
-- Format/crypto work can proceed alongside the agent because agents store
-  opaque bytes.
-- Failure-harness scaffolding can proceed alongside both once CLI commands and
-  failpoint names are fixed.
-- Portal integration waits for all three lanes.
+- Supported-filesystem qualification and the reconciliation observation model
+  can proceed independently.
+- Backup target evaluation and master-key recovery design can proceed in
+  parallel, but the restore drill waits for both.
+- Node observation/retirement, movement, and GC share one lifecycle owner;
+  physical deletion cannot precede the observation and retention proofs.
 
-Persistent formats and state transitions have one authoritative owner. Delete
-and garbage-collection semantics must not be developed independently because
-they share generation, observation, reference, and node-retirement rules.
+## Remaining M1 passes
 
-## Deferred M1 passes
-
-- deletion markers and stale-metadata precedence;
-- inventory-driven reconstruction, scrub, and repair;
-- safe movement, quotas, retirement, and garbage collection;
+- continuous scrub/reconciliation and explicit degraded-state reporting;
+- safe movement, quotas, observation, retirement, and garbage collection;
 - versioned offsite backup, SQLite history replication, and independent key
   recovery;
 - portal-loss and empty-infrastructure restore drills.

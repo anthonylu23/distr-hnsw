@@ -10,7 +10,7 @@ use crate::{
     object::{ObjectHash, ObjectKind},
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UploadState {
@@ -114,6 +114,99 @@ pub struct FileRecord {
     pub manifest_hash: ObjectHash,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileState {
+    Committed,
+    Deleted,
+    RecoveryBlocked,
+}
+
+impl FileState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::Deleted => "deleted",
+            Self::RecoveryBlocked => "recovery_blocked",
+        }
+    }
+}
+
+impl FromStr for FileState {
+    type Err = MetadataError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "committed" => Ok(Self::Committed),
+            "deleted" => Ok(Self::Deleted),
+            "recovery_blocked" => Ok(Self::RecoveryBlocked),
+            _ => Err(MetadataError::InvalidFileState(value.to_owned())),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FileProjection {
+    pub file_id: Uuid,
+    pub generation: u64,
+    pub state: FileState,
+    pub name: Option<String>,
+    pub plaintext_hash: Option<[u8; 32]>,
+    pub plaintext_size: Option<u64>,
+    pub manifest_hash: Option<ObjectHash>,
+    pub deletion_hash: Option<ObjectHash>,
+    pub deleted_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeleteState {
+    ReplicatingMarker,
+    Committed,
+}
+
+impl DeleteState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReplicatingMarker => "replicating_marker",
+            Self::Committed => "committed",
+        }
+    }
+}
+
+impl FromStr for DeleteState {
+    type Err = MetadataError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "replicating_marker" => Ok(Self::ReplicatingMarker),
+            "committed" => Ok(Self::Committed),
+            _ => Err(MetadataError::InvalidDeleteState(value.to_owned())),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NewDeleteOperation {
+    pub operation_id: Uuid,
+    pub idempotency_key: String,
+    pub file_id: Uuid,
+    pub generation: u64,
+    pub deleted_at: i64,
+    pub marker_hash: ObjectHash,
+    pub marker_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeleteOperation {
+    pub operation_id: Uuid,
+    pub idempotency_key: String,
+    pub file_id: Uuid,
+    pub generation: u64,
+    pub deleted_at: i64,
+    pub marker_hash: ObjectHash,
+    pub marker_bytes: Vec<u8>,
+    pub state: DeleteState,
+}
+
 pub struct Database {
     connection: Connection,
 }
@@ -123,15 +216,17 @@ impl Database {
         if let Some(parent) = path.parent() {
             ensure_directory(parent)?;
         }
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != 0 && version != SCHEMA_VERSION {
-            return Err(MetadataError::UnsupportedSchemaVersion(version));
+        match version {
+            0 => connection.execute_batch(SCHEMA)?,
+            1 => migrate_v1_to_v2(&mut connection)?,
+            SCHEMA_VERSION => connection.execute_batch(SCHEMA)?,
+            _ => return Err(MetadataError::UnsupportedSchemaVersion(version)),
         }
-        connection.execute_batch(SCHEMA)?;
         if let Some(parent) = path.parent() {
             sync_directory(parent)?;
         }
@@ -418,36 +513,73 @@ impl Database {
         )?;
 
         let mut statement = transaction.prepare(
-            "SELECT ciphertext_hash FROM upload_chunks
+            "SELECT ordinal, plaintext_len, nonce, ciphertext_hash, ciphertext_len
+             FROM upload_chunks
              WHERE upload_id = ?1 ORDER BY ordinal",
         )?;
-        let hashes = statement
+        let chunk_rows = statement
             .query_map([upload_id.to_string()], |row| {
-                row.get::<_, Option<String>>(0)
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<u32>>(4)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
-        for hash in hashes {
-            let hash = hash.ok_or(MetadataError::MissingChunkObject)?;
-            let hash = ObjectHash::parse(hash)?;
+        for (_, _, _, hash, _) in &chunk_rows {
+            let hash = hash.as_ref().ok_or(MetadataError::MissingChunkObject)?;
+            let hash = ObjectHash::parse(hash.clone())?;
             require_replica_floor(&transaction, ObjectKind::Chunk, &hash, minimum_replicas)?;
         }
 
         transaction.execute(
             "INSERT INTO files
-             (file_id, generation, name, plaintext_hash, plaintext_size,
-              manifest_hash, upload_id, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'committed')",
+             (file_id, current_generation, state, name, plaintext_hash,
+              plaintext_size, current_manifest_hash, source_upload_id)
+             VALUES (?1, ?2, 'committed', ?3, ?4, ?5, ?6, ?7)",
             params![
                 upload.file_id.to_string(),
                 to_i64(upload.generation)?,
-                upload.file_name,
+                &upload.file_name,
                 upload.plaintext_hash.as_slice(),
                 to_i64(upload.plaintext_size)?,
                 manifest_hash.as_str(),
                 upload.upload_id.to_string(),
             ],
         )?;
+        transaction.execute(
+            "INSERT INTO file_manifests
+             (file_id, generation, manifest_hash, name, plaintext_hash, plaintext_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                upload.file_id.to_string(),
+                to_i64(upload.generation)?,
+                manifest_hash.as_str(),
+                &upload.file_name,
+                upload.plaintext_hash.as_slice(),
+                to_i64(upload.plaintext_size)?,
+            ],
+        )?;
+        for (ordinal, plaintext_len, nonce, hash, ciphertext_len) in chunk_rows {
+            transaction.execute(
+                "INSERT INTO file_chunks
+                 (file_id, generation, ordinal, plaintext_len, nonce,
+                  ciphertext_hash, ciphertext_len)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    upload.file_id.to_string(),
+                    to_i64(upload.generation)?,
+                    ordinal,
+                    plaintext_len,
+                    nonce,
+                    hash.ok_or(MetadataError::MissingChunkObject)?,
+                    ciphertext_len.ok_or(MetadataError::MissingChunkObject)?,
+                ],
+            )?;
+        }
         transaction.execute(
             "UPDATE uploads SET state = 'committed' WHERE upload_id = ?1",
             [upload_id.to_string()],
@@ -459,6 +591,178 @@ impl Database {
 
     pub fn file_by_id(&self, file_id: Uuid) -> Result<Option<FileRecord>, MetadataError> {
         file_by_id_connection(&self.connection, file_id)
+    }
+
+    pub fn file_projection(&self, file_id: Uuid) -> Result<Option<FileProjection>, MetadataError> {
+        self.connection
+            .query_row(
+                "SELECT file_id, current_generation, state, name, plaintext_hash,
+                        plaintext_size, current_manifest_hash,
+                        current_deletion_hash, deleted_at
+                 FROM files WHERE file_id = ?1",
+                [file_id.to_string()],
+                row_to_file_projection,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn all_file_projections(&self) -> Result<Vec<FileProjection>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT file_id, current_generation, state, name, plaintext_hash,
+                    plaintext_size, current_manifest_hash,
+                    current_deletion_hash, deleted_at
+             FROM files ORDER BY file_id",
+        )?;
+        let values = statement
+            .query_map([], row_to_file_projection)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(values)
+    }
+
+    pub fn delete_by_idempotency(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<DeleteOperation>, MetadataError> {
+        self.connection
+            .query_row(
+                "SELECT operation_id, idempotency_key, file_id, generation,
+                        deleted_at, marker_hash, marker_bytes, state
+                 FROM delete_operations WHERE idempotency_key = ?1",
+                [idempotency_key],
+                row_to_delete_operation,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn create_delete_operation(
+        &mut self,
+        operation: &NewDeleteOperation,
+    ) -> Result<(), MetadataError> {
+        let transaction = self.connection.transaction()?;
+        let projection = transaction
+            .query_row(
+                "SELECT file_id, current_generation, state, name, plaintext_hash,
+                        plaintext_size, current_manifest_hash,
+                        current_deletion_hash, deleted_at
+                 FROM files WHERE file_id = ?1",
+                [operation.file_id.to_string()],
+                row_to_file_projection,
+            )
+            .optional()?
+            .ok_or(MetadataError::MissingFile(operation.file_id))?;
+        if projection.state != FileState::Committed {
+            return Err(MetadataError::FileNotCommitted(operation.file_id));
+        }
+        if projection
+            .generation
+            .checked_add(1)
+            .ok_or(MetadataError::NumericOverflow)?
+            != operation.generation
+        {
+            return Err(MetadataError::GenerationConflict(operation.file_id));
+        }
+        transaction.execute(
+            "INSERT INTO delete_operations
+             (operation_id, idempotency_key, file_id, generation, deleted_at,
+              marker_hash, marker_bytes, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'replicating_marker')",
+            params![
+                operation.operation_id.to_string(),
+                operation.idempotency_key,
+                operation.file_id.to_string(),
+                to_i64(operation.generation)?,
+                operation.deleted_at,
+                operation.marker_hash.as_str(),
+                operation.marker_bytes,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn commit_delete(
+        &mut self,
+        operation_id: Uuid,
+        minimum_replicas: usize,
+    ) -> Result<DeleteOperation, MetadataError> {
+        let transaction = self.connection.transaction()?;
+        let operation = transaction.query_row(
+            "SELECT operation_id, idempotency_key, file_id, generation,
+                    deleted_at, marker_hash, marker_bytes, state
+             FROM delete_operations WHERE operation_id = ?1",
+            [operation_id.to_string()],
+            row_to_delete_operation,
+        )?;
+        if operation.state == DeleteState::Committed {
+            transaction.commit()?;
+            return Ok(operation);
+        }
+        require_replica_floor(
+            &transaction,
+            ObjectKind::DeletionMarker,
+            &operation.marker_hash,
+            minimum_replicas,
+        )?;
+        let projection = transaction.query_row(
+            "SELECT file_id, current_generation, state, name, plaintext_hash,
+                    plaintext_size, current_manifest_hash,
+                    current_deletion_hash, deleted_at
+             FROM files WHERE file_id = ?1",
+            [operation.file_id.to_string()],
+            row_to_file_projection,
+        )?;
+        if projection.generation > operation.generation {
+            return Err(MetadataError::GenerationConflict(operation.file_id));
+        }
+        if projection.generation == operation.generation
+            && (projection.state != FileState::Deleted
+                || projection.deletion_hash.as_ref() != Some(&operation.marker_hash))
+        {
+            return Err(MetadataError::GenerationConflict(operation.file_id));
+        }
+        transaction.execute(
+            "INSERT INTO deletion_markers
+             (file_id, generation, marker_hash, deleted_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_id, generation) DO NOTHING",
+            params![
+                operation.file_id.to_string(),
+                to_i64(operation.generation)?,
+                operation.marker_hash.as_str(),
+                operation.deleted_at,
+            ],
+        )?;
+        let persisted_marker: String = transaction.query_row(
+            "SELECT marker_hash FROM deletion_markers WHERE file_id = ?1 AND generation = ?2",
+            params![operation.file_id.to_string(), to_i64(operation.generation)?],
+            |row| row.get(0),
+        )?;
+        if persisted_marker != operation.marker_hash.as_str() {
+            return Err(MetadataError::GenerationConflict(operation.file_id));
+        }
+        transaction.execute(
+            "UPDATE files
+             SET current_generation = ?2, state = 'deleted',
+                 current_deletion_hash = ?3, deleted_at = ?4,
+                 updated_at = unixepoch()
+             WHERE file_id = ?1",
+            params![
+                operation.file_id.to_string(),
+                to_i64(operation.generation)?,
+                operation.marker_hash.as_str(),
+                operation.deleted_at,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE delete_operations SET state = 'committed'
+             WHERE operation_id = ?1",
+            [operation.operation_id.to_string()],
+        )?;
+        transaction.commit()?;
+        self.delete_by_idempotency(&operation.idempotency_key)?
+            .ok_or(MetadataError::MissingDeleteOperation)
     }
 
     pub fn confirmed_agents(
@@ -477,6 +781,207 @@ impl Database {
             .map_err(MetadataError::from)?;
         Ok(agents)
     }
+
+    pub fn apply_recovered_manifest(
+        &mut self,
+        manifest: &crate::format::DecodedManifest,
+        manifest_hash: &ObjectHash,
+    ) -> Result<(), MetadataError> {
+        let transaction = self.connection.transaction()?;
+        let existing = file_projection_transaction(&transaction, manifest.file_id)?;
+        if existing
+            .as_ref()
+            .is_some_and(|file| file.generation > manifest.generation)
+        {
+            return Err(MetadataError::GenerationConflict(manifest.file_id));
+        }
+        transaction.execute(
+            "INSERT INTO file_manifests
+             (file_id, generation, manifest_hash, name, plaintext_hash, plaintext_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(file_id, generation) DO NOTHING",
+            params![
+                manifest.file_id.to_string(),
+                to_i64(manifest.generation)?,
+                manifest_hash.as_str(),
+                &manifest.payload.name,
+                manifest.payload.plaintext_hash.as_slice(),
+                to_i64(manifest.payload.plaintext_len)?,
+            ],
+        )?;
+        let persisted_hash: String = transaction.query_row(
+            "SELECT manifest_hash FROM file_manifests WHERE file_id = ?1 AND generation = ?2",
+            params![manifest.file_id.to_string(), to_i64(manifest.generation)?],
+            |row| row.get(0),
+        )?;
+        if persisted_hash != manifest_hash.as_str() {
+            return Err(MetadataError::GenerationConflict(manifest.file_id));
+        }
+        for chunk in &manifest.payload.chunks {
+            transaction.execute(
+                "INSERT INTO file_chunks
+                 (file_id, generation, ordinal, plaintext_len, nonce,
+                  ciphertext_hash, ciphertext_len)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(file_id, generation, ordinal) DO NOTHING",
+                params![
+                    manifest.file_id.to_string(),
+                    to_i64(manifest.generation)?,
+                    chunk.ordinal,
+                    chunk.plaintext_len,
+                    chunk.nonce.as_slice(),
+                    chunk.ciphertext_hash.as_str(),
+                    chunk.ciphertext_len,
+                ],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO files
+             (file_id, current_generation, state, name, plaintext_hash,
+              plaintext_size, current_manifest_hash)
+             VALUES (?1, ?2, 'committed', ?3, ?4, ?5, ?6)
+             ON CONFLICT(file_id) DO UPDATE SET
+                 current_generation = excluded.current_generation,
+                 state = 'committed', name = excluded.name,
+                 plaintext_hash = excluded.plaintext_hash,
+                 plaintext_size = excluded.plaintext_size,
+                 current_manifest_hash = excluded.current_manifest_hash,
+                 current_deletion_hash = NULL, deleted_at = NULL,
+                 updated_at = unixepoch()",
+            params![
+                manifest.file_id.to_string(),
+                to_i64(manifest.generation)?,
+                &manifest.payload.name,
+                manifest.payload.plaintext_hash.as_slice(),
+                to_i64(manifest.payload.plaintext_len)?,
+                manifest_hash.as_str(),
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM recovery_issues WHERE file_id = ?1",
+            [manifest.file_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn apply_recovered_deletion(
+        &mut self,
+        marker: &crate::format::DeletionMarker,
+        marker_hash: &ObjectHash,
+    ) -> Result<(), MetadataError> {
+        let transaction = self.connection.transaction()?;
+        let existing = file_projection_transaction(&transaction, marker.file_id)?;
+        if existing
+            .as_ref()
+            .is_some_and(|file| file.generation > marker.generation)
+        {
+            return Err(MetadataError::GenerationConflict(marker.file_id));
+        }
+        transaction.execute(
+            "INSERT INTO deletion_markers (file_id, generation, marker_hash, deleted_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_id, generation) DO NOTHING",
+            params![
+                marker.file_id.to_string(),
+                to_i64(marker.generation)?,
+                marker_hash.as_str(),
+                marker.deleted_at,
+            ],
+        )?;
+        let persisted_hash: String = transaction.query_row(
+            "SELECT marker_hash FROM deletion_markers WHERE file_id = ?1 AND generation = ?2",
+            params![marker.file_id.to_string(), to_i64(marker.generation)?],
+            |row| row.get(0),
+        )?;
+        if persisted_hash != marker_hash.as_str() {
+            return Err(MetadataError::GenerationConflict(marker.file_id));
+        }
+        transaction.execute(
+            "INSERT INTO files
+             (file_id, current_generation, state, current_deletion_hash, deleted_at)
+             VALUES (?1, ?2, 'deleted', ?3, ?4)
+             ON CONFLICT(file_id) DO UPDATE SET
+                 current_generation = excluded.current_generation,
+                 state = 'deleted', current_deletion_hash = excluded.current_deletion_hash,
+                 deleted_at = excluded.deleted_at, updated_at = unixepoch()",
+            params![
+                marker.file_id.to_string(),
+                to_i64(marker.generation)?,
+                marker_hash.as_str(),
+                marker.deleted_at,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM recovery_issues WHERE file_id = ?1",
+            [marker.file_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_recovery_blocked(
+        &mut self,
+        file_id: Uuid,
+        generation: u64,
+        deletion_hash: Option<&ObjectHash>,
+        issue: &str,
+    ) -> Result<(), MetadataError> {
+        let transaction = self.connection.transaction()?;
+        let existing = file_projection_transaction(&transaction, file_id)?;
+        let state = if deletion_hash.is_some()
+            || existing
+                .as_ref()
+                .is_some_and(|file| file.state == FileState::Deleted)
+        {
+            FileState::Deleted
+        } else {
+            FileState::RecoveryBlocked
+        };
+        transaction.execute(
+            "INSERT INTO files (file_id, current_generation, state, current_deletion_hash)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_id) DO UPDATE SET
+                 current_generation = MAX(files.current_generation, excluded.current_generation),
+                 state = excluded.state,
+                 current_deletion_hash = COALESCE(excluded.current_deletion_hash, files.current_deletion_hash),
+                 updated_at = unixepoch()",
+            params![
+                file_id.to_string(),
+                to_i64(generation)?,
+                state.as_str(),
+                deletion_hash.map(ObjectHash::as_str),
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM recovery_issues WHERE file_id = ?1",
+            [file_id.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO recovery_issues (file_id, generation, issue_kind, detail)
+             VALUES (?1, ?2, 'recovery_blocked', ?3)",
+            params![file_id.to_string(), to_i64(generation)?, issue],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+fn file_projection_transaction(
+    transaction: &Transaction<'_>,
+    file_id: Uuid,
+) -> Result<Option<FileProjection>, MetadataError> {
+    transaction
+        .query_row(
+            "SELECT file_id, current_generation, state, name, plaintext_hash,
+                    plaintext_size, current_manifest_hash,
+                    current_deletion_hash, deleted_at
+             FROM files WHERE file_id = ?1",
+            [file_id.to_string()],
+            row_to_file_projection,
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn upload_state(
@@ -551,7 +1056,8 @@ fn file_by_id_connection(
 ) -> Result<Option<FileRecord>, MetadataError> {
     connection
         .query_row(
-            "SELECT file_id, generation, name, plaintext_hash, plaintext_size, manifest_hash
+            "SELECT file_id, current_generation, name, plaintext_hash,
+                    plaintext_size, current_manifest_hash
              FROM files WHERE file_id = ?1 AND state = 'committed'",
             [file_id.to_string()],
             row_to_file,
@@ -566,7 +1072,8 @@ fn file_by_id_transaction(
 ) -> Result<Option<FileRecord>, MetadataError> {
     transaction
         .query_row(
-            "SELECT file_id, generation, name, plaintext_hash, plaintext_size, manifest_hash
+            "SELECT file_id, current_generation, name, plaintext_hash,
+                    plaintext_size, current_manifest_hash
              FROM files WHERE file_id = ?1 AND state = 'committed'",
             [file_id.to_string()],
             row_to_file,
@@ -589,6 +1096,55 @@ fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
         plaintext_size: from_i64_sql(plaintext_size)?,
         manifest_hash: ObjectHash::parse(manifest_hash)
             .map_err(|error| metadata_to_sql(error.into()))?,
+    })
+}
+
+fn row_to_file_projection(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileProjection> {
+    let file_id: String = row.get(0)?;
+    let generation: i64 = row.get(1)?;
+    let state: String = row.get(2)?;
+    let plaintext_hash: Option<Vec<u8>> = row.get(4)?;
+    let plaintext_size: Option<i64> = row.get(5)?;
+    let manifest_hash: Option<String> = row.get(6)?;
+    let deletion_hash: Option<String> = row.get(7)?;
+    Ok(FileProjection {
+        file_id: parse_uuid_sql(&file_id)?,
+        generation: from_i64_sql(generation)?,
+        state: FileState::from_str(&state).map_err(metadata_to_sql)?,
+        name: row.get(3)?,
+        plaintext_hash: plaintext_hash
+            .map(|bytes| fixed_bytes(&bytes, "plaintext hash"))
+            .transpose()
+            .map_err(metadata_to_sql)?,
+        plaintext_size: plaintext_size.map(from_i64_sql).transpose()?,
+        manifest_hash: manifest_hash
+            .map(ObjectHash::parse)
+            .transpose()
+            .map_err(|error| metadata_to_sql(error.into()))?,
+        deletion_hash: deletion_hash
+            .map(ObjectHash::parse)
+            .transpose()
+            .map_err(|error| metadata_to_sql(error.into()))?,
+        deleted_at: row.get(8)?,
+    })
+}
+
+fn row_to_delete_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeleteOperation> {
+    let operation_id: String = row.get(0)?;
+    let file_id: String = row.get(2)?;
+    let generation: i64 = row.get(3)?;
+    let marker_hash: String = row.get(5)?;
+    let state: String = row.get(7)?;
+    Ok(DeleteOperation {
+        operation_id: parse_uuid_sql(&operation_id)?,
+        idempotency_key: row.get(1)?,
+        file_id: parse_uuid_sql(&file_id)?,
+        generation: from_i64_sql(generation)?,
+        deleted_at: row.get(4)?,
+        marker_hash: ObjectHash::parse(marker_hash)
+            .map_err(|error| metadata_to_sql(error.into()))?,
+        marker_bytes: row.get(6)?,
+        state: DeleteState::from_str(&state).map_err(metadata_to_sql)?,
     })
 }
 
@@ -655,7 +1211,9 @@ CREATE TABLE IF NOT EXISTS upload_chunks (
 );
 
 CREATE TABLE IF NOT EXISTS placements (
-    object_kind TEXT NOT NULL CHECK(object_kind IN ('chunk', 'manifest')),
+    object_kind TEXT NOT NULL CHECK(object_kind IN (
+        'chunk', 'manifest', 'deletion_marker'
+    )),
     object_hash TEXT NOT NULL,
     agent_id TEXT NOT NULL,
     failure_domain TEXT NOT NULL,
@@ -666,23 +1224,228 @@ CREATE TABLE IF NOT EXISTS placements (
 
 CREATE TABLE IF NOT EXISTS files (
     file_id TEXT PRIMARY KEY,
+    current_generation INTEGER NOT NULL CHECK(current_generation > 0),
+    state TEXT NOT NULL CHECK(state IN (
+        'committed', 'deleted', 'recovery_blocked'
+    )),
+    name TEXT,
+    plaintext_hash BLOB CHECK(plaintext_hash IS NULL OR length(plaintext_hash) = 32),
+    plaintext_size INTEGER CHECK(plaintext_size IS NULL OR plaintext_size >= 0),
+    current_manifest_hash TEXT,
+    current_deletion_hash TEXT,
+    source_upload_id TEXT UNIQUE REFERENCES uploads(upload_id),
+    deleted_at INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    CHECK (state != 'committed' OR (
+        name IS NOT NULL AND plaintext_hash IS NOT NULL
+        AND plaintext_size IS NOT NULL AND current_manifest_hash IS NOT NULL
+        AND current_deletion_hash IS NULL
+    )),
+    CHECK (state != 'deleted' OR current_deletion_hash IS NOT NULL)
+);
+
+CREATE TABLE IF NOT EXISTS file_manifests (
+    file_id TEXT NOT NULL,
     generation INTEGER NOT NULL CHECK(generation > 0),
+    manifest_hash TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     plaintext_hash BLOB NOT NULL CHECK(length(plaintext_hash) = 32),
     plaintext_size INTEGER NOT NULL CHECK(plaintext_size >= 0),
-    manifest_hash TEXT NOT NULL,
-    upload_id TEXT NOT NULL UNIQUE REFERENCES uploads(upload_id),
-    state TEXT NOT NULL CHECK(state = 'committed'),
+    PRIMARY KEY(file_id, generation)
+);
+
+CREATE TABLE IF NOT EXISTS file_chunks (
+    file_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    plaintext_len INTEGER NOT NULL CHECK(plaintext_len >= 0),
+    nonce BLOB NOT NULL CHECK(length(nonce) = 24),
+    ciphertext_hash TEXT NOT NULL,
+    ciphertext_len INTEGER NOT NULL CHECK(ciphertext_len >= 0),
+    PRIMARY KEY(file_id, generation, ordinal),
+    FOREIGN KEY(file_id, generation)
+        REFERENCES file_manifests(file_id, generation)
+);
+
+CREATE TABLE IF NOT EXISTS deletion_markers (
+    file_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    marker_hash TEXT NOT NULL UNIQUE,
+    deleted_at INTEGER NOT NULL,
+    PRIMARY KEY(file_id, generation)
+);
+
+CREATE TABLE IF NOT EXISTS delete_operations (
+    operation_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    file_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    deleted_at INTEGER NOT NULL,
+    marker_hash TEXT NOT NULL,
+    marker_bytes BLOB NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('replicating_marker', 'committed')),
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
-PRAGMA user_version = 1;
+CREATE TABLE IF NOT EXISTS recovery_issues (
+    file_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    issue_kind TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    observed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    resolved_at INTEGER,
+    PRIMARY KEY(file_id, generation, issue_kind)
+);
+
+PRAGMA user_version = 2;
 "#;
+
+fn migrate_v1_to_v2(connection: &mut Connection) -> Result<(), MetadataError> {
+    connection.pragma_update(None, "foreign_keys", "OFF")?;
+    let migration = connection.execute_batch(
+        r#"
+BEGIN IMMEDIATE;
+
+ALTER TABLE files RENAME TO files_v1;
+ALTER TABLE placements RENAME TO placements_v1;
+
+CREATE TABLE placements (
+    object_kind TEXT NOT NULL CHECK(object_kind IN (
+        'chunk', 'manifest', 'deletion_marker'
+    )),
+    object_hash TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    failure_domain TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending', 'confirmed')),
+    confirmed_at INTEGER,
+    PRIMARY KEY(object_kind, object_hash, agent_id)
+);
+
+INSERT INTO placements
+SELECT object_kind, object_hash, agent_id, failure_domain, state, confirmed_at
+FROM placements_v1;
+
+CREATE TABLE files (
+    file_id TEXT PRIMARY KEY,
+    current_generation INTEGER NOT NULL CHECK(current_generation > 0),
+    state TEXT NOT NULL CHECK(state IN (
+        'committed', 'deleted', 'recovery_blocked'
+    )),
+    name TEXT,
+    plaintext_hash BLOB CHECK(plaintext_hash IS NULL OR length(plaintext_hash) = 32),
+    plaintext_size INTEGER CHECK(plaintext_size IS NULL OR plaintext_size >= 0),
+    current_manifest_hash TEXT,
+    current_deletion_hash TEXT,
+    source_upload_id TEXT UNIQUE REFERENCES uploads(upload_id),
+    deleted_at INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    CHECK (state != 'committed' OR (
+        name IS NOT NULL AND plaintext_hash IS NOT NULL
+        AND plaintext_size IS NOT NULL AND current_manifest_hash IS NOT NULL
+        AND current_deletion_hash IS NULL
+    )),
+    CHECK (state != 'deleted' OR current_deletion_hash IS NOT NULL)
+);
+
+CREATE TABLE file_manifests (
+    file_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    manifest_hash TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    plaintext_hash BLOB NOT NULL CHECK(length(plaintext_hash) = 32),
+    plaintext_size INTEGER NOT NULL CHECK(plaintext_size >= 0),
+    PRIMARY KEY(file_id, generation)
+);
+
+CREATE TABLE file_chunks (
+    file_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    plaintext_len INTEGER NOT NULL CHECK(plaintext_len >= 0),
+    nonce BLOB NOT NULL CHECK(length(nonce) = 24),
+    ciphertext_hash TEXT NOT NULL,
+    ciphertext_len INTEGER NOT NULL CHECK(ciphertext_len >= 0),
+    PRIMARY KEY(file_id, generation, ordinal),
+    FOREIGN KEY(file_id, generation)
+        REFERENCES file_manifests(file_id, generation)
+);
+
+CREATE TABLE deletion_markers (
+    file_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    marker_hash TEXT NOT NULL UNIQUE,
+    deleted_at INTEGER NOT NULL,
+    PRIMARY KEY(file_id, generation)
+);
+
+CREATE TABLE delete_operations (
+    operation_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    file_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    deleted_at INTEGER NOT NULL,
+    marker_hash TEXT NOT NULL,
+    marker_bytes BLOB NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('replicating_marker', 'committed')),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE TABLE recovery_issues (
+    file_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    issue_kind TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    observed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    resolved_at INTEGER,
+    PRIMARY KEY(file_id, generation, issue_kind)
+);
+
+INSERT INTO files (
+    file_id, current_generation, state, name, plaintext_hash, plaintext_size,
+    current_manifest_hash, source_upload_id, created_at, updated_at
+)
+SELECT file_id, generation, 'committed', name, plaintext_hash, plaintext_size,
+       manifest_hash, upload_id, created_at, created_at
+FROM files_v1;
+
+INSERT INTO file_manifests (
+    file_id, generation, manifest_hash, name, plaintext_hash, plaintext_size
+)
+SELECT file_id, generation, manifest_hash, name, plaintext_hash, plaintext_size
+FROM files_v1;
+
+INSERT INTO file_chunks (
+    file_id, generation, ordinal, plaintext_len, nonce,
+    ciphertext_hash, ciphertext_len
+)
+SELECT f.file_id, f.generation, c.ordinal, c.plaintext_len, c.nonce,
+       c.ciphertext_hash, c.ciphertext_len
+FROM files_v1 AS f
+JOIN upload_chunks AS c ON c.upload_id = f.upload_id
+WHERE c.ciphertext_hash IS NOT NULL AND c.ciphertext_len IS NOT NULL;
+
+DROP TABLE files_v1;
+DROP TABLE placements_v1;
+PRAGMA user_version = 2;
+COMMIT;
+"#,
+    );
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    migration?;
+    connection.execute_batch(SCHEMA)?;
+    Ok(())
+}
 
 #[derive(Debug, Error)]
 pub enum MetadataError {
     #[error("invalid upload state: {0}")]
     InvalidState(String),
+    #[error("invalid file state: {0}")]
+    InvalidFileState(String),
+    #[error("invalid delete-operation state: {0}")]
+    InvalidDeleteState(String),
     #[error("illegal upload transition from {current:?} to {next:?}")]
     IllegalTransition {
         current: UploadState,
@@ -698,6 +1461,14 @@ pub enum MetadataError {
     MissingChunkObject,
     #[error("committed upload has no visible file record")]
     MissingCommittedFile,
+    #[error("file does not exist: {0}")]
+    MissingFile(Uuid),
+    #[error("file is not committed: {0}")]
+    FileNotCommitted(Uuid),
+    #[error("file generation conflicts with persisted state: {0}")]
+    GenerationConflict(Uuid),
+    #[error("delete operation disappeared after commit")]
+    MissingDeleteOperation,
     #[error("replica floor is not met for {kind} {hash}")]
     ReplicaFloorNotMet { kind: ObjectKind, hash: ObjectHash },
     #[error("invalid persisted binary field: {0}")]
@@ -718,11 +1489,101 @@ pub enum MetadataError {
 mod tests {
     use super::*;
 
+    const V1_SCHEMA: &str = r#"
+CREATE TABLE uploads (upload_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+request_fingerprint BLOB NOT NULL, file_id TEXT NOT NULL UNIQUE, file_name TEXT NOT NULL,
+plaintext_hash BLOB NOT NULL, plaintext_size INTEGER NOT NULL, storage_class TEXT NOT NULL,
+content_key_nonce BLOB NOT NULL, wrapped_content_key BLOB NOT NULL, state TEXT NOT NULL,
+generation INTEGER NOT NULL, manifest_hash TEXT, manifest_bytes BLOB, created_at INTEGER NOT NULL DEFAULT (unixepoch()));
+CREATE TABLE upload_chunks (upload_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+plaintext_len INTEGER NOT NULL, plaintext_hash BLOB NOT NULL, nonce BLOB NOT NULL,
+ciphertext_hash TEXT, ciphertext_len INTEGER, PRIMARY KEY(upload_id, ordinal));
+CREATE TABLE placements (object_kind TEXT NOT NULL, object_hash TEXT NOT NULL,
+agent_id TEXT NOT NULL, failure_domain TEXT NOT NULL, state TEXT NOT NULL,
+confirmed_at INTEGER, PRIMARY KEY(object_kind, object_hash, agent_id));
+CREATE TABLE files (file_id TEXT PRIMARY KEY, generation INTEGER NOT NULL, name TEXT NOT NULL,
+plaintext_hash BLOB NOT NULL, plaintext_size INTEGER NOT NULL, manifest_hash TEXT NOT NULL,
+upload_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (unixepoch()));
+PRAGMA user_version = 1;
+"#;
+
     #[test]
     fn state_machine_rejects_regression_and_skips() {
         assert!(UploadState::Staging.permits(UploadState::ReplicatingChunks));
         assert!(!UploadState::Staging.permits(UploadState::Committed));
         assert!(!UploadState::ReplicatingManifest.permits(UploadState::ReplicatingChunks));
         assert!(UploadState::Committed.permits(UploadState::Committed));
+    }
+
+    #[test]
+    fn schema_v1_migrates_committed_uploads_without_rewriting_manifest_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(V1_SCHEMA).unwrap();
+        let upload_id = Uuid::new_v4();
+        let file_id = Uuid::new_v4();
+        let manifest_hash = ObjectHash::digest(b"persisted manifest bytes");
+        connection
+            .execute(
+                "INSERT INTO uploads (upload_id, idempotency_key, request_fingerprint, file_id,
+             file_name, plaintext_hash, plaintext_size, storage_class, content_key_nonce,
+             wrapped_content_key, state, generation, manifest_hash, manifest_bytes)
+             VALUES (?1, 'stable-key', ?2, ?3, 'empty.bin', ?4, 0, 'regular-rf2',
+                     ?5, ?6, 'committed', 1, ?7, ?8)",
+                params![
+                    upload_id.to_string(),
+                    [1_u8; 32].as_slice(),
+                    file_id.to_string(),
+                    blake3::hash(b"").as_bytes().as_slice(),
+                    [2_u8; NONCE_LEN].as_slice(),
+                    vec![3_u8; 48],
+                    manifest_hash.as_str(),
+                    b"persisted manifest bytes".as_slice(),
+                ],
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO files (file_id, generation, name, plaintext_hash, plaintext_size,
+             manifest_hash, upload_id, state) VALUES (?1, 1, 'empty.bin', ?2, 0, ?3, ?4, 'committed')",
+            params![
+                file_id.to_string(),
+                blake3::hash(b"").as_bytes().as_slice(),
+                manifest_hash.as_str(),
+                upload_id.to_string(),
+            ],
+        )
+        .unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        let file = database.file_by_id(file_id).unwrap().unwrap();
+        assert_eq!(file.manifest_hash, manifest_hash);
+        let upload = database
+            .upload_by_idempotency("stable-key")
+            .unwrap()
+            .unwrap();
+        assert_eq!(upload.state, UploadState::Committed);
+        assert_eq!(upload.manifest_bytes.unwrap(), b"persisted manifest bytes");
+        let version: i64 = database
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+    }
+
+    #[test]
+    fn future_schema_versions_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("future.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA user_version = 99;")
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            Database::open(&path),
+            Err(MetadataError::UnsupportedSchemaVersion(99))
+        ));
     }
 }

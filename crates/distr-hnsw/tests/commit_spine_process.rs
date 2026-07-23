@@ -175,3 +175,102 @@ fn abrupt_portal_exit_at_every_boundary_recovers() {
         assert_eq!(fs::read(destination).unwrap(), expected);
     }
 }
+
+#[test]
+fn abrupt_delete_exit_at_every_boundary_recovers_with_the_same_key() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_distr-hnsw"));
+    let workspace = tempfile::tempdir().unwrap();
+    let (_agent_a, target_a) = start_agent(
+        &binary,
+        "agent-a",
+        "host-a",
+        &workspace.path().join("delete-agent-a"),
+    );
+    let (_agent_b, target_b) = start_agent(
+        &binary,
+        "agent-b",
+        "host-b",
+        &workspace.path().join("delete-agent-b"),
+    );
+    let agents = vec![target_a, target_b];
+    let source = workspace.path().join("empty.bin");
+    fs::write(&source, []).unwrap();
+
+    for failpoint in [
+        Failpoint::AfterDeletePlan,
+        Failpoint::AfterFirstMarkerReplica,
+        Failpoint::AfterMarkerDurable,
+        Failpoint::BeforeDeleteCommit,
+        Failpoint::AfterDeleteCommit,
+    ] {
+        let case = workspace.path().join(failpoint.as_str());
+        fs::create_dir_all(&case).unwrap();
+        let database = case.join("portal.sqlite");
+        let master_key = case.join("master.key");
+        assert!(Command::new(&binary)
+            .args(["portal", "init", "--database"])
+            .arg(&database)
+            .arg("--master-key")
+            .arg(&master_key)
+            .status()
+            .unwrap()
+            .success());
+        let uploaded = portal_command(&binary, "put", &database, &master_key, &agents)
+            .arg("--idempotency-key")
+            .arg(format!("upload-{}", failpoint.as_str()))
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(uploaded.status.success());
+        let file_id = Uuid::parse_str(String::from_utf8(uploaded.stdout).unwrap().trim()).unwrap();
+        let delete_key = format!("delete-{}", failpoint.as_str());
+
+        let crashed = portal_command(&binary, "delete", &database, &master_key, &agents)
+            .arg("--idempotency-key")
+            .arg(&delete_key)
+            .arg(file_id.to_string())
+            .env("DISTR_HNSW_FAILPOINT", failpoint.as_str())
+            .output()
+            .unwrap();
+        assert_eq!(crashed.status.code(), Some(86));
+
+        let before = case.join("before-retry.bin");
+        let get_before = portal_command(&binary, "get", &database, &master_key, &agents)
+            .arg(file_id.to_string())
+            .arg(&before)
+            .output()
+            .unwrap();
+        assert_eq!(
+            get_before.status.success(),
+            failpoint != Failpoint::AfterDeleteCommit,
+            "unexpected visibility at {}: {}",
+            failpoint.as_str(),
+            String::from_utf8_lossy(&get_before.stderr)
+        );
+
+        let resumed = portal_command(&binary, "delete", &database, &master_key, &agents)
+            .arg("--idempotency-key")
+            .arg(&delete_key)
+            .arg(file_id.to_string())
+            .output()
+            .unwrap();
+        assert!(resumed.status.success());
+        let repeated = portal_command(&binary, "delete", &database, &master_key, &agents)
+            .arg("--idempotency-key")
+            .arg(&delete_key)
+            .arg(file_id.to_string())
+            .output()
+            .unwrap();
+        assert!(repeated.status.success());
+        assert_eq!(resumed.stdout, repeated.stdout);
+
+        let new_key = portal_command(&binary, "delete", &database, &master_key, &agents)
+            .arg("--idempotency-key")
+            .arg("different-key")
+            .arg(file_id.to_string())
+            .output()
+            .unwrap();
+        assert!(!new_key.status.success());
+        assert!(String::from_utf8_lossy(&new_key.stderr).contains("already deleted"));
+    }
+}

@@ -3,18 +3,22 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectKind {
     Chunk,
     Manifest,
+    DeletionMarker,
 }
 
 impl ObjectKind {
+    pub const ALL: [Self; 3] = [Self::Chunk, Self::Manifest, Self::DeletionMarker];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Chunk => "chunk",
             Self::Manifest => "manifest",
+            Self::DeletionMarker => "deletion_marker",
         }
     }
 }
@@ -32,6 +36,7 @@ impl FromStr for ObjectKind {
         match value {
             "chunk" => Ok(Self::Chunk),
             "manifest" => Ok(Self::Manifest),
+            "deletion_marker" => Ok(Self::DeletionMarker),
             _ => Err(ObjectError::InvalidKind(value.to_owned())),
         }
     }

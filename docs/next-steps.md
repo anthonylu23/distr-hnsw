@@ -19,27 +19,32 @@ Public code fragments remain weak and keyword search wins more decided
 comparisons than semantic search, so hybrid fusion remains a phase-5 product
 requirement.
 
-## Phase 1 — start here
+## Phase 1 — next pass
 
-Start the blob plane + recovery foundation per DESIGN.md §14 and
-[roadmap.md](roadmap.md#m1--build-the-blob-plane-and-recovery-foundation).
-Before implementation, pin object formats, SQLite transitions, fsync
-boundaries, master-key custody, backup defaults, and the crash-test matrix.
-Then build the smallest recovery-first slice:
-
-1. One regular-file class with 4 MiB encrypted chunks.
-2. RF2 across two local agents with a file-backed master key.
-3. Durable portal commit state machine and immutable recovery objects.
-4. Failure injection and an empty-infrastructure restore drill.
-
-The implemented first-pass contract and implementation dependency graph are in
+The implemented contract and dependency graph are in
 [m1-storage-contract.md](m1-storage-contract.md) and
-[m1-implementation-plan.md](m1-implementation-plan.md). Pass 1 provides the
-commit spine through restart-safe RF2 upload and byte-identical download;
-M1 remains **In progress**. The next pass should pin and implement deletion
-markers plus inventory-driven reconstruction before repair/GC. Backup,
-independent key recovery, supported-filesystem review, and the
-blank-infrastructure restore remain later M1 gates.
+[m1-implementation-plan.md](m1-implementation-plan.md). Passes 1 and 2 now
+provide restart-safe RF2 upload/download, durable logical deletion, strict
+agent inventories, and explicit plan/apply recovery with recovery-only repair.
+M1 remains **In progress**.
+
+The next lifecycle pass should:
+
+1. Pin the node observation, degraded-placement, retention, and retirement
+   model before any physical deletion.
+2. Add continuous inventory comparison and scrub using the pass-2 inventory
+   and verification primitives; keep repair policy explicit and observable.
+3. Implement safe placement movement and node retirement, proving replacement
+   durability before old-copy removal.
+4. Add quota/admission behavior and then GC only for generations proven
+   unreachable after the retention horizon.
+5. Run large storage, corruption, and movement matrices on `anthonypc`, not the
+   laptop.
+
+In parallel, resolve supported-filesystem qualification, the first versioned
+backup target, SQLite history restore, and independent master-key recovery.
+The empty-infrastructure restore drill waits for those inputs and remains the
+M1 exit gate.
 
 ## Ops notes
 

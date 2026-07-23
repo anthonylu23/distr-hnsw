@@ -2,17 +2,17 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::{
-    durability::{DurableStore, StoreError},
+    durability::{DurableStore, InventoryPage, StoreError, MAX_INVENTORY_PAGE},
     object::ObjectHash,
     CHUNK_SIZE,
 };
@@ -59,6 +59,7 @@ pub fn router(store: DurableStore, identity: AgentIdentity) -> Router {
     };
     Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/inventory/{kind}", get(inventory))
         .route("/v1/objects/{kind}/{hash}", get(get_object).put(put_object))
         .layer(DefaultBodyLimit::max(CHUNK_SIZE + 1024 * 1024))
         .with_state(state)
@@ -66,6 +67,27 @@ pub fn router(store: DurableStore, identity: AgentIdentity) -> Router {
 
 async fn health(State(state): State<AgentState>) -> Json<AgentIdentity> {
     Json(state.identity)
+}
+
+#[derive(Deserialize)]
+struct InventoryQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn inventory(
+    State(state): State<AgentState>,
+    Path(kind): Path<String>,
+    Query(query): Query<InventoryQuery>,
+) -> Result<Json<InventoryPage>, AgentError> {
+    let kind = kind.parse()?;
+    let after = query.after.map(ObjectHash::parse).transpose()?;
+    let limit = query.limit.unwrap_or(MAX_INVENTORY_PAGE);
+    let page =
+        tokio::task::spawn_blocking(move || state.store.inventory(kind, after.as_ref(), limit))
+            .await
+            .map_err(AgentError::Join)??;
+    Ok(Json(page))
 }
 
 async fn put_object(
@@ -109,6 +131,10 @@ impl IntoResponse for AgentError {
             Self::Object(_) => StatusCode::BAD_REQUEST,
             Self::Store(StoreError::NotFound(_)) => StatusCode::NOT_FOUND,
             Self::Store(StoreError::HashMismatch { .. }) => StatusCode::CONFLICT,
+            Self::Store(StoreError::InvalidInventoryLimit(_)) => StatusCode::BAD_REQUEST,
+            Self::Store(StoreError::MalformedInventoryEntry(_)) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             Self::Store(StoreError::InvalidPath(_))
             | Self::Store(StoreError::Io(_))
             | Self::Join(_) => StatusCode::INTERNAL_SERVER_ERROR,
