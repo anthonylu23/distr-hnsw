@@ -6,12 +6,13 @@ next dependency boundary.
 
 ## Current status
 
-Passes 1 and 2 are implemented locally. The product crate provides loopback
-agents plus portal `init`, `put`, `get`, `delete`, and `recover` commands.
-Pass 2 adds deletion-marker v1, SQLite schema v2 with atomic v1 migration,
-paginated inventories, plan/apply recovery reports, highest-generation
-selection, recovery-only RF2 repair, per-file convergence, and fail-closed
-recovery issues.
+Passes 1 and 2 plus the compatibility-hardening pass are implemented locally.
+The product crate provides loopback agents plus portal `init`, `put`, `get`,
+`delete`, and `recover` commands. Pass 2 adds deletion-marker v1, paginated
+inventories, plan/apply recovery reports, highest-generation selection,
+recovery-only RF2 repair, per-file convergence, and fail-closed recovery
+issues. The hardening pass integrates the audited commit spine, introduces
+canonical SQLite schema v3, and migrates both prior schema-v2 layouts.
 
 This is not M1 acceptance. Physical lifecycle work, continuous reconciliation,
 supported-filesystem review, offsite backup, independent key recovery, portal
@@ -47,6 +48,21 @@ Pass 2 exits when newer immutable evidence can safely rebuild stale SQLite,
 required objects can be restored to RF2, and no blocked or deleted file becomes
 downloadable. Those gates now pass in the light local matrix.
 
+## Compatibility hardening — integrated baseline
+
+1. Persist the chunk envelope version while retaining byte-identical v1 AAD.
+2. Treat RF2 as a floor when extra agents reject writes or are unavailable.
+3. Live-revalidate required chunks, manifests, and deletion markers before the
+   committing transaction.
+4. Preserve committed retries without live agents or the original source.
+5. Migrate schema v1, audited commit-spine v2, and recovery-history v2 into one
+   canonical v3 layout without rewriting immutable objects.
+6. Exercise exact chunk download after migration and refuse file or tombstone
+   commit when confirmed physical copies disappeared.
+
+This pass exits when all Pass 1 and Pass 2 regression suites run against the
+same source tree and every supported historical schema fixture converges on v3.
+
 ### Validation
 
 Run on the development machine:
@@ -69,6 +85,9 @@ portal at each crash boundary. Larger future storage matrices belong on
   parallel, but the restore drill waits for both.
 - Node observation/retirement, movement, and GC share one lifecycle owner;
   physical deletion cannot precede the observation and retention proofs.
+
+The safety model for that owner is pinned in
+[`m1-lifecycle-contract.md`](m1-lifecycle-contract.md).
 
 ## Remaining M1 passes
 

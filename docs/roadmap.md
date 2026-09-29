@@ -29,10 +29,11 @@ to the best eligible dimension. M0 is accepted and M1 is unblocked. See
 [phase-0-validation.md](phase-0-validation.md) and
 [next-steps.md](next-steps.md).
 
-M1 passes 1 and 2 now implement the loopback-only RF2 commit spine, durable
-logical deletion, strict paginated inventories, SQLite v2 migration, and
-explicit plan/apply recovery with recovery-only RF2 repair. The full M1 gate
-remains open pending physical lifecycle correctness, continuous reconciliation,
+M1 passes 1 and 2 plus compatibility hardening now implement the loopback-only
+RF2 commit spine, durable logical deletion, strict paginated inventories,
+canonical SQLite v3 migration, live pre-commit replica validation, and explicit
+plan/apply recovery with recovery-only RF2 repair. The full M1 gate remains
+open pending physical lifecycle correctness, continuous reconciliation,
 offsite backup and independent key recovery, supported-filesystem review, and
 the empty-infrastructure restore drill. See
 [m1-implementation-plan.md](m1-implementation-plan.md).

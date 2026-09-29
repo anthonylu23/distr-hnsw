@@ -864,9 +864,10 @@ a calendar rather than in the abstract.
    documents—stands on it. distr-hnsw may not hold the only copy of a file until
    this recovery gate passes.
 
-   Current implementation status: passes 1 and 2 provide the RF2 upload spine,
-   logical deletion without agent DELETE, strict object inventories, SQLite v2
-   migration, and explicit plan/apply recovery with recovery-only repair. M1
+   Current implementation status: passes 1 and 2 plus compatibility hardening
+   provide the RF2 upload spine, logical deletion without agent DELETE, strict
+   object inventories, canonical SQLite v3 migration, live pre-commit replica
+   validation, and explicit plan/apply recovery with recovery-only repair. M1
    remains in progress; reconciliation, lifecycle/GC, backup/key recovery, and
    the empty-infrastructure restore gate are still open.
 2. **Tailscale auth + sessions + API keys** (~2–4 weeks) — WhoIs provider,

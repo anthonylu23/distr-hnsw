@@ -1,8 +1,9 @@
 # M1 storage contract
 
-This document pins the implemented M1 blob-plane contract through pass 2. It
-is subordinate to `DESIGN.md` and `docs/roadmap.md`; later M1 work may extend
-these rules but must not weaken their durability or recovery invariants.
+This document pins the implemented M1 blob-plane contract through the
+compatibility-hardening pass after pass 2. It is subordinate to `DESIGN.md` and
+`docs/roadmap.md`; later M1 work may extend these rules but must not weaken
+their durability or recovery invariants.
 
 ## Implemented boundary
 
@@ -11,6 +12,11 @@ plaintext chunks, a file-backed master key, and RF2 across two agents in
 distinct configured failure domains. It now includes restart-safe logical
 deletion, paginated agent inventories, deterministic recovery planning, and
 explicit recovery application with recovery-only repair.
+
+The integrated baseline also preserves chunk-envelope v1 byte compatibility,
+treats RF2 as a floor when extra agents fail, live-revalidates every required
+object before file or tombstone commit, and lets already-committed idempotent
+retries succeed without a source file or live agents.
 
 Agents remain loopback-only and unauthenticated for M1 development. Physical
 deletion, continuous reconciliation, movement, node retirement, quotas, GC,
@@ -55,8 +61,9 @@ trailing bytes, unsupported versions, invalid lengths, tampering, and wrong
 keys.
 
 The portal persists exact manifest bytes and hash before dispatch. A file is
-visible only after its manifest and all referenced chunks have confirmed RF2
-placements in distinct failure domains and SQLite commits the projection.
+visible only after its manifest and all referenced chunks have live
+GET-and-hash-verified RF2 placements in distinct failure domains and SQLite
+commits the projection. Persisted placement rows alone cannot authorize commit.
 
 ## Logical deletion
 
@@ -65,23 +72,29 @@ placements in distinct failure domains and SQLite commits the projection.
 id, and generation header plus an authenticated encrypted `deleted_at`
 payload. Exact bytes and hash are persisted before replication.
 
-The marker must reach RF2 before one SQLite transaction inserts its immutable
-generation record, changes the current file projection to `deleted`, and marks
-the operation committed. Downloads remain available before that transaction
-and are denied afterward. Reusing the same key resumes or returns the same
-success. A key reused for another file conflicts; a new key for an already
-deleted file returns `AlreadyDeleted`. Logical deletion never calls agent
-DELETE and never removes older manifests or chunks.
+The marker must reach live, hash-verified RF2 before one SQLite transaction
+inserts its immutable generation record, changes the current file projection
+to `deleted`, and marks the operation committed. Downloads remain available
+before that transaction and are denied afterward. Reusing the same key resumes
+or returns the same success. A key reused for another file conflicts; a new key
+for an already deleted file returns `AlreadyDeleted`. Logical deletion never
+calls agent DELETE and never removes older manifests or chunks.
 
-## SQLite schema v2
+## SQLite schema v3
 
-Schema v2 stores `files` as the current projection with generation and
+Schema v3 stores `files` as the current projection with generation and
 `committed`, `deleted`, or `recovery_blocked` state. It adds immutable
 `file_manifests`, `file_chunks`, `deletion_markers`, restartable
 `delete_operations`, and `recovery_issues`; placements accept all three object
-kinds. Opening a v1 database migrates it in one transaction, preserving
-committed uploads, chunks, placements, and the exact existing manifest bytes.
-Unknown future schema versions are rejected.
+kinds. Per-chunk envelope versions are persisted in upload and recovered-file
+history; manifest v1 implies chunk envelope v1.
+
+The two earlier development lines both used schema version 2 for incompatible
+layouts. Opening a v2 database inspects its table shape and atomically migrates
+either the audited commit-spine layout or the recovery-history layout to
+canonical v3. V1 also migrates directly to v3. Existing manifest bytes,
+ciphertext hashes, and chunk-v1 AAD remain unchanged. Unknown or unrecognized
+schema layouts fail closed.
 
 ## Recovery contract
 
@@ -114,3 +127,7 @@ at RF2, first manifest replica, manifest at RF2, before commit, and after
 commit. Delete tests stop after plan persistence, first marker replica, marker
 at RF2, before tombstone commit, and after commit. Retrying with the same
 idempotency key must converge without premature visibility changes.
+
+Physical lifecycle behavior is governed by
+[`m1-lifecycle-contract.md`](m1-lifecycle-contract.md). Agent DELETE remains
+unimplemented.

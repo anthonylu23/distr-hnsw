@@ -2,9 +2,13 @@ use std::{fs, path::Path};
 
 use distr_hnsw::{
     agent::{serve_agent, AgentIdentity},
-    crypto::{random_key, unwrap_key, wrap_key, MasterKey},
+    crypto::{
+        encrypt_chunk, random_key, random_nonce, unwrap_key, wrap_key, MasterKey, ENVELOPE_VERSION,
+    },
     durability::DurableStore,
-    format::{decode_manifest, encode_deletion_marker, encode_manifest},
+    format::{
+        decode_manifest, encode_deletion_marker, encode_manifest, ChunkRecord, ManifestPayload,
+    },
     metadata::{Database, FileState},
     object::{ObjectHash, ObjectKind},
     portal::{AgentTarget, Failpoint, FailpointAction, Portal, PortalError},
@@ -149,6 +153,67 @@ async fn every_delete_boundary_is_retryable_and_never_removes_objects() {
                 .is_ok());
         }
     }
+}
+
+#[tokio::test]
+async fn delete_refuses_to_commit_when_confirmed_marker_replicas_are_gone() {
+    let agent_a = start_agent("agent-a", "host-a").await;
+    let agent_b = start_agent("agent-b", "host-b").await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
+    let workspace = tempfile::tempdir().unwrap();
+    let key_path = workspace.path().join("master.key");
+    let database_path = workspace.path().join("portal.sqlite");
+    let source = workspace.path().join("source.bin");
+    fs::write(&source, b"delete durability").unwrap();
+    create_key(&key_path);
+
+    let mut portal = Portal::open(
+        &database_path,
+        MasterKey::load(&key_path).unwrap(),
+        agents.clone(),
+    )
+    .unwrap();
+    let file_id = portal.upload(&source, "delete-source").await.unwrap();
+    drop(portal);
+
+    let mut portal = Portal::open(
+        &database_path,
+        MasterKey::load(&key_path).unwrap(),
+        agents.clone(),
+    )
+    .unwrap()
+    .with_failpoint(Failpoint::AfterMarkerDurable, FailpointAction::ReturnError);
+    assert!(matches!(
+        portal.delete(file_id, "delete-missing-marker").await,
+        Err(PortalError::InjectedFailure(Failpoint::AfterMarkerDurable))
+    ));
+    drop(portal);
+
+    let marker_hash = Database::open(&database_path)
+        .unwrap()
+        .delete_by_idempotency("delete-missing-marker")
+        .unwrap()
+        .unwrap()
+        .marker_hash;
+    for agent in [&agent_a, &agent_b] {
+        fs::remove_file(
+            DurableStore::open(agent.volume.path())
+                .unwrap()
+                .object_path(ObjectKind::DeletionMarker, &marker_hash),
+        )
+        .unwrap();
+    }
+
+    let mut portal =
+        Portal::open(&database_path, MasterKey::load(&key_path).unwrap(), agents).unwrap();
+    assert!(matches!(
+        portal.delete(file_id, "delete-missing-marker").await,
+        Err(PortalError::NoValidReplica {
+            kind: ObjectKind::DeletionMarker,
+            ..
+        })
+    ));
+    assert!(portal.is_visible(file_id).unwrap());
 }
 
 #[tokio::test]
@@ -616,4 +681,179 @@ async fn migrated_v1_upload_remains_downloadable_and_idempotent() {
     let destination = workspace.path().join("legacy-download.bin");
     portal.download(file_id, &destination).await.unwrap();
     assert_eq!(fs::read(destination).unwrap(), Vec::<u8>::new());
+}
+
+#[tokio::test]
+async fn audited_v2_chunk_remains_downloadable_after_v3_migration() {
+    let agent_a = start_agent("agent-a", "host-a").await;
+    let agent_b = start_agent("agent-b", "host-b").await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
+    let workspace = tempfile::tempdir().unwrap();
+    let key_path = workspace.path().join("master.key");
+    let database_path = workspace.path().join("audited-v2.sqlite");
+    create_key(&key_path);
+    let master = MasterKey::load(&key_path).unwrap();
+    let file_id = uuid::Uuid::new_v4();
+    let upload_id = uuid::Uuid::new_v4();
+    let content_key = random_key();
+    let nonce = random_nonce();
+    let plaintext = b"audited v2 chunk payload";
+    let plaintext_hash = *blake3::hash(plaintext).as_bytes();
+    let ciphertext = encrypt_chunk(
+        &content_key,
+        ENVELOPE_VERSION,
+        file_id,
+        0,
+        plaintext.len() as u32,
+        &nonce,
+        plaintext,
+    )
+    .unwrap();
+    let chunk_hash = ObjectHash::digest(&ciphertext);
+    let wrapped_content_key = wrap_key(&master, b"content", file_id, 1, &content_key).unwrap();
+    let payload = ManifestPayload {
+        name: "legacy.bin".to_owned(),
+        plaintext_len: plaintext.len() as u64,
+        plaintext_hash,
+        content_key: wrapped_content_key.clone(),
+        chunks: vec![ChunkRecord {
+            ordinal: 0,
+            plaintext_len: plaintext.len() as u32,
+            nonce,
+            ciphertext_hash: chunk_hash.clone(),
+            ciphertext_len: ciphertext.len() as u32,
+        }],
+    };
+    let manifest_bytes = encode_manifest(&master, file_id, 1, &payload).unwrap();
+    let manifest_hash = ObjectHash::digest(&manifest_bytes);
+    for agent in [&agent_a, &agent_b] {
+        let store = DurableStore::open(agent.volume.path()).unwrap();
+        store
+            .put(ObjectKind::Chunk, &chunk_hash, &ciphertext)
+            .unwrap();
+        store
+            .put(ObjectKind::Manifest, &manifest_hash, &manifest_bytes)
+            .unwrap();
+    }
+
+    let connection = Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE uploads (
+                upload_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+                request_fingerprint BLOB NOT NULL, file_id TEXT NOT NULL UNIQUE,
+                file_name TEXT NOT NULL, plaintext_hash BLOB NOT NULL,
+                plaintext_size INTEGER NOT NULL, storage_class TEXT NOT NULL,
+                content_key_nonce BLOB NOT NULL, wrapped_content_key BLOB NOT NULL,
+                state TEXT NOT NULL, generation INTEGER NOT NULL, manifest_hash TEXT,
+                manifest_bytes BLOB, created_at INTEGER NOT NULL DEFAULT (unixepoch())
+             );
+             CREATE TABLE upload_chunks (
+                upload_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                envelope_version INTEGER NOT NULL, plaintext_len INTEGER NOT NULL,
+                plaintext_hash BLOB NOT NULL, nonce BLOB NOT NULL,
+                ciphertext_hash TEXT, ciphertext_len INTEGER,
+                PRIMARY KEY(upload_id, ordinal)
+             );
+             CREATE TABLE placements (
+                object_kind TEXT NOT NULL, object_hash TEXT NOT NULL,
+                agent_id TEXT NOT NULL, failure_domain TEXT NOT NULL,
+                state TEXT NOT NULL, confirmed_at INTEGER,
+                PRIMARY KEY(object_kind, object_hash, agent_id)
+             );
+             CREATE TABLE files (
+                file_id TEXT PRIMARY KEY, generation INTEGER NOT NULL, name TEXT NOT NULL,
+                plaintext_hash BLOB NOT NULL, plaintext_size INTEGER NOT NULL,
+                manifest_hash TEXT NOT NULL, upload_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (unixepoch())
+             );
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO uploads
+             (upload_id, idempotency_key, request_fingerprint, file_id, file_name,
+              plaintext_hash, plaintext_size, storage_class, content_key_nonce,
+              wrapped_content_key, state, generation, manifest_hash, manifest_bytes)
+             VALUES (?1, 'audited-v2-key', ?2, ?3, 'legacy.bin', ?4, ?5,
+                     'regular-rf2', ?6, ?7, 'committed', 1, ?8, ?9)",
+            params![
+                upload_id.to_string(),
+                [1_u8; 32].as_slice(),
+                file_id.to_string(),
+                plaintext_hash.as_slice(),
+                plaintext.len() as u64,
+                wrapped_content_key.nonce.as_slice(),
+                wrapped_content_key.ciphertext,
+                manifest_hash.as_str(),
+                manifest_bytes,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO upload_chunks
+             (upload_id, ordinal, envelope_version, plaintext_len, plaintext_hash,
+              nonce, ciphertext_hash, ciphertext_len)
+             VALUES (?1, 0, 1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                upload_id.to_string(),
+                plaintext.len() as u32,
+                plaintext_hash.as_slice(),
+                nonce.as_slice(),
+                chunk_hash.as_str(),
+                ciphertext.len() as u32,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO files
+             (file_id, generation, name, plaintext_hash, plaintext_size,
+              manifest_hash, upload_id, state)
+             VALUES (?1, 1, 'legacy.bin', ?2, ?3, ?4, ?5, 'committed')",
+            params![
+                file_id.to_string(),
+                plaintext_hash.as_slice(),
+                plaintext.len() as u64,
+                manifest_hash.as_str(),
+                upload_id.to_string(),
+            ],
+        )
+        .unwrap();
+    for agent in [&agent_a, &agent_b] {
+        for (kind, hash) in [
+            (ObjectKind::Chunk, &chunk_hash),
+            (ObjectKind::Manifest, &manifest_hash),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO placements
+                     (object_kind, object_hash, agent_id, failure_domain, state, confirmed_at)
+                     VALUES (?1, ?2, ?3, ?4, 'confirmed', unixepoch())",
+                    params![
+                        kind.as_str(),
+                        hash.as_str(),
+                        agent.target.id,
+                        agent.target.failure_domain,
+                    ],
+                )
+                .unwrap();
+        }
+    }
+    drop(connection);
+
+    let mut portal =
+        Portal::open(&database_path, MasterKey::load(&key_path).unwrap(), agents).unwrap();
+    let destination = workspace.path().join("legacy.download");
+    portal.download(file_id, &destination).await.unwrap();
+    assert_eq!(fs::read(destination).unwrap(), plaintext);
+    assert_eq!(
+        portal
+            .upload(&workspace.path().join("missing-source"), "audited-v2-key")
+            .await
+            .unwrap(),
+        file_id
+    );
 }

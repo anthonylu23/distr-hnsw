@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use distr_hnsw::{portal::Failpoint, CHUNK_SIZE};
+use distr_hnsw::{metadata::Database, portal::Failpoint, CHUNK_SIZE};
 use uuid::Uuid;
 
 struct AgentProcess {
@@ -145,6 +145,21 @@ fn abrupt_portal_exit_at_every_boundary_recovers() {
             String::from_utf8_lossy(&crashed.stderr)
         );
 
+        let metadata = Database::open(&database).unwrap();
+        let upload = metadata
+            .upload_by_idempotency(&idempotency_key)
+            .unwrap()
+            .unwrap();
+        let visible_before_retry = metadata.file_by_id(upload.file_id).unwrap().is_some();
+        assert_eq!(
+            visible_before_retry,
+            failpoint == Failpoint::AfterCommit,
+            "pre-commit visibility leaked at {}",
+            failpoint.as_str()
+        );
+        let expected_file_id = upload.file_id;
+        drop(metadata);
+
         let resumed = portal_command(&binary, "put", &database, &master_key, &agents)
             .arg("--idempotency-key")
             .arg(&idempotency_key)
@@ -159,6 +174,7 @@ fn abrupt_portal_exit_at_every_boundary_recovers() {
         );
         let file_id = String::from_utf8(resumed.stdout).unwrap();
         let file_id = Uuid::parse_str(file_id.trim()).unwrap();
+        assert_eq!(file_id, expected_file_id);
 
         let destination = case.join("download.bin");
         let downloaded = portal_command(&binary, "get", &database, &master_key, &agents)
