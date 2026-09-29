@@ -645,22 +645,28 @@ async fn repair_object(
         .expect("repair requires a verified source copy");
     let mut planned = 0;
     let mut applied = 0;
+    // Agents whose recorded copy is missing or corrupt are restored in place
+    // even when the floor is already met elsewhere: desired placement is
+    // every configured copy intact.
+    let damaged: BTreeSet<String> = database
+        .placement_states(object.kind, &object.hash)?
+        .into_iter()
+        .filter(|(_, state, _)| matches!(state, PlacementState::Missing | PlacementState::Corrupt))
+        .map(|(agent, _, _)| agent)
+        .collect();
     for agent in reachable {
         let domains = verification.domains().len();
-        if domains >= MINIMUM_REPLICAS && verification.valid.len() >= DESIRED_REPLICAS {
-            break;
-        }
         let agent_id = agent.target.id.as_str();
         if verification.valid.contains(agent_id) {
             continue;
         }
+        let need_more = domains < MINIMUM_REPLICAS || verification.valid.len() < DESIRED_REPLICAS;
         let domain_has_copy = verification
             .valid_domains
             .values()
             .any(|domain| domain == &agent.target.failure_domain);
-        // Restore a damaged copy in place, or extend to a new failure domain
-        // when the floor is not met.
-        if domain_has_copy && domains >= MINIMUM_REPLICAS {
+        let extends_floor = need_more && !(domain_has_copy && domains >= MINIMUM_REPLICAS);
+        if !extends_floor && !damaged.contains(agent_id) {
             continue;
         }
         planned += 1;

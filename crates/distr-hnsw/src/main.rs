@@ -11,6 +11,7 @@ use distr_hnsw::{
     agent::{bind_and_serve_agent, AgentIdentity, CapacityConfig},
     backup::{self, BackupTargetSpec},
     crypto::MasterKey,
+    lifecycle::{self, GcOptions},
     metadata::{Database, JobMode, KeyBinding},
     portal::{prepare_agents, AgentTarget, Failpoint, FailpointAction, Portal},
     reconcile::{health_report, scrub},
@@ -162,6 +163,43 @@ enum PortalCommand {
     Restore {
         #[command(subcommand)]
         command: RestoreCommand,
+    },
+    /// Move an agent's copies elsewhere copy-first, then orphan its placements.
+    Drain {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long = "agent", required = true)]
+        agents: Vec<AgentTarget>,
+        #[arg(long)]
+        agent_id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Retire an agent's incarnation once every object meets RF2 without it.
+    Retire {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long = "agent", required = true)]
+        agents: Vec<AgentTarget>,
+        #[arg(long)]
+        agent_id: String,
+    },
+    /// Plan garbage collection with per-object proofs; `--apply` deletes
+    /// only objects whose proof re-derives unchanged.
+    Gc {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long = "agent", required = true)]
+        agents: Vec<AgentTarget>,
+        #[arg(long)]
+        apply: bool,
+        /// Seconds a deleted generation is retained live (default 30 days).
+        #[arg(long, default_value_t = 30 * 24 * 3600)]
+        retention_seconds: i64,
+        /// Seconds an uncommitted upload is kept before its objects are
+        /// collectible (default 7 days).
+        #[arg(long, default_value_t = 7 * 24 * 3600)]
+        staging_grace_seconds: i64,
     },
 }
 
@@ -564,6 +602,70 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+            }
+            PortalCommand::Drain {
+                database,
+                agents,
+                agent_id,
+                dry_run,
+            } => {
+                let agents = prepare_agents(agents)?;
+                let mut database = Database::open(&database)?;
+                let report = lifecycle::drain(
+                    &mut database,
+                    &agents,
+                    &reqwest::Client::new(),
+                    &agent_id,
+                    dry_run,
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.exit_code() == 2 {
+                    std::process::exit(2);
+                }
+                Ok(())
+            }
+            PortalCommand::Retire {
+                database,
+                agents,
+                agent_id,
+            } => {
+                let agents = prepare_agents(agents)?;
+                let mut database = Database::open(&database)?;
+                let report =
+                    lifecycle::retire(&mut database, &agents, &reqwest::Client::new(), &agent_id)
+                        .await?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.exit_code() == 2 {
+                    std::process::exit(2);
+                }
+                Ok(())
+            }
+            PortalCommand::Gc {
+                database,
+                agents,
+                apply,
+                retention_seconds,
+                staging_grace_seconds,
+            } => {
+                let agents = prepare_agents(agents)?;
+                let mut database = Database::open(&database)?;
+                let report = lifecycle::gc(
+                    &mut database,
+                    &agents,
+                    &reqwest::Client::new(),
+                    GcOptions {
+                        retention_seconds,
+                        staging_grace_seconds,
+                        apply,
+                    },
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.exit_code() == 2 {
+                    std::process::exit(2);
+                }
+                Ok(())
             }
             PortalCommand::Restore { command } => match command {
                 RestoreCommand::Metadata {

@@ -10,7 +10,7 @@ use crate::{
     object::{ObjectHash, ObjectKind},
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const MASTER_KEY_ID_META: &str = "master_key_id";
 const CONTENT_GENERATION_META: &str = "content_generation";
 
@@ -225,6 +225,9 @@ pub enum PlacementState {
     Confirmed,
     Missing,
     Corrupt,
+    /// Superseded by a confirmed replacement elsewhere; the copy may still
+    /// exist but no longer counts and is eligible for collection.
+    Orphaned,
 }
 
 impl PlacementState {
@@ -234,6 +237,7 @@ impl PlacementState {
             Self::Confirmed => "confirmed",
             Self::Missing => "missing",
             Self::Corrupt => "corrupt",
+            Self::Orphaned => "orphaned",
         }
     }
 }
@@ -247,6 +251,7 @@ impl FromStr for PlacementState {
             "confirmed" => Ok(Self::Confirmed),
             "missing" => Ok(Self::Missing),
             "corrupt" => Ok(Self::Corrupt),
+            "orphaned" => Ok(Self::Orphaned),
             _ => Err(MetadataError::InvalidPlacementState(value.to_owned())),
         }
     }
@@ -334,6 +339,38 @@ pub struct CompleteScan {
     pub kind: ObjectKind,
     pub inventory_digest: String,
     pub completed_at: i64,
+}
+
+/// An uncommitted upload past its grace period and the objects it staged.
+#[derive(Clone, Debug)]
+pub struct ExpiredUpload {
+    pub upload_id: Uuid,
+    pub created_at: i64,
+    pub objects: Vec<(ObjectKind, ObjectHash)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewGcProof {
+    pub kind: ObjectKind,
+    pub hash: ObjectHash,
+    pub reason: String,
+    pub content_generation: i64,
+    pub incarnation_digest: String,
+    pub observation_digest: String,
+    pub retention_seconds: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct GcProof {
+    pub proof_id: Uuid,
+    pub kind: ObjectKind,
+    pub hash: ObjectHash,
+    pub reason: String,
+    pub planned_at: i64,
+    pub content_generation: i64,
+    pub incarnation_digest: String,
+    pub observation_digest: String,
+    pub retention_seconds: i64,
 }
 
 /// A SQLite snapshot shipped to a backup target.
@@ -533,7 +570,7 @@ impl Database {
                 migrate_v3_to_v4(&mut connection)?;
             }
             3 => migrate_v3_to_v4(&mut connection)?,
-            4 | 5 => apply_schema(&connection)?,
+            4..=6 => migrate_to_v7(&mut connection)?,
             SCHEMA_VERSION => apply_schema(&connection)?,
             _ => return Err(MetadataError::UnsupportedSchemaVersion(version)),
         }
@@ -758,6 +795,353 @@ impl Database {
                 hash.as_str(),
                 ciphertext_len
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_placement_state(
+        &mut self,
+        kind: ObjectKind,
+        hash: &ObjectHash,
+        agent_id: &str,
+        state: PlacementState,
+    ) -> Result<(), MetadataError> {
+        let changed = self.connection.execute(
+            "UPDATE placements SET state = ?4
+             WHERE object_kind = ?1 AND object_hash = ?2 AND agent_id = ?3",
+            params![kind.as_str(), hash.as_str(), agent_id, state.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(MetadataError::MissingPlacement);
+        }
+        Ok(())
+    }
+
+    /// Every placement row recorded for an agent, any state.
+    pub fn placements_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<(ObjectKind, ObjectHash, PlacementState)>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT object_kind, object_hash, state FROM placements
+             WHERE agent_id = ?1 ORDER BY object_kind, object_hash",
+        )?;
+        let rows = statement
+            .query_map([agent_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(kind, hash, state)| {
+                Ok((
+                    kind.parse()?,
+                    ObjectHash::parse(hash)?,
+                    PlacementState::from_str(&state)?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Every placement row for an object, any agent and state.
+    pub fn all_placements(
+        &self,
+        kind: ObjectKind,
+        hash: &ObjectHash,
+    ) -> Result<Vec<(String, String, PlacementState)>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT agent_id, failure_domain, state FROM placements
+             WHERE object_kind = ?1 AND object_hash = ?2 ORDER BY agent_id",
+        )?;
+        let rows = statement
+            .query_map(params![kind.as_str(), hash.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(agent, domain, state)| Ok((agent, domain, PlacementState::from_str(&state)?)))
+            .collect()
+    }
+
+    pub fn delete_placements(
+        &mut self,
+        kind: ObjectKind,
+        hash: &ObjectHash,
+    ) -> Result<usize, MetadataError> {
+        Ok(self.connection.execute(
+            "DELETE FROM placements WHERE object_kind = ?1 AND object_hash = ?2",
+            params![kind.as_str(), hash.as_str()],
+        )?)
+    }
+
+    pub fn delete_placement(
+        &mut self,
+        kind: ObjectKind,
+        hash: &ObjectHash,
+        agent_id: &str,
+    ) -> Result<(), MetadataError> {
+        self.connection.execute(
+            "DELETE FROM placements WHERE object_kind = ?1 AND object_hash = ?2 AND agent_id = ?3",
+            params![kind.as_str(), hash.as_str(), agent_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn active_incarnation(&self, agent_id: &str) -> Result<Option<String>, MetadataError> {
+        self.connection
+            .query_row(
+                "SELECT incarnation_id FROM agent_incarnations
+                 WHERE agent_id = ?1 AND status = 'active'",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Formally retire an agent's active incarnation and orphan every placement
+    /// it still holds. Callers must first prove the floor holds without it.
+    pub fn retire_incarnation(&mut self, agent_id: &str) -> Result<String, MetadataError> {
+        let transaction = self.connection.transaction()?;
+        let incarnation: Option<String> = transaction
+            .query_row(
+                "SELECT incarnation_id FROM agent_incarnations
+                 WHERE agent_id = ?1 AND status = 'active'",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let incarnation =
+            incarnation.ok_or_else(|| MetadataError::NoActiveIncarnation(agent_id.to_owned()))?;
+        transaction.execute(
+            "UPDATE agent_incarnations SET status = 'retired', last_seen_at = unixepoch()
+             WHERE incarnation_id = ?1",
+            [&incarnation],
+        )?;
+        transaction.execute(
+            "UPDATE placements SET state = 'orphaned'
+             WHERE agent_id = ?1 AND state IN ('pending', 'confirmed', 'missing', 'corrupt')",
+            [agent_id],
+        )?;
+        transaction.commit()?;
+        Ok(incarnation)
+    }
+
+    /// Deleted files as `(file_id, generation, deleted_at)`.
+    pub fn deleted_files(&self) -> Result<Vec<(Uuid, u64, i64)>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT file_id, current_generation, deleted_at FROM files
+             WHERE state = 'deleted' AND deleted_at IS NOT NULL ORDER BY file_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(file_id, generation, deleted_at)| {
+                Ok((
+                    Uuid::parse_str(&file_id)
+                        .map_err(|_| MetadataError::InvalidBinaryField("file id".to_owned()))?,
+                    u64::try_from(generation).map_err(|_| MetadataError::NumericOverflow)?,
+                    deleted_at,
+                ))
+            })
+            .collect()
+    }
+
+    /// Objects belonging to generations of a file below `generation`:
+    /// manifests and chunks that a later deletion or replacement superseded.
+    pub fn superseded_objects(
+        &self,
+        file_id: Uuid,
+        generation: u64,
+    ) -> Result<Vec<(ObjectKind, ObjectHash)>, MetadataError> {
+        let mut out = Vec::new();
+        let mut manifests = self.connection.prepare(
+            "SELECT manifest_hash FROM file_manifests WHERE file_id = ?1 AND generation < ?2",
+        )?;
+        for hash in manifests
+            .query_map(params![file_id.to_string(), to_i64(generation)?], |row| {
+                row.get::<_, String>(0)
+            })?
+        {
+            out.push((ObjectKind::Manifest, ObjectHash::parse(hash?)?));
+        }
+        let mut chunks = self.connection.prepare(
+            "SELECT ciphertext_hash FROM file_chunks WHERE file_id = ?1 AND generation < ?2",
+        )?;
+        for hash in chunks.query_map(params![file_id.to_string(), to_i64(generation)?], |row| {
+            row.get::<_, String>(0)
+        })? {
+            out.push((ObjectKind::Chunk, ObjectHash::parse(hash?)?));
+        }
+        Ok(out)
+    }
+
+    /// Uncommitted uploads older than `cutoff` as `(upload_id, created_at,
+    /// objects)`: staging garbage once the grace period has elapsed.
+    pub fn expired_uploads(&self, cutoff: i64) -> Result<Vec<ExpiredUpload>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT upload_id, created_at, manifest_hash FROM uploads
+             WHERE state != 'committed' AND created_at <= ?1 ORDER BY upload_id",
+        )?;
+        let uploads = statement
+            .query_map([cutoff], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = Vec::new();
+        for (upload_id, created_at, manifest_hash) in uploads {
+            let mut objects = Vec::new();
+            if let Some(hash) = manifest_hash {
+                objects.push((ObjectKind::Manifest, ObjectHash::parse(hash)?));
+            }
+            let mut chunks = self.connection.prepare(
+                "SELECT ciphertext_hash FROM upload_chunks
+                 WHERE upload_id = ?1 AND ciphertext_hash IS NOT NULL",
+            )?;
+            for hash in chunks.query_map([&upload_id], |row| row.get::<_, String>(0))? {
+                objects.push((ObjectKind::Chunk, ObjectHash::parse(hash?)?));
+            }
+            out.push(ExpiredUpload {
+                upload_id: Uuid::parse_str(&upload_id)
+                    .map_err(|_| MetadataError::InvalidBinaryField("upload id".to_owned()))?,
+                created_at,
+                objects,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Whether any live (committed) file's current generation references the
+    /// object.
+    pub fn required_by_live_file(
+        &self,
+        kind: ObjectKind,
+        hash: &ObjectHash,
+    ) -> Result<bool, MetadataError> {
+        let query = match kind {
+            ObjectKind::Manifest => {
+                "SELECT EXISTS(SELECT 1 FROM files
+                 WHERE state = 'committed' AND current_manifest_hash = ?1)"
+            }
+            ObjectKind::Chunk => {
+                "SELECT EXISTS(SELECT 1 FROM file_chunks AS c JOIN files AS f
+                 ON f.file_id = c.file_id AND f.current_generation = c.generation
+                 WHERE f.state = 'committed' AND c.ciphertext_hash = ?1)"
+            }
+            ObjectKind::DeletionMarker => {
+                "SELECT EXISTS(SELECT 1 FROM files
+                 WHERE state = 'deleted' AND current_deletion_hash = ?1)"
+            }
+        };
+        self.connection
+            .query_row(query, [hash.as_str()], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    pub fn record_gc_proof(&mut self, proof: &NewGcProof) -> Result<Uuid, MetadataError> {
+        let proof_id = Uuid::new_v4();
+        self.connection.execute(
+            "INSERT INTO gc_proofs
+             (proof_id, object_kind, object_hash, reason, content_generation,
+              incarnation_digest, observation_digest, retention_seconds, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'planned')",
+            params![
+                proof_id.to_string(),
+                proof.kind.as_str(),
+                proof.hash.as_str(),
+                proof.reason,
+                proof.content_generation,
+                proof.incarnation_digest,
+                proof.observation_digest,
+                proof.retention_seconds,
+            ],
+        )?;
+        Ok(proof_id)
+    }
+
+    pub fn planned_gc_proofs(&self) -> Result<Vec<GcProof>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT proof_id, object_kind, object_hash, reason, planned_at,
+                    content_generation, incarnation_digest, observation_digest,
+                    retention_seconds
+             FROM gc_proofs WHERE status = 'planned'
+             ORDER BY object_kind, object_hash, planned_at",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(id, kind, hash, reason, planned_at, generation, inc, obs, retention)| {
+                    Ok(GcProof {
+                        proof_id: Uuid::parse_str(&id).map_err(|_| {
+                            MetadataError::InvalidBinaryField("proof id".to_owned())
+                        })?,
+                        kind: kind.parse()?,
+                        hash: ObjectHash::parse(hash)?,
+                        reason,
+                        planned_at,
+                        content_generation: generation,
+                        incarnation_digest: inc,
+                        observation_digest: obs,
+                        retention_seconds: retention,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub fn gc_applied(&self, kind: ObjectKind, hash: &ObjectHash) -> Result<bool, MetadataError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM gc_proofs
+                 WHERE object_kind = ?1 AND object_hash = ?2 AND status = 'applied')",
+                params![kind.as_str(), hash.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn finish_gc_proof(
+        &mut self,
+        proof_id: Uuid,
+        status: &str,
+        detail: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        self.connection.execute(
+            "UPDATE gc_proofs SET status = ?2, applied_at = unixepoch(), detail = ?3
+             WHERE proof_id = ?1 AND status = 'planned'",
+            params![proof_id.to_string(), status, detail],
         )?;
         Ok(())
     }
@@ -2435,7 +2819,7 @@ CREATE TABLE IF NOT EXISTS placements (
     agent_id TEXT NOT NULL,
     failure_domain TEXT NOT NULL,
     incarnation_id TEXT,
-    state TEXT NOT NULL CHECK(state IN ('pending', 'confirmed', 'missing', 'corrupt')),
+    state TEXT NOT NULL CHECK(state IN ('pending', 'confirmed', 'missing', 'corrupt', 'orphaned')),
     confirmed_at INTEGER,
     last_verified_at INTEGER,
     last_verified_job TEXT,
@@ -2583,9 +2967,84 @@ fn apply_schema(connection: &Connection) -> Result<(), MetadataError> {
     connection.execute_batch(LIFECYCLE_SCHEMA)?;
     connection.execute_batch(META_SCHEMA)?;
     connection.execute_batch(BACKUP_SCHEMA)?;
-    connection.execute_batch("PRAGMA user_version = 6;")?;
+    connection.execute_batch(GC_SCHEMA)?;
+    connection.execute_batch("PRAGMA user_version = 7;")?;
     Ok(())
 }
+
+/// Schema v7 admits the `orphaned` placement state (a table rebuild, since
+/// SQLite cannot alter a CHECK constraint) and adds `gc_proofs`. Versions 4
+/// through 6 all reach v7 through this path; v5 and v6 were additive.
+fn migrate_to_v7(connection: &mut Connection) -> Result<(), MetadataError> {
+    let migration: Result<(), MetadataError> = (|| {
+        connection.execute_batch("BEGIN IMMEDIATE;")?;
+        let has_orphaned: bool = connection.query_row(
+            "SELECT instr(sql, 'orphaned') > 0 FROM sqlite_master
+             WHERE type = 'table' AND name = 'placements'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_orphaned {
+            connection.execute_batch(
+                r#"
+ALTER TABLE placements RENAME TO placements_v6;
+
+CREATE TABLE placements (
+    object_kind TEXT NOT NULL CHECK(object_kind IN (
+        'chunk', 'manifest', 'deletion_marker'
+    )),
+    object_hash TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    failure_domain TEXT NOT NULL,
+    incarnation_id TEXT,
+    state TEXT NOT NULL CHECK(state IN ('pending', 'confirmed', 'missing', 'corrupt', 'orphaned')),
+    confirmed_at INTEGER,
+    last_verified_at INTEGER,
+    last_verified_job TEXT,
+    PRIMARY KEY(object_kind, object_hash, agent_id)
+);
+
+INSERT INTO placements
+    (object_kind, object_hash, agent_id, failure_domain, incarnation_id, state,
+     confirmed_at, last_verified_at, last_verified_job)
+SELECT object_kind, object_hash, agent_id, failure_domain, incarnation_id, state,
+       confirmed_at, last_verified_at, last_verified_job
+FROM placements_v6;
+
+DROP TABLE placements_v6;
+"#,
+            )?;
+        }
+        connection.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if migration.is_err() {
+        let _ = connection.execute_batch("ROLLBACK;");
+    }
+    migration?;
+    apply_schema(connection)
+}
+
+const GC_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS gc_proofs (
+    proof_id TEXT PRIMARY KEY,
+    object_kind TEXT NOT NULL CHECK(object_kind IN (
+        'chunk', 'manifest', 'deletion_marker'
+    )),
+    object_hash TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    planned_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    content_generation INTEGER NOT NULL,
+    incarnation_digest TEXT NOT NULL,
+    observation_digest TEXT NOT NULL,
+    retention_seconds INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('planned', 'applied', 'stale')),
+    applied_at INTEGER,
+    detail TEXT
+);
+
+CREATE INDEX IF NOT EXISTS gc_proofs_object ON gc_proofs(object_kind, object_hash, status);
+"#;
 
 /// Schema v5 added `portal_meta` (bound master-key identifier); v6 adds the
 /// backup job, object, and snapshot tables. Both are additive, so applying the
@@ -2653,7 +3112,7 @@ CREATE TABLE placements (
     agent_id TEXT NOT NULL,
     failure_domain TEXT NOT NULL,
     incarnation_id TEXT,
-    state TEXT NOT NULL CHECK(state IN ('pending', 'confirmed', 'missing', 'corrupt')),
+    state TEXT NOT NULL CHECK(state IN ('pending', 'confirmed', 'missing', 'corrupt', 'orphaned')),
     confirmed_at INTEGER,
     last_verified_at INTEGER,
     last_verified_job TEXT,
@@ -2947,6 +3406,8 @@ pub enum MetadataError {
     },
     #[error("deleted file has no deletion marker hash")]
     MissingDeletionMarker,
+    #[error("agent {0} has no active incarnation")]
+    NoActiveIncarnation(String),
     #[error(
         "master key {presented} does not match the key {bound} this database was created with"
     )]
