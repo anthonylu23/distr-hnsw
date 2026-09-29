@@ -8,7 +8,7 @@ use std::{
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use distr_hnsw::{
-    agent::{bind_and_serve_agent, AgentIdentity},
+    agent::{bind_and_serve_agent, AgentIdentity, CapacityConfig},
     backup::{self, BackupTargetSpec},
     crypto::MasterKey,
     metadata::{Database, JobMode, KeyBinding},
@@ -38,6 +38,16 @@ enum Command {
         bind: SocketAddr,
         #[arg(long)]
         volume: PathBuf,
+        /// Maximum bytes this volume may hold (default: filesystem size).
+        #[arg(long)]
+        quota_bytes: Option<u64>,
+        /// Headroom regular chunks may not consume (default max(10%, 1 GiB)).
+        #[arg(long)]
+        reserve_bytes: Option<u64>,
+        /// Headroom even control objects and repair may not consume
+        /// (default max(1%, 256 MiB)).
+        #[arg(long)]
+        hard_floor_bytes: Option<u64>,
     },
     /// Run portal metadata and file operations.
     Portal {
@@ -300,7 +310,22 @@ async fn main() -> anyhow::Result<()> {
             failure_domain,
             bind,
             volume,
-        } => bind_and_serve_agent(bind, volume, AgentIdentity { id, failure_domain }).await,
+            quota_bytes,
+            reserve_bytes,
+            hard_floor_bytes,
+        } => {
+            bind_and_serve_agent(
+                bind,
+                volume,
+                AgentIdentity { id, failure_domain },
+                CapacityConfig {
+                    quota_bytes,
+                    reserve_bytes,
+                    hard_floor_bytes,
+                },
+            )
+            .await
+        }
         Command::Portal { command } => match command {
             PortalCommand::Init {
                 database,
@@ -417,9 +442,17 @@ async fn main() -> anyhow::Result<()> {
                     portal = portal
                         .with_failpoint(Failpoint::from_str(&value)?, FailpointAction::ExitProcess);
                 }
-                let file_id = portal.upload(&source, &idempotency_key).await?;
-                println!("{file_id}");
-                Ok(())
+                match portal.upload(&source, &idempotency_key).await {
+                    Ok(file_id) => {
+                        println!("{file_id}");
+                        Ok(())
+                    }
+                    Err(error @ distr_hnsw::portal::PortalError::InsufficientCapacity { .. }) => {
+                        eprintln!("error: {error}");
+                        std::process::exit(3);
+                    }
+                    Err(error) => Err(error.into()),
+                }
             }
             PortalCommand::Get {
                 database,

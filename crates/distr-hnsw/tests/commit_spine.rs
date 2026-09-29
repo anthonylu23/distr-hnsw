@@ -232,9 +232,11 @@ async fn rf2_never_commits_when_the_second_agent_rejects_writes() {
     let key = MasterKey::load(&key_path).unwrap();
     let mut portal =
         Portal::open(&database_path, key, vec![agent_a.target.clone(), agent_b]).unwrap();
+    // An agent's HTTP 507 is a capacity refusal: the floor is not lowered and
+    // the upload stays invisible.
     assert!(matches!(
         portal.upload(&source, "rf2-refusal").await,
-        Err(PortalError::AgentRejected { status: 507, .. })
+        Err(PortalError::InsufficientCapacity { .. })
     ));
 
     let database = Database::open(&database_path).unwrap();

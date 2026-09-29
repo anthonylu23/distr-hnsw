@@ -126,6 +126,9 @@ pub struct Portal {
     /// Incarnation each configured agent reported when last verified in this
     /// process. Placements are only recorded against a verified incarnation.
     incarnations: HashMap<String, String>,
+    /// Chunk-admissible bytes each agent reported when last verified; agents
+    /// that report no capacity (older builds, test doubles) are unlimited.
+    capacities: HashMap<String, u64>,
     failpoint: Option<(Failpoint, FailpointAction)>,
 }
 
@@ -145,6 +148,7 @@ impl Portal {
             agents,
             client: reqwest::Client::new(),
             incarnations: HashMap::new(),
+            capacities: HashMap::new(),
             failpoint: None,
         })
     }
@@ -228,6 +232,11 @@ impl Portal {
         };
 
         self.hit(Failpoint::AfterPlan)?;
+
+        // Admission: at least two distinct failure domains must each be able
+        // to hold every chunk before any chunk is dispatched (DESIGN §11.1).
+        // The persisted plan is kept so a later retry converges.
+        self.require_admissible_capacity(upload.upload_id)?;
 
         if upload.state == UploadState::Staging {
             self.database
@@ -523,6 +532,18 @@ impl Portal {
                     continue;
                 }
             };
+            if response.status() == reqwest::StatusCode::INSUFFICIENT_STORAGE {
+                let refusal: Option<crate::agent::CapacityRefusal> = response.json().await.ok();
+                last_failure = Some(PortalError::InsufficientCapacity {
+                    required_bytes: bytes.len() as u64,
+                    replicas_required: MINIMUM_REPLICAS,
+                    domains_eligible: 0,
+                    limiting: refusal
+                        .map(|refusal| format!("{:?}", refusal.limiting).to_lowercase())
+                        .unwrap_or_else(|| "agent".to_owned()),
+                });
+                continue;
+            }
             if !response.status().is_success() {
                 last_failure = Some(PortalError::AgentRejected {
                     agent: agent.id.clone(),
@@ -544,6 +565,34 @@ impl Portal {
                     hash: hash.clone(),
                 }),
             );
+        }
+        Ok(())
+    }
+
+    fn require_admissible_capacity(&self, upload_id: Uuid) -> Result<(), PortalError> {
+        let required: u64 = self
+            .database
+            .chunks(upload_id)?
+            .iter()
+            .map(|chunk| u64::from(chunk.plaintext_len) + 16)
+            .sum();
+        let mut domains = HashSet::new();
+        for agent in &self.agents {
+            let admissible = self
+                .capacities
+                .get(&agent.id)
+                .is_none_or(|free| *free >= required);
+            if admissible && self.incarnations.contains_key(&agent.id) {
+                domains.insert(agent.failure_domain.as_str());
+            }
+        }
+        if domains.len() < MINIMUM_REPLICAS {
+            return Err(PortalError::InsufficientCapacity {
+                required_bytes: required,
+                replicas_required: MINIMUM_REPLICAS,
+                domains_eligible: domains.len(),
+                limiting: "quota".to_owned(),
+            });
         }
         Ok(())
     }
@@ -684,6 +733,10 @@ impl Portal {
             )?;
             self.incarnations
                 .insert(agent.id.clone(), identity.incarnation_id);
+            if let Some(capacity) = identity.capacity {
+                self.capacities
+                    .insert(agent.id.clone(), capacity.effective_free_bytes);
+            }
             live_domains.insert(agent.failure_domain.clone());
         }
         if live_domains.len() < MINIMUM_REPLICAS {
@@ -874,6 +927,13 @@ struct RemoteAgentIdentity {
     id: String,
     failure_domain: String,
     incarnation_id: String,
+    #[serde(default)]
+    capacity: Option<RemoteCapacity>,
+}
+
+#[derive(Deserialize)]
+struct RemoteCapacity {
+    effective_free_bytes: u64,
 }
 
 #[derive(Debug, Error)]
@@ -930,6 +990,13 @@ pub enum PortalError {
     },
     #[error("replica floor is not met for {kind} {hash}")]
     ReplicaFloorNotMet { kind: ObjectKind, hash: ObjectHash },
+    #[error("insufficient capacity: {required_bytes} bytes need {replicas_required} failure domains but {domains_eligible} can admit them (limiting: {limiting}); the durability floor is unchanged and nothing was deleted")]
+    InsufficientCapacity {
+        required_bytes: u64,
+        replicas_required: usize,
+        domains_eligible: usize,
+        limiting: String,
+    },
     #[error("no valid replica for {kind} {hash}: {detail}")]
     NoValidReplica {
         kind: ObjectKind,

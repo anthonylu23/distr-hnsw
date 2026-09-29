@@ -2,6 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use thiserror::Error;
@@ -24,9 +25,12 @@ pub struct InventoryPage {
     pub next_after: Option<ObjectHash>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DurableStore {
     root: PathBuf,
+    /// Bytes held by stored objects, computed on open and maintained by put
+    /// and delete. Temporary files are not counted.
+    used_bytes: AtomicU64,
 }
 
 impl DurableStore {
@@ -38,7 +42,67 @@ impl DurableStore {
         for kind in ObjectKind::ALL {
             ensure_child_directory(&objects, &objects.join(kind.as_str()))?;
         }
-        Ok(Self { root })
+        let store = Self {
+            root,
+            used_bytes: AtomicU64::new(0),
+        };
+        let mut used = 0_u64;
+        for kind in ObjectKind::ALL {
+            let mut after = None;
+            loop {
+                let page = store.inventory(kind, after.as_ref(), MAX_INVENTORY_PAGE)?;
+                used = used.saturating_add(page.objects.iter().map(|object| object.size).sum());
+                match page.next_after {
+                    Some(cursor) => after = Some(cursor),
+                    None => break,
+                }
+            }
+        }
+        store.used_bytes.store(used, Ordering::Relaxed);
+        Ok(store)
+    }
+
+    pub fn used_bytes(&self) -> u64 {
+        self.used_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Free bytes reported by the filesystem holding the volume.
+    pub fn filesystem_free_bytes(&self) -> Result<(u64, u64), StoreError> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(self.root.as_os_str().as_bytes())
+            .map_err(|_| StoreError::InvalidPath(self.root.clone()))?;
+        let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::statvfs(path.as_ptr(), &mut stats) };
+        if result != 0 {
+            return Err(StoreError::Io(io::Error::last_os_error()));
+        }
+        let fragment = stats.f_frsize.max(1);
+        Ok((
+            stats.f_bavail.saturating_mul(fragment),
+            stats.f_blocks.saturating_mul(fragment),
+        ))
+    }
+
+    /// Physically remove an object. Idempotent: a missing object is not an
+    /// error. Only garbage-collection proofs may call this (see
+    /// `docs/m1-lifecycle-contract.md`).
+    pub fn delete(&self, kind: ObjectKind, hash: &ObjectHash) -> Result<bool, StoreError> {
+        let path = self.object_path(kind, hash);
+        let size = match fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(StoreError::Io(error)),
+        };
+        fs::remove_file(&path)?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        self.used_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                Some(used.saturating_sub(size))
+            })
+            .ok();
+        Ok(true)
     }
 
     /// Load the immutable incarnation identity of this volume, creating it
@@ -110,10 +174,13 @@ impl DurableStore {
         ensure_child_directory(&namespace, &first_prefix)?;
         ensure_child_directory(&first_prefix, parent)?;
 
+        let mut replaced_bytes = 0_u64;
         if final_path.exists() {
             match self.get(kind, expected) {
                 Ok(_) => return Ok(()),
-                Err(StoreError::HashMismatch { .. }) => {}
+                Err(StoreError::HashMismatch { .. }) => {
+                    replaced_bytes = fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -134,6 +201,12 @@ impl DurableStore {
 
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
+        } else {
+            self.used_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                    Some(used.saturating_sub(replaced_bytes) + bytes.len() as u64)
+                })
+                .ok();
         }
         result
     }
@@ -335,6 +408,15 @@ mod tests {
         store.put(ObjectKind::Chunk, &hash, bytes).unwrap();
         store.put(ObjectKind::Chunk, &hash, bytes).unwrap();
         assert_eq!(store.get(ObjectKind::Chunk, &hash).unwrap(), bytes);
+        assert_eq!(store.used_bytes(), bytes.len() as u64);
+        assert_eq!(
+            DurableStore::open(directory.path()).unwrap().used_bytes(),
+            bytes.len() as u64
+        );
+        assert!(store.delete(ObjectKind::Chunk, &hash).unwrap());
+        assert!(!store.delete(ObjectKind::Chunk, &hash).unwrap());
+        assert_eq!(store.used_bytes(), 0);
+        store.put(ObjectKind::Chunk, &hash, bytes).unwrap();
 
         fs::write(store.object_path(ObjectKind::Chunk, &hash), b"corrupt").unwrap();
         assert!(matches!(
