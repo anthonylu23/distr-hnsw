@@ -212,11 +212,11 @@ Implement the milestone in this recovery-first sequence:
    independently of cluster nodes; automate portal loss and total-cluster
    restore.
 
-Before the milestone exits, close the phase-1 design questions for production
-master-key custody and recovery, the first supported versioned backup target
-and safe RPO/retention defaults, and admission behavior when the entire cluster
-is over budget. The file-backed key and files-first admission policy are
-working defaults, not unreviewed permanent contracts.
+The phase-1 design questions for master-key custody and recovery, the first
+versioned backup target and RPO/retention defaults, and over-budget admission
+were decided on 2026-09-29 (DESIGN §10, §11.1, §15;
+[m1-phase-1-decisions.md](m1-phase-1-decisions.md)). Each decision counts as
+closed only when its listed tests and drills pass.
 
 ### Acceptance criteria
 

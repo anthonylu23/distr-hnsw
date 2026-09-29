@@ -1,7 +1,10 @@
 # M1 phase-1 design decisions
 
-Date: 2026-09-29. Status of every decision below: **Proposed (awaiting owner
-ratification)**.
+Date: 2026-09-29. Status: **Ratified by the owner on 2026-09-29**, with one
+amendment to decision 2 (Litestream removed from the v1 restore path in favor
+of `VACUUM INTO` snapshots as the primary SQLite backup). DESIGN §10, §11,
+§11.1, and §15 record the decisions; this page keeps the reasoning and the
+tests each decision must pass before it counts as closed.
 
 `docs/roadmap.md` (M1, "Before the milestone exits") requires three phase-1
 questions from `DESIGN.md` §15 to be closed as documented decisions with tested
@@ -55,9 +58,10 @@ passphrase-wrapped **recovery bundle** as the independent custody artifact.
    bundles below the OWASP floor `m = 19 MiB, t = 2, p = 1`
    ([OWASP](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)).
    Parameters travel in the bundle and can be raised without a format bump.
-   The tool generates the passphrase by default (eight words from a
-   7,776-word list, about 103 bits); a user-supplied one needs an explicit
-   flag and a minimum length.
+   The tool generates the passphrase by default (24 Crockford base32
+   characters in six groups, 120 bits, no ambiguous glyphs); a user-supplied
+   one is read from stdin with an explicit flag and a minimum length. A
+   word-list passphrase is a later option.
 4. **Ceremony.** `portal init` prints the bundle once and refuses to finish
    until the operator re-enters the passphrase and the bundle round-trips.
    The bundle is never written to SQLite, the object store, or the backup
@@ -72,7 +76,10 @@ passphrase-wrapped **recovery bundle** as the independent custody artifact.
    ```
 
    `restore` uses `create_new` semantics and never overwrites a key file;
-   `--verify` decrypts and compares without writing.
+   `--verify` decrypts and compares without writing. Implemented as
+   specified, plus a parameter ceiling (4 GiB / t = 64 / p = 64) so a
+   corrupted header cannot demand unbounded work, and `--kdf-*` overrides
+   for tests.
 
 **Fails closed.** Missing key file, insecure permissions, wrong length or
 trailing bytes (existing); loaded key whose `key_id` differs from SQLite (new
@@ -107,7 +114,9 @@ undecryptable manifests (`m1-storage-contract.md`).
   gains `key` subcommands; the next schema version (v5; v4 is the lifecycle
   pass) adds `meta(key_id)`; crates `argon2`, `zeroize`.
 
-**Status: Proposed (awaiting owner ratification).**
+**Status: Ratified 2026-09-29; implemented (schema v5, `recovery_bundle.rs`,
+`portal key`); unit and process tests pass. Closes for M1 when the
+empty-infrastructure drill obtains the key from the bundle alone.**
 
 ---
 
@@ -148,37 +157,34 @@ reference deployment and MinIO as the test double. SFTP/WebDAV are deferred.
   `RELEASE.2025-05-20`
   ([MinIO](https://docs.min.io/enterprise/aistor-object-store/administration/object-locking-and-immutability/)).
   Compliance mode is not the default because it cannot be shortened.
-- **SQLite history: Litestream plus periodic snapshots.** Run Litestream
-  0.5.x for continuous replication and point-in-time restore. It holds a read
-  transaction, takes over checkpointing, and ships LTX files with
-  `sync-interval` 1s, snapshots every 24h, and 24h default retention
+- **SQLite history: `VACUUM INTO` snapshots (amended at ratification).** The
+  portal writes an in-process `VACUUM INTO` snapshot, which is transactional,
+  does not block writers, and is fsynced under `synchronous=NORMAL/FULL`
+  ([SQLite](https://www.sqlite.org/lang_vacuum.html)), whenever the database
+  changed and at least every five minutes, and ships it to the backup target
+  as an immutable object. This keeps one code path and no external process
+  on the restore path. The metadata RPO is therefore the snapshot interval,
+  which is acceptable because core file records are reconstructible from
+  replicated manifests and deletion markers (`m1-storage-contract.md`,
+  "Recovery contract"); the RPO bounds loss of control metadata, not of
+  committed files. Litestream 0.5 remains an optional later addition for
+  second-level metadata RPO; its version-sensitive LTX format and
+  checkpoint interaction kept it off v1
   ([how it works](https://litestream.io/how-it-works/),
-  [config](https://litestream.io/reference/config/)). Set retention
-  explicitly: 0.5 allows one replica per database and silently ignores legacy
-  per-replica retention keys
-  ([migration guide](https://litestream.io/docs/migration/),
-  [release post](https://fly.io/blog/litestream-v050-is-here/)).
-  Independently, the portal writes a daily in-process `VACUUM INTO` snapshot,
-  which is transactional, does not block writers, and is fsynced under
-  `synchronous=NORMAL/FULL` ([SQLite](https://www.sqlite.org/lang_vacuum.html)).
-  Litestream restores are version-sensitive (LTX is new in 0.5), so the
-  snapshot is the format-independent fallback and the drill verifies one
-  against the other. The portal must leave checkpointing to Litestream;
-  confirm the exact interaction during implementation. `sqlite3_rsync`
-  ([SQLite](https://www.sqlite.org/rsync.html)) suits manual portal-loss
-  rehearsals only.
+  [migration guide](https://litestream.io/docs/migration/)).
+  `sqlite3_rsync` ([SQLite](https://www.sqlite.org/rsync.html)) suits manual
+  portal-loss rehearsals only.
 - **Defaults** (operator-visible and editable, DESIGN §11.1):
 
   | Setting | Default | Rationale |
   |---|---|---|
-  | Metadata RPO target | 60 s | Litestream sync 1s plus upload; "replicated" never means zero RPO. |
+  | Metadata RPO target | 5 min (snapshot interval) | Control metadata only; file records rebuild from immutable objects. |
   | Blob RPO target | 15 min | Continuous copy-and-verify; warn > 15 min, critical > 60 min. |
   | Portal-loss RTO target | 10 min once recovery material is at hand | DESIGN §11. |
   | Total-cluster-loss RTO | Measured by drill, no default claim | Published per release (DESIGN §8.5). |
   | Live deletion grace | 30 days | Lifecycle GC proof horizon. |
   | Offsite retention of deleted generations | 90 days after the deletion marker | Never shorter than live grace; equals Object Lock default retention. |
-  | Litestream snapshot interval / retention | 24 h / 14 days | Overrides the 24 h default. |
-  | `VACUUM INTO` snapshots | daily, keep 30 | Format-independent fallback. |
+  | `VACUUM INTO` snapshots | every 5 min when changed; keep 7 days hourly, 30 days daily | Primary SQLite backup. |
   | Integrity verification | daily catalog listing; weekly 1% download-and-hash sample | Detects silent loss before a drill. |
   | Restore drill | before every release and at least quarterly | Required for "recovery ready". |
 
@@ -186,8 +192,7 @@ reference deployment and MinIO as the test double. SFTP/WebDAV are deferred.
   `GET /v1/health/backup`) reports `BackupStatusV1`: target kind/id, declared
   targets, `backup_lag_seconds` (age of the oldest committed object not yet
   verified offsite), `objects_pending`, `metadata_replication_lag_seconds`
-  (a heartbeat row observed in the replica, independent of Litestream
-  metrics), `last_backup_completed_at`, `last_integrity_verification_at` and
+  (age of the newest shipped snapshot), `last_backup_completed_at`, `last_integrity_verification_at` and
   result, `last_restore_drill_at` with measured recovery point/time, and
   `recovery_ready` (gate passed, lag within target, drill within window).
   Per-file `offsite_state: pending | copied | verified` is persisted.
@@ -203,9 +208,9 @@ bytes, durability is undemonstrated and `DESIGN.md` §11.1 forbids claiming it.
 |---|---|---|---|
 | **Versioned directory** (attached disk, mounted share, rclone-able) | Layout-level only | Best; laptop and `anthonypc` | First adapter and drill rig; offsite only on a rotated or remote disk. |
 | **S3-compatible** (B2, MinIO, AWS) | Bucket versioning + Object Lock | MinIO on `anthonypc` | First supported network target; B2 reference. |
-| SFTP / WebDAV | None native (Litestream supports both as replicas) | Easy | Defer; no immutability story for objects. |
-| Litestream only | PITR, second-level RPO | Good | Adopt, paired with `VACUUM INTO` for format independence. |
-| `VACUUM INTO` only | RPO = interval | Simple | Hours of RPO; keep as fallback, not primary. |
+| SFTP / WebDAV | None native | Easy | Defer; no immutability story for objects. |
+| Litestream | PITR, second-level RPO | Good | Optional later addition; extra process and version-sensitive format kept it off v1. |
+| **`VACUUM INTO` snapshots** | RPO = interval | Simplest; one code path | Adopt as primary; file records are reconstructible so minutes of metadata RPO are acceptable. |
 
 ### Consequences and tested behavior required
 
@@ -215,8 +220,8 @@ bytes, durability is undemonstrated and `DESIGN.md` §11.1 forbids claiming it.
   kill mid-copy never leaves `verified` without a hash-verified offsite
   object; `backup_lag_seconds` rises when the target is unreachable.
 - `anthonypc` matrix: directory and MinIO targets with Object Lock; deleting
-  a locked object fails; Litestream restore to a declared point and the
-  `VACUUM INTO` fallback both reconcile against the object set.
+  a locked object fails; a restored `VACUUM INTO` snapshot reconciles against
+  the object set and recovery rebuilds any newer file records.
 - Empty-infrastructure drill: blank metadata and volumes; inputs are only the
   backup set, SQLite history, and the Decision 1 bundle; bytes match original
   hashes; record declared vs. actual RPO/RTO, hashes, missing control
@@ -226,7 +231,7 @@ bytes, durability is undemonstrated and `DESIGN.md` §11.1 forbids claiming it.
 - Note: the Rust `object_store` crate is a candidate for both adapters;
   confirm conditional-put support before adopting it.
 
-**Status: Proposed (awaiting owner ratification).**
+**Status: Ratified 2026-09-29 with the snapshot amendment; not yet implemented (lane C).**
 
 ---
 
@@ -317,7 +322,7 @@ deletion. This makes that concrete for the M1 blob plane.
 - Roadmap criterion closed: ENOSPC and global budget exhaustion produce
   admission-control errors and actionable health without violating the floor.
 
-**Status: Proposed (awaiting owner ratification).**
+**Status: Ratified 2026-09-29; not yet implemented (lifecycle order step 4).**
 
 ---
 
@@ -327,11 +332,11 @@ Parallel lanes beside the lifecycle pass in `m1-implementation-plan.md`; only
 the drill serializes on them.
 
 1. **Lane B, key custody (Decision 1).** Smallest change; land first:
-   `key_id`, `RecoveryBundleV1`, zeroize, `key` subcommands, schema v4.
+   `key_id`, `RecoveryBundleV1`, zeroize, `key` subcommands, schema v5.
 2. **Lane C, backup set (Decision 2).** Layout v1 and the directory adapter
    with the copy-and-verify job and `BackupStatusV1`; then the S3-compatible
-   adapter against MinIO on `anthonypc`; then Litestream with explicit
-   retention plus daily `VACUUM INTO`.
+   adapter against MinIO on `anthonypc`; `VACUUM INTO` snapshot shipping
+   lands with the directory adapter.
 3. **Lane A, lifecycle (existing plan).** Decision 3 is step 4 of the
    lifecycle contract's order (quota/headroom admission, ENOSPC injection),
    after observations and scrub/repair, before GC planning.
@@ -339,6 +344,6 @@ the drill serializes on them.
    lane A's reconciliation observations; runs on `anthonypc` with blank
    metadata and volumes and records the roadmap evidence package. Its pass
    closes the M1 exit gate.
-5. **Ratification bookkeeping.** On approval, update `DESIGN.md` §10, §11,
-   §11.1, §15 and the roadmap M1 checklist; on amendment, revise this page and
-   keep its status lines accurate until the tests above are green.
+5. **Ratification bookkeeping.** Done 2026-09-29: `DESIGN.md` §10, §11,
+   §11.1, §15 record the decisions. Keep the status lines above accurate
+   until each decision's tests are green.

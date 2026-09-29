@@ -687,6 +687,18 @@ replace browser-session or application authorization.
   key has a separately tested backup and rotation procedure; backing up chunks
   without it is not recovery. This protects data at rest on storage machines,
   not against portal compromise.
+- **Master-key custody (decided 2026-09-29, phase 1).** The operational key
+  stays file-backed so unattended reboots work. A non-secret key identifier
+  derived from the key is stored in portal metadata and checked at every
+  portal start and before any recovery scan; a mismatch fails closed before
+  anything is decrypted. Independent recovery uses a versioned **recovery
+  bundle**: the master key wrapped with XChaCha20-Poly1305 under a key derived
+  by Argon2id (RFC 9106 parameters, floor enforced) from a passphrase kept
+  off-cluster. The bundle is emitted once at `init` as printable text, never
+  stored in the cluster or its backups, and `init` does not complete until the
+  operator proves it round-trips. Shamir splitting and rotation are reserved
+  bundle-v2 seams. Losing both the passphrase and every cluster disk loses the
+  data, by design. Details: `docs/m1-phase-1-decisions.md`.
 - **Vault**: content keys wrapped by an Argon2id passphrase-derived key the
   server never holds. Browser-side encryption uses an audited, pinned WASM
   implementation for Argon2id and XChaCha20-Poly1305; these algorithms are not
@@ -719,10 +731,14 @@ and verifiable client (native app, signed extension, or equivalent).
 
 ## 11. Metadata, portal recovery
 
-SQLite (WAL mode) + Litestream versioned offsite replication; sqlc-style typed
-queries (Rust: `sqlx`/`rusqlite`), portable SQL as the Postgres escape hatch.
-The dashboard reports observed replication lag. "Replicated" never means zero
-RPO unless a synchronous mechanism establishes it.
+SQLite (WAL mode) with transactional `VACUUM INTO` snapshots shipped to the
+versioned backup target (decided 2026-09-29; Litestream is an optional later
+addition, not on the v1 restore path); sqlc-style typed queries (Rust:
+`sqlx`/`rusqlite`), portable SQL as the Postgres escape hatch. The dashboard
+reports observed replication lag. "Replicated" never means zero RPO unless a
+synchronous mechanism establishes it. Core file records are reconstructible
+from replicated manifests and deletion markers, so the metadata RPO bounds the
+loss of control metadata, not of committed files.
 
 Schema sketch:
 
@@ -784,6 +800,31 @@ The operator selects and can see explicit targets for:
 - portal-loss and total-cluster-loss recovery-time objectives (RTO);
 - live deletion grace period and offsite backup retention;
 - last successful backup, integrity verification, and full restore drill.
+
+**Backup target and defaults (decided 2026-09-29, phase 1).** One versioned
+backup-set layout sits behind a target trait with two adapters: a versioned
+directory (first; drill rig and attached or rotated disks) and S3-compatible
+object storage with bucket versioning and governance-mode Object Lock (first
+supported network offsite target; Backblaze B2 reference, MinIO test double).
+SFTP/WebDAV are deferred. SQLite history is backed up as `VACUUM INTO`
+snapshots shipped whenever the database changed and at least every few
+minutes. Defaults: metadata RPO equals the snapshot interval (5 minutes), blob
+RPO 15 minutes, live deletion grace 30 days, offsite retention of deleted
+generations 90 days, weekly 1% download-and-hash verification, restore drill
+before every release and at least quarterly. Backup lag, last verification,
+last drill, and a `recovery_ready` flag are externally observable.
+
+**Over-budget admission (decided 2026-09-29, phase 1).** Effective free space
+per volume is the lesser of quota headroom and filesystem free space minus a
+reserve of max(10%, 1 GiB). A write is admitted only when at least
+`minimum_write_replicas` distinct failure domains can each hold it; a
+cluster-wide byte sum never authorizes a write. Regular chunks never consume
+the reserve; deletion markers and in-flight manifests may, and repair may
+down to a hard floor. Agents enforce the same limit on PUT and map ENOSPC to
+the same refusal. Refusals are a distinct capacity error (CLI exit 3, HTTP
+507) with actionable health; the durability floor is never lowered and no
+emergency deletion occurs. Files-first ordering extends this to the vector
+plane via a per-class admission priority.
 
 A release gate restores a representative cluster into empty infrastructure,
 downloads regular files byte-for-byte, rebuilds a file collection from source,
@@ -923,15 +964,13 @@ Each question is tagged with the phase (§14) that must resolve it.
   choice, not evidence that 512d is statistically superior on the holdout.
   Chunk dials remain `chunk_chars=2000`, overlap `200`. See
   `docs/phase-0-validation.md`.
-- **[phase 1] Master key custody**: file vs. keychain vs. passphrase-unlock
-  at portal start (unattended reboot tradeoff), plus the independent
-  recovery ceremony.
-- **[phase 1] Backup defaults**: which versioned object-store targets ship
-  first, and what RPO/retention defaults are safe enough before distr-hnsw
-  may hold unique data?
-- **[phase 1] Admission-control UX** when the cluster is globally over
-  budget. Working default: files-first — file collections win over app
-  collections.
+- **[phase 1] Master key custody** — decided 2026-09-29: file-backed key
+  plus key identifier and a passphrase-wrapped recovery bundle (§10).
+- **[phase 1] Backup defaults** — decided 2026-09-29: versioned directory
+  then S3-compatible with Object Lock; `VACUUM INTO` snapshots for SQLite;
+  defaults in §11.1.
+- **[phase 1] Admission-control UX** — decided 2026-09-29: two-domain
+  admission with reserve headroom, files-first priority seam (§11.1).
 - **[phase 5] Chunk-to-file score aggregation**: max-sim first; revisit
   (mean-of-top-m, learned) once real usage exists.
 - **[post-v1] Namespace compatibility**: do we ever need path/WebDAV *views*
