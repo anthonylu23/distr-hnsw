@@ -29,12 +29,12 @@ agent inventories, canonical schema-v4 migration, explicit plan/apply
 recovery, agent incarnations, complete-scan observations, durability health,
 and copy-first scrub/repair. M1 remains **In progress**.
 
-Decisions awaiting the owner (2026-09-29):
-
-- Ratify or amend the three proposals in
-  [m1-phase-1-decisions.md](m1-phase-1-decisions.md): master-key recovery
-  bundle, first backup target with RPO/retention defaults, and over-budget
-  admission. Once ratified, update DESIGN §10, §11, §11.1, §15 first.
+The three phase-1 decisions were ratified on 2026-09-29 and recorded in
+DESIGN §10, §11, §11.1, §15; see
+[m1-phase-1-decisions.md](m1-phase-1-decisions.md) for the tests each must
+pass. Lane B (key custody) is implemented: bound key identifier, recovery
+bundle v1, `portal key` commands. Lane C (backup set with `VACUUM INTO`
+snapshot shipping, directory adapter, then S3-compatible) is next.
 
 The next lifecycle pass should:
 
@@ -52,9 +52,9 @@ The next lifecycle pass should:
    test it recommends.
 5. Run large storage, corruption, and movement matrices on `anthonypc`.
 
-In parallel, implement the key-custody and backup lanes from the decisions
-page. The empty-infrastructure restore drill waits for those inputs and
-remains the M1 exit gate.
+In parallel, implement lane C from the decisions page. The
+empty-infrastructure restore drill waits for it and remains the M1 exit
+gate.
 
 ## Ops notes
 

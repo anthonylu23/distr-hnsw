@@ -68,7 +68,7 @@ pub fn encode_manifest(
     let payload_nonce = random_nonce();
     let clear_header = clear_header(MANIFEST_MAGIC, file_id, generation);
     let payload_bytes = encode_payload(payload)?;
-    let cipher = XChaCha20Poly1305::new((&manifest_key).into());
+    let cipher = XChaCha20Poly1305::new((&*manifest_key).into());
     let encrypted_payload = cipher.encrypt(
         XNonce::from_slice(&payload_nonce),
         Payload {
@@ -112,7 +112,7 @@ pub fn decode_manifest(master: &MasterKey, bytes: &[u8]) -> Result<DecodedManife
         generation,
         &wrapped_manifest_key,
     )?;
-    let cipher = XChaCha20Poly1305::new((&manifest_key).into());
+    let cipher = XChaCha20Poly1305::new((&*manifest_key).into());
     let plaintext = cipher.decrypt(
         XNonce::from_slice(&payload_nonce),
         Payload {
@@ -145,7 +145,7 @@ pub fn encode_deletion_marker(
     let payload_nonce = random_nonce();
     let clear_header = clear_header(DELETION_MARKER_MAGIC, file_id, generation);
     let payload = deleted_at.to_le_bytes();
-    let cipher = XChaCha20Poly1305::new((&marker_key).into());
+    let cipher = XChaCha20Poly1305::new((&*marker_key).into());
     let encrypted_payload = cipher.encrypt(
         XNonce::from_slice(&payload_nonce),
         Payload {
@@ -192,7 +192,7 @@ pub fn decode_deletion_marker(
         generation,
         &wrapped_marker_key,
     )?;
-    let cipher = XChaCha20Poly1305::new((&marker_key).into());
+    let cipher = XChaCha20Poly1305::new((&*marker_key).into());
     let plaintext = cipher.decrypt(
         XNonce::from_slice(&payload_nonce),
         Payload {

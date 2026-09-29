@@ -117,7 +117,7 @@ fn abrupt_portal_exit_at_every_boundary_recovers() {
         let database = case.join("portal.sqlite");
         let master_key = case.join("master.key");
         let init = Command::new(&binary)
-            .args(["portal", "init", "--database"])
+            .args(["portal", "init", "--no-recovery-bundle", "--database"])
             .arg(&database)
             .arg("--master-key")
             .arg(&master_key)
@@ -224,7 +224,7 @@ fn abrupt_delete_exit_at_every_boundary_recovers_with_the_same_key() {
         let database = case.join("portal.sqlite");
         let master_key = case.join("master.key");
         assert!(Command::new(&binary)
-            .args(["portal", "init", "--database"])
+            .args(["portal", "init", "--no-recovery-bundle", "--database"])
             .arg(&database)
             .arg("--master-key")
             .arg(&master_key)
@@ -306,7 +306,7 @@ fn scrub_and_health_commands_report_a_durable_cluster() {
     let database = workspace.path().join("portal.sqlite");
     let master_key = workspace.path().join("master.key");
     let status = Command::new(binary)
-        .args(["portal", "init", "--database"])
+        .args(["portal", "init", "--no-recovery-bundle", "--database"])
         .arg(&database)
         .arg("--master-key")
         .arg(&master_key)
@@ -392,4 +392,200 @@ fn scrub_and_health_commands_report_a_durable_cluster() {
     let report: serde_json::Value = serde_json::from_slice(&repair.stdout).unwrap();
     assert_eq!(report["totals"]["repairs_applied"], 1);
     assert_eq!(report["health"]["durable"], 2);
+}
+
+#[test]
+fn recovery_bundle_ceremony_restores_the_key_and_refuses_the_wrong_one() {
+    use std::io::Write as _;
+
+    let binary = Path::new(env!("CARGO_BIN_EXE_distr-hnsw"));
+    let workspace = tempfile::tempdir().unwrap();
+    let volume_a = workspace.path().join("agent-a");
+    let volume_b = workspace.path().join("agent-b");
+    fs::create_dir_all(&volume_a).unwrap();
+    fs::create_dir_all(&volume_b).unwrap();
+    let (_agent_a, target_a) = start_agent(binary, "agent-a", "host-a", &volume_a);
+    let (_agent_b, target_b) = start_agent(binary, "agent-b", "host-b", &volume_b);
+    let agents = vec![target_a, target_b];
+    let database = workspace.path().join("portal.sqlite");
+    let master_key = workspace.path().join("master.key");
+    let floor = [
+        "--kdf-memory-kib",
+        "19456",
+        "--kdf-time",
+        "2",
+        "--kdf-parallelism",
+        "1",
+    ];
+    let passphrase = "correct horse battery staple\n";
+
+    // Init with an operator-supplied passphrase emits an armored bundle.
+    let mut init = Command::new(binary)
+        .args(["portal", "init", "--passphrase-stdin", "--database"])
+        .arg(&database)
+        .arg("--master-key")
+        .arg(&master_key)
+        .args(floor)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    init.stdin
+        .take()
+        .unwrap()
+        .write_all(passphrase.as_bytes())
+        .unwrap();
+    let init = init.wait_with_output().unwrap();
+    assert!(init.status.success());
+    let stdout = String::from_utf8(init.stdout).unwrap();
+    let begin = stdout
+        .find("-----BEGIN DISTR-HNSW RECOVERY BUNDLE-----")
+        .unwrap();
+    let end_marker = "-----END DISTR-HNSW RECOVERY BUNDLE-----";
+    let end = stdout.find(end_marker).unwrap() + end_marker.len();
+    let bundle_path = workspace.path().join("bundle.txt");
+    fs::write(&bundle_path, &stdout[begin..end]).unwrap();
+    assert!(
+        !stdout.contains("recovery passphrase:"),
+        "supplied passphrase is never echoed"
+    );
+
+    let source = workspace.path().join("source.bin");
+    fs::write(&source, vec![3_u8; 4096]).unwrap();
+    let put = portal_command(binary, "put", &database, &master_key, &agents)
+        .args(["--idempotency-key", "bundle-drill"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        put.status.success(),
+        "{}",
+        String::from_utf8_lossy(&put.stderr)
+    );
+    let file_id = String::from_utf8(put.stdout).unwrap().trim().to_owned();
+
+    // A different key is refused before any object is read.
+    let other_key = workspace.path().join("other.key");
+    distr_hnsw::crypto::MasterKey::create(&other_key).unwrap();
+    let denied = portal_command(binary, "get", &database, &other_key, &agents)
+        .arg(&file_id)
+        .arg(workspace.path().join("denied.bin"))
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("does not match the key"));
+
+    // Lose the key file; the wrong passphrase fails, the right one verifies.
+    fs::remove_file(&master_key).unwrap();
+    let restore = |verify: bool, secret: &str, target: &Path| {
+        let mut command = Command::new(binary);
+        command
+            .args(["portal", "key", "restore", "--bundle"])
+            .arg(&bundle_path)
+            .arg("--master-key")
+            .arg(target)
+            .arg("--database")
+            .arg(&database);
+        if verify {
+            command.arg("--verify");
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(secret.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let wrong = restore(true, "incorrect horse battery staple\n", &master_key);
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("wrong passphrase"));
+    assert!(!master_key.exists());
+    let verified = restore(true, passphrase, &master_key);
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    assert!(!master_key.exists(), "verify never writes");
+    let restored = restore(false, passphrase, &master_key);
+    assert!(
+        restored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert!(master_key.exists());
+    let again = restore(false, passphrase, &master_key);
+    assert!(
+        !again.status.success(),
+        "restore never overwrites an existing key"
+    );
+
+    let destination = workspace.path().join("restored.bin");
+    let get = portal_command(binary, "get", &database, &master_key, &agents)
+        .arg(&file_id)
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(
+        get.status.success(),
+        "{}",
+        String::from_utf8_lossy(&get.stderr)
+    );
+    assert_eq!(fs::read(destination).unwrap(), vec![3_u8; 4096]);
+
+    // A bundle for an unrelated key is refused against this database by id,
+    // before the passphrase is even read.
+    let other_bundle = workspace.path().join("other-bundle.txt");
+    let mut export = Command::new(binary)
+        .args([
+            "portal",
+            "key",
+            "export-recovery",
+            "--passphrase-stdin",
+            "--master-key",
+        ])
+        .arg(&other_key)
+        .arg("--out")
+        .arg(&other_bundle)
+        .args(floor)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    export
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(passphrase.as_bytes())
+        .unwrap();
+    assert!(export.wait().unwrap().success());
+    let mismatch = Command::new(binary)
+        .args(["portal", "key", "restore", "--verify", "--bundle"])
+        .arg(&other_bundle)
+        .arg("--master-key")
+        .arg(workspace.path().join("unused.key"))
+        .arg("--database")
+        .arg(&database)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("is bound to key"));
+
+    let show = Command::new(binary)
+        .args(["portal", "key", "show-id", "--master-key"])
+        .arg(&master_key)
+        .output()
+        .unwrap();
+    assert!(show.status.success());
+    let shown = String::from_utf8(show.stdout).unwrap().trim().to_owned();
+    assert_eq!(shown.len(), 32);
+    assert!(String::from_utf8_lossy(&verified.stdout).contains(&shown));
 }

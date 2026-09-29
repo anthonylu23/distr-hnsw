@@ -1,7 +1,8 @@
 # M1 storage contract
 
 This document pins the implemented M1 blob-plane contract through the
-lifecycle observation and scrub pass (pass 3). It is subordinate to `DESIGN.md` and
+lifecycle observation and scrub pass (pass 3) and the master-key custody
+lane. It is subordinate to `DESIGN.md` and
 `docs/roadmap.md`; later M1 work may extend these rules but must not weaken
 their durability or recovery invariants.
 
@@ -44,6 +45,37 @@ sync. Linux uses `fsync`. On macOS both the file and directory syncs issue
 whether a directory `F_FULLFSYNC` persists a rename on APFS is unverified, and
 no filesystem is yet qualified for power loss. See
 [m1-filesystem-qualification.md](m1-filesystem-qualification.md).
+
+## Master-key custody
+
+The master key is a 32-byte file with owner-only permissions, zeroized in
+memory on drop. Its non-secret identifier is the first 16 bytes of
+`BLAKE3.derive_key("distr-hnsw:master-key-id:v1", key)`. `portal init`
+binds that identifier into `portal_meta`; every later `Portal::open`
+(upload, download, delete, recover) rebinds and fails closed with
+`MasterKeyMismatch` before any object is decrypted if a different key is
+presented. A database created before schema v5 is bound by the first key
+that opens it.
+
+Recovery bundle v1 wraps the key for recovery without any surviving cluster
+machine. Layout: magic `DHRB`, version `u16 = 1`, key id, KDF id
+(`1` = Argon2id), `m_cost_kib`, `t_cost`, `p_cost`, 16-byte salt, 24-byte
+nonce, and the XChaCha20-Poly1305 ciphertext of the key; everything before
+the nonce is authenticated data. Defaults are RFC 9106's 64 MiB / t = 3 /
+p = 4; decoding refuses parameters below the OWASP floor (19 MiB / 2 / 1)
+or above a ceiling (4 GiB / 64 / 64) so a corrupted header cannot demand
+unbounded work. The bundle is printed as armored base64 with a short
+checksum line so transcription errors are reported as such rather than as a
+wrong passphrase. Passphrases are generated as 24 Crockford base32
+characters (120 bits) unless supplied on stdin (minimum 12 bytes).
+
+`portal init` emits the bundle once for a newly created key and verifies the
+round-trip before printing; `--no-recovery-bundle` skips it for development.
+`portal key export-recovery` re-emits one; `portal key restore --verify`
+proves a bundle and passphrase recover the key bound to a database without
+writing; `portal key restore` writes the key to a path that must not exist.
+Wrong passphrase, any tampering, unsupported version, or out-of-range
+parameters fail without partial output.
 
 ## Agent incarnations
 
@@ -111,7 +143,7 @@ or returns the same success. A key reused for another file conflicts; a new key
 for an already deleted file returns `AlreadyDeleted`. Logical deletion never
 calls agent DELETE and never removes older manifests or chunks.
 
-## SQLite schema v4
+## SQLite schema v5
 
 Schema v3 stores `files` as the current projection with generation and
 `committed`, `deleted`, or `recovery_blocked` state. It adds immutable
@@ -126,12 +158,13 @@ and `last_verified_job` columns and the state set `pending`, `confirmed`,
 `scan_observations`, and `object_health`. Migrated placement rows keep a NULL
 incarnation until their agent is observed. Opening a database marks any job
 still `running` from a previous process as `interrupted` and fails its open
-scans; interrupted scans prove nothing.
+scans; interrupted scans prove nothing. Schema v5 adds `portal_meta`, which
+holds the bound master-key identifier.
 
 The two earlier development lines both used schema version 2 for incompatible
 layouts. Opening a v2 database inspects its table shape and atomically migrates
 either the audited commit-spine layout or the recovery-history layout to
-canonical v3, then to v4. V1 also migrates through v3 to v4. Existing manifest
+canonical v3, then v4, then v5. V1 also migrates through the same chain. Existing manifest
 bytes, ciphertext hashes, and chunk-v1 AAD remain unchanged. Unknown or
 unrecognized schema layouts fail closed.
 

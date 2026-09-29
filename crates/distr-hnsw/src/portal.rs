@@ -136,8 +136,11 @@ impl Portal {
         agents: Vec<AgentTarget>,
     ) -> Result<Self, PortalError> {
         let agents = prepare_agents(agents)?;
+        let mut database = Database::open(database_path)?;
+        // Refuse a wrong key before any object is decrypted.
+        database.bind_master_key_id(&master_key.key_id_hex())?;
         Ok(Self {
-            database: Database::open(database_path)?,
+            database,
             master_key,
             agents,
             client: reqwest::Client::new(),

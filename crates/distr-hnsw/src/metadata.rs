@@ -10,7 +10,8 @@ use crate::{
     object::{ObjectHash, ObjectKind},
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
+const MASTER_KEY_ID_META: &str = "master_key_id";
 
 /// SQL predicate selecting placements that count toward the live durability
 /// floor: confirmed rows whose agent incarnation is still active. Legacy rows
@@ -306,6 +307,15 @@ pub enum IncarnationObservation {
     Superseded { previous: String },
 }
 
+/// Outcome of binding a master key identifier to the database.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyBinding {
+    /// The database had no bound key and now records this one.
+    Bound,
+    /// The presented key matches the bound identifier.
+    Matched,
+}
+
 /// The agent and incarnation a placement row belongs to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlacementTarget {
@@ -502,6 +512,7 @@ impl Database {
                 migrate_v3_to_v4(&mut connection)?;
             }
             3 => migrate_v3_to_v4(&mut connection)?,
+            4 => migrate_v4_to_v5(&connection)?,
             SCHEMA_VERSION => apply_schema(&connection)?,
             _ => return Err(MetadataError::UnsupportedSchemaVersion(version)),
         }
@@ -511,6 +522,49 @@ impl Database {
             sync_directory(parent)?;
         }
         Ok(database)
+    }
+
+    /// Bind this database to a master key by its non-secret identifier. The
+    /// first key to open an unbound (or pre-v5) database binds it; any later
+    /// key must match, and a mismatch fails before anything is decrypted.
+    pub fn bind_master_key_id(&mut self, key_id_hex: &str) -> Result<KeyBinding, MetadataError> {
+        let transaction = self.connection.transaction()?;
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM portal_meta WHERE key = ?1",
+                [MASTER_KEY_ID_META],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let outcome = match existing {
+            Some(bound) if bound == key_id_hex => KeyBinding::Matched,
+            Some(bound) => {
+                return Err(MetadataError::MasterKeyMismatch {
+                    bound,
+                    presented: key_id_hex.to_owned(),
+                });
+            }
+            None => {
+                transaction.execute(
+                    "INSERT INTO portal_meta (key, value) VALUES (?1, ?2)",
+                    params![MASTER_KEY_ID_META, key_id_hex],
+                )?;
+                KeyBinding::Bound
+            }
+        };
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    pub fn master_key_id(&self) -> Result<Option<String>, MetadataError> {
+        self.connection
+            .query_row(
+                "SELECT value FROM portal_meta WHERE key = ?1",
+                [MASTER_KEY_ID_META],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn create_upload(&mut self, upload: &NewUpload) -> Result<(), MetadataError> {
@@ -2233,9 +2287,25 @@ CREATE TABLE IF NOT EXISTS object_health (
 fn apply_schema(connection: &Connection) -> Result<(), MetadataError> {
     connection.execute_batch(BASE_SCHEMA)?;
     connection.execute_batch(LIFECYCLE_SCHEMA)?;
-    connection.execute_batch("PRAGMA user_version = 4;")?;
+    connection.execute_batch(META_SCHEMA)?;
+    connection.execute_batch("PRAGMA user_version = 5;")?;
     Ok(())
 }
+
+/// Schema v5 adds `portal_meta`, which records the bound master-key
+/// identifier. Existing data is untouched; the first key to open the database
+/// binds it.
+fn migrate_v4_to_v5(connection: &Connection) -> Result<(), MetadataError> {
+    apply_schema(connection)
+}
+
+const META_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS portal_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+"#;
 
 /// Rebuild `placements` with incarnation and verification columns and the
 /// expanded state set, then add the lifecycle tables. Existing rows keep a
@@ -2273,7 +2343,7 @@ DROP TABLE placements_v3;
             )?;
         }
         connection.execute_batch(LIFECYCLE_SCHEMA)?;
-        connection.execute_batch("PRAGMA user_version = 4; COMMIT;")?;
+        connection.execute_batch("COMMIT;")?;
         Ok(())
     })();
     if migration.is_err() {
@@ -2550,6 +2620,10 @@ pub enum MetadataError {
     },
     #[error("deleted file has no deletion marker hash")]
     MissingDeletionMarker,
+    #[error(
+        "master key {presented} does not match the key {bound} this database was created with"
+    )]
+    MasterKeyMismatch { bound: String, presented: String },
     #[error("reconcile job is not running: {0}")]
     MissingJob(Uuid),
     #[error("scan observation is not running: {0}")]
@@ -2989,6 +3063,32 @@ PRAGMA user_version = 1;
             Err(MetadataError::MissingJob(_))
         ));
         assert!(database.latest_complete_scans().unwrap().is_empty());
+    }
+
+    #[test]
+    fn master_key_binding_adopts_then_refuses_other_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("meta.sqlite");
+        let mut database = Database::open(&path).unwrap();
+        assert_eq!(database.master_key_id().unwrap(), None);
+        assert_eq!(
+            database.bind_master_key_id("aa").unwrap(),
+            KeyBinding::Bound
+        );
+        assert_eq!(
+            database.bind_master_key_id("aa").unwrap(),
+            KeyBinding::Matched
+        );
+        assert!(matches!(
+            database.bind_master_key_id("bb"),
+            Err(MetadataError::MasterKeyMismatch { .. })
+        ));
+        assert_eq!(database.master_key_id().unwrap().as_deref(), Some("aa"));
+        let version: i64 = database
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

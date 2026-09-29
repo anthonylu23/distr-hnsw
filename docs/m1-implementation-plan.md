@@ -6,22 +6,23 @@ next dependency boundary.
 
 ## Current status
 
-Passes 1, 2, the compatibility-hardening pass, and pass 3 (lifecycle
-observation and scrub) are implemented and pushed. The product crate provides
-loopback agents plus portal `init`, `put`, `get`, `delete`, `recover`,
-`scrub`, and `health` commands. Pass 2 adds deletion-marker v1, paginated
+Passes 1, 2, the compatibility-hardening pass, pass 3 (lifecycle
+observation and scrub), and lane B (master-key custody) are implemented and
+pushed. The product crate provides loopback agents plus portal `init`,
+`put`, `get`, `delete`, `recover`, `scrub`, `health`, and `key` commands. Pass 2 adds deletion-marker v1, paginated
 inventories, plan/apply recovery reports, highest-generation selection,
 recovery-only RF2 repair, per-file convergence, and fail-closed recovery
 issues. The hardening pass integrates the audited commit spine, introduces
 canonical SQLite schema v3, and migrates both prior schema-v2 layouts. Pass 3
 adds agent incarnations, complete-scan observations, placement verification
 states, per-object durability health, and copy-first scrub/repair on schema
-v4.
+v4. Lane B adds the bound key identifier (schema v5) and recovery bundle v1
+with its `init` ceremony and `key` commands.
 
 This is not M1 acceptance. Movement, retirement, quotas, GC, offsite backup,
-independent key recovery, portal metadata restore, filesystem power-loss
-qualification, and the blank-infrastructure drill remain open. The three
-phase-1 design questions have proposed answers awaiting ratification in
+portal metadata restore, filesystem power-loss qualification, and the
+blank-infrastructure drill remain open. The three phase-1 design questions
+were ratified on 2026-09-29; see
 [`m1-phase-1-decisions.md`](m1-phase-1-decisions.md).
 
 ## Pass 1 — commit spine
@@ -89,6 +90,25 @@ Pass 3 exits when every required object's durability is observable from
 persisted state and a lost or corrupt copy is restored without any physical
 deletion. Those gates pass in the light local matrix on btrfs.
 
+## Lane B — master-key custody
+
+1. Derive a non-secret key identifier, bind it at `init`, and refuse a
+   mismatching key at every portal open before any decryption.
+2. Define recovery bundle v1 (Argon2id-wrapped XChaCha20-Poly1305, armored,
+   floor and ceiling on KDF parameters, transcription checksum).
+3. Emit the bundle once at `init` after an internal round-trip check; add
+   `key show-id`, `key export-recovery`, and `key restore [--verify]`.
+4. Zeroize the master key and unwrapped content keys on drop.
+5. Exercise round-trip, wrong passphrase, every tampered header and body
+   byte, transcription error, truncation, out-of-range parameters, wrong-key
+   refusal against a bound database, verify-never-writes, and
+   restore-never-overwrites, through the binary.
+
+Lane B exits when a key lost with every cluster disk is recovered from the
+bundle and an off-cluster passphrase alone, and the recovered key downloads
+a committed file byte for byte. Those gates pass locally; the
+empty-infrastructure drill will repeat them from blank infrastructure.
+
 ### Validation
 
 Run on the development machine:
@@ -122,8 +142,8 @@ The safety model for that owner is pinned in
 - copy-first placement movement and formal node retirement;
 - quota/headroom admission and ENOSPC failure injection;
 - proof-producing GC planning (dry-run first) and, last, agent DELETE;
-- versioned offsite backup, SQLite history replication, and independent key
-  recovery (proposals in `m1-phase-1-decisions.md`);
+- versioned offsite backup with `VACUUM INTO` snapshot shipping (lane C in
+  `m1-phase-1-decisions.md`);
 - filesystem power-loss qualification drill
   (`m1-filesystem-qualification.md`);
 - portal-loss and empty-infrastructure restore drills.

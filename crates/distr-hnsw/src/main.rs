@@ -1,15 +1,22 @@
-use std::{net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{
+    io::{self, Read, Write},
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use distr_hnsw::{
     agent::{bind_and_serve_agent, AgentIdentity},
     crypto::MasterKey,
-    metadata::{Database, JobMode},
+    metadata::{Database, JobMode, KeyBinding},
     portal::{prepare_agents, AgentTarget, Failpoint, FailpointAction, Portal},
     reconcile::{health_report, scrub},
+    recovery_bundle::{self, KdfParams},
 };
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(name = "distr-hnsw", version, about)]
@@ -40,12 +47,26 @@ enum Command {
 
 #[derive(Subcommand)]
 enum PortalCommand {
-    /// Initialize the SQLite database and file-backed master key.
+    /// Initialize the SQLite database and file-backed master key, bind the
+    /// key identifier, and emit the recovery bundle once.
     Init {
         #[arg(long)]
         database: PathBuf,
         #[arg(long)]
         master_key: PathBuf,
+        /// Skip the recovery bundle (development only; export one later with
+        /// `key export-recovery`).
+        #[arg(long)]
+        no_recovery_bundle: bool,
+        #[command(flatten)]
+        passphrase: PassphraseArgs,
+        #[command(flatten)]
+        kdf: KdfArgs,
+    },
+    /// Master-key custody: recovery bundle export, verification, and restore.
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
     },
     /// Commit a seekable regular file to RF2.
     Put {
@@ -114,6 +135,121 @@ enum PortalCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// Print the non-secret identifier of a master key.
+    ShowId {
+        #[arg(long)]
+        master_key: PathBuf,
+    },
+    /// Wrap the master key in a passphrase-protected recovery bundle.
+    ExportRecovery {
+        #[arg(long)]
+        master_key: PathBuf,
+        /// Write the armored bundle here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[command(flatten)]
+        passphrase: PassphraseArgs,
+        #[command(flatten)]
+        kdf: KdfArgs,
+    },
+    /// Recover a master key from a bundle. Reads the passphrase from stdin.
+    /// With `--database`, refuses a bundle whose key does not match the
+    /// database. With `--verify`, decrypts and compares without writing.
+    Restore {
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
+        #[arg(long)]
+        database: Option<PathBuf>,
+        #[arg(long)]
+        verify: bool,
+    },
+}
+
+#[derive(Args)]
+struct PassphraseArgs {
+    /// Read the passphrase from stdin instead of generating one.
+    #[arg(long)]
+    passphrase_stdin: bool,
+}
+
+#[derive(Args)]
+struct KdfArgs {
+    /// Argon2id memory cost in KiB (default 65536; floor 19456).
+    #[arg(long)]
+    kdf_memory_kib: Option<u32>,
+    /// Argon2id iterations (default 3; floor 2).
+    #[arg(long)]
+    kdf_time: Option<u32>,
+    /// Argon2id parallelism (default 4; floor 1).
+    #[arg(long)]
+    kdf_parallelism: Option<u32>,
+}
+
+impl KdfArgs {
+    fn params(&self) -> KdfParams {
+        KdfParams {
+            m_cost_kib: self.kdf_memory_kib.unwrap_or(KdfParams::DEFAULT.m_cost_kib),
+            t_cost: self.kdf_time.unwrap_or(KdfParams::DEFAULT.t_cost),
+            p_cost: self.kdf_parallelism.unwrap_or(KdfParams::DEFAULT.p_cost),
+        }
+    }
+}
+
+fn read_passphrase_stdin() -> anyhow::Result<Zeroizing<String>> {
+    let mut input = Zeroizing::new(String::new());
+    io::stdin()
+        .read_to_string(&mut input)
+        .context("reading passphrase from stdin")?;
+    let trimmed = input.trim_end_matches(['\r', '\n']).to_owned();
+    Ok(Zeroizing::new(trimmed))
+}
+
+/// Emit the recovery bundle for `key`, verifying that it round-trips before
+/// anything is printed. Returns the armored text.
+fn emit_recovery_bundle(
+    key: &MasterKey,
+    passphrase: &PassphraseArgs,
+    kdf: &KdfArgs,
+    out: Option<&Path>,
+) -> anyhow::Result<String> {
+    let (secret, generated) = if passphrase.passphrase_stdin {
+        (read_passphrase_stdin()?, false)
+    } else {
+        (recovery_bundle::generate_passphrase(), true)
+    };
+    let armored = recovery_bundle::seal(key, secret.as_bytes(), kdf.params())?;
+    let reopened = recovery_bundle::open(&armored, secret.as_bytes())?;
+    anyhow::ensure!(
+        reopened.key.bytes() == key.bytes(),
+        "recovery bundle did not round-trip; refusing to continue"
+    );
+    match out {
+        Some(path) => {
+            std::fs::write(path, &armored)
+                .with_context(|| format!("writing recovery bundle {}", path.display()))?;
+            println!("recovery bundle written to {}", path.display());
+        }
+        None => {
+            print!("{armored}");
+        }
+    }
+    if generated {
+        println!("recovery passphrase: {}", secret.as_str());
+    }
+    println!(
+        "Store the bundle and passphrase separately, off this cluster. Losing both the \
+         passphrase and every cluster disk loses the data. Verify at any time with:\n  \
+         distr-hnsw portal key restore --verify --bundle <file> --master-key <unused-path> \
+         --database <db>  (passphrase on stdin)"
+    );
+    io::stdout().flush()?;
+    Ok(armored)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -128,25 +264,105 @@ async fn main() -> anyhow::Result<()> {
             PortalCommand::Init {
                 database,
                 master_key,
+                no_recovery_bundle,
+                passphrase,
+                kdf,
             } => {
                 if database.exists() && !master_key.exists() {
                     anyhow::bail!(
                         "database exists but master key is missing; refusing to generate an unrelated key"
                     );
                 }
-                if master_key.exists() {
-                    MasterKey::load(&master_key).with_context(|| {
+                let (key, created) = if master_key.exists() {
+                    let key = MasterKey::load(&master_key).with_context(|| {
                         format!("validating existing master key {}", master_key.display())
                     })?;
+                    (key, false)
                 } else {
-                    MasterKey::create(&master_key)
+                    let key = MasterKey::create(&master_key)
                         .with_context(|| format!("creating master key {}", master_key.display()))?;
-                }
-                Database::open(&database)
+                    (key, true)
+                };
+                let mut db = Database::open(&database)
                     .with_context(|| format!("initializing database {}", database.display()))?;
+                let binding = db.bind_master_key_id(&key.key_id_hex())?;
                 println!("initialized");
+                println!(
+                    "master key id: {} ({})",
+                    key.key_id_hex(),
+                    match binding {
+                        KeyBinding::Bound => "bound to database",
+                        KeyBinding::Matched => "matches database",
+                    }
+                );
+                if created && !no_recovery_bundle {
+                    emit_recovery_bundle(&key, &passphrase, &kdf, None)?;
+                } else if created {
+                    println!(
+                        "no recovery bundle emitted; run `portal key export-recovery` before this \
+                         key protects any data you cannot lose"
+                    );
+                }
                 Ok(())
             }
+            PortalCommand::Key { command } => match command {
+                KeyCommand::ShowId { master_key } => {
+                    let key = MasterKey::load(&master_key)?;
+                    println!("{}", key.key_id_hex());
+                    Ok(())
+                }
+                KeyCommand::ExportRecovery {
+                    master_key,
+                    out,
+                    passphrase,
+                    kdf,
+                } => {
+                    let key = MasterKey::load(&master_key)?;
+                    emit_recovery_bundle(&key, &passphrase, &kdf, out.as_deref())?;
+                    Ok(())
+                }
+                KeyCommand::Restore {
+                    bundle,
+                    master_key,
+                    database,
+                    verify,
+                } => {
+                    let armored = std::fs::read_to_string(&bundle)
+                        .with_context(|| format!("reading recovery bundle {}", bundle.display()))?;
+                    let header = recovery_bundle::inspect(&armored)?;
+                    if let Some(database) = &database {
+                        let db = Database::open(database)?;
+                        match db.master_key_id()? {
+                            Some(bound) if bound != header.key_id_hex() => anyhow::bail!(
+                                "recovery bundle wraps key {} but database {} is bound to key {bound}",
+                                header.key_id_hex(),
+                                database.display()
+                            ),
+                            Some(_) => {}
+                            None => anyhow::bail!(
+                                "database {} has no bound master key; refusing to guess",
+                                database.display()
+                            ),
+                        }
+                    }
+                    let passphrase = read_passphrase_stdin()?;
+                    let opened = recovery_bundle::open(&armored, passphrase.as_bytes())?;
+                    if verify {
+                        println!("verified: bundle recovers key {}", opened.key.key_id_hex());
+                        return Ok(());
+                    }
+                    opened
+                        .key
+                        .write_new(&master_key)
+                        .with_context(|| format!("writing master key {}", master_key.display()))?;
+                    println!(
+                        "restored key {} to {}",
+                        opened.key.key_id_hex(),
+                        master_key.display()
+                    );
+                    Ok(())
+                }
+            },
             PortalCommand::Put {
                 database,
                 master_key,

@@ -6,3 +6,11 @@ members = ["crates/distr-hnsw", "prototype"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 version = "0.1.0"
+
+# Argon2id is unusably slow unoptimized; recovery-bundle tests would take
+# minutes. Optimize the KDF crates even in dev builds.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

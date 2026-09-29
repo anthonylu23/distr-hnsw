@@ -12,37 +12,73 @@ use chacha20poly1305::{
 use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::durability::{ensure_directory, sync_directory, sync_regular_file};
 
 pub const ENVELOPE_VERSION: u16 = 1;
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 24;
+pub const KEY_ID_LEN: usize = 16;
+const KEY_ID_CONTEXT: &str = "distr-hnsw:master-key-id:v1";
 
+/// The server master key. Zeroized on drop.
 #[derive(Clone)]
 pub struct MasterKey([u8; KEY_LEN]);
 
+impl Drop for MasterKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 impl MasterKey {
+    /// Generate a fresh key and persist it durably with owner-only permissions.
     pub fn create(path: &Path) -> Result<Self, CryptoError> {
+        let mut bytes = [0_u8; KEY_LEN];
+        OsRng.fill_bytes(&mut bytes);
+        let key = Self(bytes);
+        key.write_new(path)?;
+        Ok(key)
+    }
+
+    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Persist this key to a path that must not already exist.
+    pub fn write_new(&self, path: &Path) -> Result<(), CryptoError> {
         if path.exists() {
             return Err(CryptoError::KeyAlreadyExists(path.to_owned()));
         }
         if let Some(parent) = path.parent() {
             ensure_directory(parent)?;
         }
-        let mut bytes = [0_u8; KEY_LEN];
-        OsRng.fill_bytes(&mut bytes);
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .mode(0o600)
             .open(path)?;
-        file.write_all(&bytes)?;
+        file.write_all(&self.0)?;
         sync_regular_file(&file)?;
         if let Some(parent) = path.parent() {
             sync_directory(parent)?;
         }
-        Ok(Self(bytes))
+        Ok(())
+    }
+
+    /// Non-secret identifier derived from the key. It lets the portal refuse a
+    /// wrong key before decrypting anything and lets a recovery bundle name
+    /// the key it wraps without revealing it.
+    pub fn key_id(&self) -> [u8; KEY_ID_LEN] {
+        let derived = blake3::derive_key(KEY_ID_CONTEXT, &self.0);
+        derived[..KEY_ID_LEN]
+            .try_into()
+            .expect("derive_key yields 32 bytes")
+    }
+
+    pub fn key_id_hex(&self) -> String {
+        hex::encode(self.key_id())
     }
 
     pub fn load(path: &Path) -> Result<Self, CryptoError> {
@@ -71,9 +107,9 @@ pub struct WrappedKey {
     pub ciphertext: Vec<u8>,
 }
 
-pub fn random_key() -> [u8; KEY_LEN] {
-    let mut key = [0_u8; KEY_LEN];
-    OsRng.fill_bytes(&mut key);
+pub fn random_key() -> Zeroizing<[u8; KEY_LEN]> {
+    let mut key = Zeroizing::new([0_u8; KEY_LEN]);
+    OsRng.fill_bytes(key.as_mut());
     key
 }
 
@@ -109,19 +145,21 @@ pub fn unwrap_key(
     file_id: Uuid,
     generation: u64,
     wrapped: &WrappedKey,
-) -> Result<[u8; KEY_LEN], CryptoError> {
+) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
     let aad = key_aad(purpose, file_id, generation);
     let cipher = XChaCha20Poly1305::new(master.bytes().into());
-    let plaintext = cipher.decrypt(
+    let plaintext = Zeroizing::new(cipher.decrypt(
         XNonce::from_slice(&wrapped.nonce),
         Payload {
             msg: &wrapped.ciphertext,
             aad: &aad,
         },
-    )?;
-    plaintext
+    )?);
+    let key: [u8; KEY_LEN] = plaintext
+        .as_slice()
         .try_into()
-        .map_err(|_| CryptoError::InvalidKeyLength)
+        .map_err(|_| CryptoError::InvalidKeyLength)?;
+    Ok(Zeroizing::new(key))
 }
 
 pub fn encrypt_chunk(
