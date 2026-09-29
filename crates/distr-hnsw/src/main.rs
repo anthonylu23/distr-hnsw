@@ -5,8 +5,9 @@ use clap::{Parser, Subcommand};
 use distr_hnsw::{
     agent::{bind_and_serve_agent, AgentIdentity},
     crypto::MasterKey,
-    metadata::Database,
-    portal::{AgentTarget, Failpoint, FailpointAction, Portal},
+    metadata::{Database, JobMode},
+    portal::{prepare_agents, AgentTarget, Failpoint, FailpointAction, Portal},
+    reconcile::{health_report, scrub},
 };
 use uuid::Uuid;
 
@@ -91,6 +92,25 @@ enum PortalCommand {
         agents: Vec<AgentTarget>,
         #[arg(long)]
         apply: bool,
+    },
+    /// Verify every required object on every agent and report durability
+    /// health. Needs no master key. `--repair` restores copies copy-first;
+    /// nothing is ever deleted.
+    Scrub {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long = "agent", required = true)]
+        agents: Vec<AgentTarget>,
+        #[arg(long)]
+        repair: bool,
+        /// Repeat continuously, sleeping this many seconds between jobs.
+        #[arg(long)]
+        interval: Option<u64>,
+    },
+    /// Print persisted lifecycle health without contacting agents.
+    Health {
+        #[arg(long)]
+        database: PathBuf,
     },
 }
 
@@ -183,6 +203,45 @@ async fn main() -> anyhow::Result<()> {
                 let key = MasterKey::load(&master_key)?;
                 let mut portal = Portal::open(&database, key, agents)?;
                 let report = portal.recover(apply).await?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.exit_code() == 2 {
+                    std::process::exit(2);
+                }
+                Ok(())
+            }
+            PortalCommand::Scrub {
+                database,
+                agents,
+                repair,
+                interval,
+            } => {
+                let agents = prepare_agents(agents)?;
+                let mut database = Database::open(&database)?;
+                let client = reqwest::Client::new();
+                let mode = if repair {
+                    JobMode::Repair
+                } else {
+                    JobMode::Verify
+                };
+                loop {
+                    let report = scrub(&mut database, &agents, &client, mode).await?;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    match interval {
+                        Some(seconds) => {
+                            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+                        }
+                        None => {
+                            if report.exit_code() == 2 {
+                                std::process::exit(2);
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            PortalCommand::Health { database } => {
+                let database = Database::open(&database)?;
+                let report = health_report(&database)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 if report.exit_code() == 2 {
                     std::process::exit(2);

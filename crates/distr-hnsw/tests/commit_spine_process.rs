@@ -290,3 +290,106 @@ fn abrupt_delete_exit_at_every_boundary_recovers_with_the_same_key() {
         assert!(String::from_utf8_lossy(&new_key.stderr).contains("already deleted"));
     }
 }
+
+#[test]
+fn scrub_and_health_commands_report_a_durable_cluster() {
+    let binary = env!("CARGO_BIN_EXE_distr-hnsw");
+    let binary = Path::new(binary);
+    let workspace = tempfile::tempdir().unwrap();
+    let volume_a = workspace.path().join("agent-a");
+    let volume_b = workspace.path().join("agent-b");
+    fs::create_dir_all(&volume_a).unwrap();
+    fs::create_dir_all(&volume_b).unwrap();
+    let (_agent_a, target_a) = start_agent(binary, "agent-a", "host-a", &volume_a);
+    let (_agent_b, target_b) = start_agent(binary, "agent-b", "host-b", &volume_b);
+    let agents = vec![target_a, target_b];
+    let database = workspace.path().join("portal.sqlite");
+    let master_key = workspace.path().join("master.key");
+    let status = Command::new(binary)
+        .args(["portal", "init", "--database"])
+        .arg(&database)
+        .arg("--master-key")
+        .arg(&master_key)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let source = workspace.path().join("source.bin");
+    fs::write(&source, vec![7_u8; CHUNK_SIZE / 2]).unwrap();
+    let put = portal_command(binary, "put", &database, &master_key, &agents)
+        .args(["--idempotency-key", "cli-scrub"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        put.status.success(),
+        "{}",
+        String::from_utf8_lossy(&put.stderr)
+    );
+
+    let scrub = Command::new(binary)
+        .args(["portal", "scrub", "--database"])
+        .arg(&database)
+        .args(agents.iter().flat_map(|agent| ["--agent", agent.as_str()]))
+        .output()
+        .unwrap();
+    assert!(
+        scrub.status.success(),
+        "{}",
+        String::from_utf8_lossy(&scrub.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&scrub.stdout).unwrap();
+    assert_eq!(report["report_type"], "ScrubReportV1");
+    assert_eq!(report["complete_observation"], true);
+    assert_eq!(report["health"]["durable"], 2);
+    assert_eq!(report["health"]["at_risk"], 0);
+
+    let health = Command::new(binary)
+        .args(["portal", "health", "--database"])
+        .arg(&database)
+        .output()
+        .unwrap();
+    assert!(
+        health.status.success(),
+        "{}",
+        String::from_utf8_lossy(&health.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&health.stdout).unwrap();
+    assert_eq!(report["report_type"], "HealthReportV1");
+    assert_eq!(report["latest_job"]["status"], "complete");
+    assert_eq!(report["incarnations"].as_array().unwrap().len(), 2);
+
+    // Corrupt one copy: verify-only scrub exits 2 and repair restores it.
+    let database_handle = Database::open(&database).unwrap();
+    let chunk = database_handle
+        .required_objects()
+        .unwrap()
+        .into_iter()
+        .find(|object| object.kind == distr_hnsw::object::ObjectKind::Chunk)
+        .unwrap();
+    drop(database_handle);
+    let path = distr_hnsw::durability::DurableStore::open(&volume_a)
+        .unwrap()
+        .object_path(chunk.kind, &chunk.hash);
+    fs::write(&path, b"flipped").unwrap();
+    let scrub = Command::new(binary)
+        .args(["portal", "scrub", "--database"])
+        .arg(&database)
+        .args(agents.iter().flat_map(|agent| ["--agent", agent.as_str()]))
+        .output()
+        .unwrap();
+    assert_eq!(scrub.status.code(), Some(2));
+    let repair = Command::new(binary)
+        .args(["portal", "scrub", "--repair", "--database"])
+        .arg(&database)
+        .args(agents.iter().flat_map(|agent| ["--agent", agent.as_str()]))
+        .output()
+        .unwrap();
+    assert!(
+        repair.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repair.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&repair.stdout).unwrap();
+    assert_eq!(report["totals"]["repairs_applied"], 1);
+    assert_eq!(report["health"]["durable"], 2);
+}

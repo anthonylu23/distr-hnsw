@@ -151,6 +151,23 @@ impl Portal {
         self
     }
 
+    pub async fn scrub(
+        &mut self,
+        repair: bool,
+    ) -> Result<crate::reconcile::ScrubReportV1, crate::reconcile::ScrubError> {
+        crate::reconcile::scrub(
+            &mut self.database,
+            &self.agents,
+            &self.client,
+            if repair {
+                crate::metadata::JobMode::Repair
+            } else {
+                crate::metadata::JobMode::Verify
+            },
+        )
+        .await
+    }
+
     pub async fn recover(
         &mut self,
         apply: bool,

@@ -5,6 +5,7 @@ pub mod format;
 pub mod metadata;
 pub mod object;
 pub mod portal;
+pub mod reconcile;
 pub mod recovery;
 
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024;
