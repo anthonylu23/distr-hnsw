@@ -123,6 +123,9 @@ pub struct Portal {
     pub(crate) master_key: MasterKey,
     pub(crate) agents: Vec<AgentTarget>,
     pub(crate) client: reqwest::Client,
+    /// Incarnation each configured agent reported when last verified in this
+    /// process. Placements are only recorded against a verified incarnation.
+    incarnations: HashMap<String, String>,
     failpoint: Option<(Failpoint, FailpointAction)>,
 }
 
@@ -130,15 +133,15 @@ impl Portal {
     pub fn open(
         database_path: &Path,
         master_key: MasterKey,
-        mut agents: Vec<AgentTarget>,
+        agents: Vec<AgentTarget>,
     ) -> Result<Self, PortalError> {
-        validate_agent_set(&agents)?;
-        agents.sort_by(|left, right| left.id.cmp(&right.id));
+        let agents = prepare_agents(agents)?;
         Ok(Self {
             database: Database::open(database_path)?,
             master_key,
             agents,
             client: reqwest::Client::new(),
+            incarnations: HashMap::new(),
             failpoint: None,
         })
     }
@@ -481,8 +484,17 @@ impl Portal {
             if self.database.placement_confirmed(kind, hash, &agent.id)? {
                 continue;
             }
-            self.database
-                .ensure_pending_placement(kind, hash, &agent.id, &agent.failure_domain)?;
+            let Some(incarnation_id) = self.incarnations.get(&agent.id).cloned() else {
+                last_failure = Some(PortalError::AgentNotVerified(agent.id.clone()));
+                continue;
+            };
+            self.database.ensure_pending_placement(
+                kind,
+                hash,
+                &agent.id,
+                &agent.failure_domain,
+                &incarnation_id,
+            )?;
             let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
             let response = match self.client.put(url).body(bytes.to_vec()).send().await {
                 Ok(response) => response,
@@ -614,10 +626,13 @@ impl Portal {
         })
     }
 
-    async fn verify_remote_agents(&self) -> Result<(), PortalError> {
+    /// Verify every configured agent's identity and record its incarnation.
+    /// Unreachable agents are tolerated as long as the live failure domains
+    /// still meet the replica floor; identity mismatches fail closed.
+    async fn verify_remote_agents(&mut self) -> Result<(), PortalError> {
         let mut live_domains = HashSet::new();
         let mut last_failure = None;
-        for agent in &self.agents {
+        for agent in self.agents.clone() {
             let response = match self
                 .client
                 .get(format!("{}/v1/health", agent.base_url))
@@ -642,7 +657,14 @@ impl Portal {
             if identity.id != agent.id || identity.failure_domain != agent.failure_domain {
                 return Err(PortalError::AgentIdentityMismatch(agent.id.clone()));
             }
-            live_domains.insert(agent.failure_domain.as_str());
+            self.database.observe_agent_incarnation(
+                &agent.id,
+                &agent.failure_domain,
+                &identity.incarnation_id,
+            )?;
+            self.incarnations
+                .insert(agent.id.clone(), identity.incarnation_id);
+            live_domains.insert(agent.failure_domain.clone());
         }
         if live_domains.len() < MINIMUM_REPLICAS {
             return Err(last_failure.unwrap_or(PortalError::InsufficientFailureDomains));
@@ -777,6 +799,13 @@ fn new_upload(
     })
 }
 
+/// Validate a configured agent set and order it deterministically by id.
+pub fn prepare_agents(mut agents: Vec<AgentTarget>) -> Result<Vec<AgentTarget>, PortalError> {
+    validate_agent_set(&agents)?;
+    agents.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(agents)
+}
+
 fn validate_agent_set(agents: &[AgentTarget]) -> Result<(), PortalError> {
     let ids: HashSet<_> = agents.iter().map(|agent| agent.id.as_str()).collect();
     let domains: HashSet<_> = agents
@@ -824,6 +853,7 @@ fn read_exact_or_source_changed(
 struct RemoteAgentIdentity {
     id: String,
     failure_domain: String,
+    incarnation_id: String,
 }
 
 #[derive(Debug, Error)]
@@ -836,6 +866,8 @@ pub enum PortalError {
     InsufficientFailureDomains,
     #[error("remote agent identity does not match configuration: {0}")]
     AgentIdentityMismatch(String),
+    #[error("agent {0} was not verified before placement; refusing to record an unverified copy")]
+    AgentNotVerified(String),
     #[error("source is not a regular file: {0}")]
     SourceNotRegularFile(PathBuf),
     #[error("source file name is not valid UTF-8: {0}")]

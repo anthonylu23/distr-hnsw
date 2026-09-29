@@ -127,8 +127,11 @@ pub async fn recover(
     let mut listings: BTreeMap<(String, String), BTreeMap<String, u64>> = BTreeMap::new();
     let mut summaries = Vec::new();
 
+    let mut incarnations: BTreeMap<String, String> = BTreeMap::new();
     for agent in agents {
-        verify_agent(client, agent).await?;
+        let incarnation_id = verify_agent(client, agent).await?;
+        database.observe_agent_incarnation(&agent.id, &agent.failure_domain, &incarnation_id)?;
+        incarnations.insert(agent.id.clone(), incarnation_id);
         let mut object_count = 0_usize;
         for kind in ObjectKind::ALL {
             let mut after: Option<ObjectHash> = None;
@@ -330,6 +333,7 @@ pub async fn recover(
         database,
         client,
         agents,
+        incarnations: &incarnations,
         replicas: &mut replicas,
         mode,
     };
@@ -458,8 +462,19 @@ struct RepairContext<'a> {
     database: &'a mut Database,
     client: &'a reqwest::Client,
     agents: &'a [AgentTarget],
+    incarnations: &'a BTreeMap<String, String>,
     replicas: &'a mut BTreeMap<(String, String), ReplicaSet>,
     mode: RecoveryMode,
+}
+
+fn incarnation_of(
+    incarnations: &BTreeMap<String, String>,
+    agent_id: &str,
+) -> Result<String, RecoveryError> {
+    incarnations
+        .get(agent_id)
+        .cloned()
+        .ok_or_else(|| RecoveryError::AgentIdentity(agent_id.to_owned()))
 }
 
 impl RepairContext<'_> {
@@ -532,11 +547,23 @@ impl RepairContext<'_> {
                     repairs.push(repair);
                     continue;
                 }
+                // Copy-first protocol: the destination counts only after a
+                // read-back proves the bytes landed intact.
+                if !read_back_matches(self.client, target, kind, hash).await {
+                    issues.push(format!(
+                        "repair target {} did not read back {kind} {hash} intact",
+                        target.id
+                    ));
+                    repairs.push(repair);
+                    continue;
+                }
+                let incarnation_id = incarnation_of(self.incarnations, &target.id)?;
                 self.database.ensure_pending_placement(
                     kind,
                     hash,
                     &target.id,
                     &target.failure_domain,
+                    &incarnation_id,
                 )?;
                 self.database.confirm_placement(kind, hash, &target.id)?;
                 replica.valid_agents.insert(target.id.clone());
@@ -553,11 +580,13 @@ impl RepairContext<'_> {
         if self.mode == RecoveryMode::Apply {
             for agent_id in &replica.valid_agents {
                 if let Some(agent) = self.agents.iter().find(|agent| agent.id == *agent_id) {
+                    let incarnation_id = incarnation_of(self.incarnations, &agent.id)?;
                     self.database.ensure_pending_placement(
                         kind,
                         hash,
                         &agent.id,
                         &agent.failure_domain,
+                        &incarnation_id,
                     )?;
                     self.database.confirm_placement(kind, hash, &agent.id)?;
                 }
@@ -567,11 +596,31 @@ impl RepairContext<'_> {
     }
 }
 
-async fn verify_agent(client: &reqwest::Client, agent: &AgentTarget) -> Result<(), RecoveryError> {
+async fn read_back_matches(
+    client: &reqwest::Client,
+    agent: &AgentTarget,
+    kind: ObjectKind,
+    hash: &ObjectHash,
+) -> bool {
+    let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
+    match client.get(url).send().await {
+        Ok(response) if response.status().is_success() => match response.bytes().await {
+            Ok(bytes) => ObjectHash::digest(&bytes) == *hash,
+            Err(_) => false,
+        },
+        _ => false,
+    }
+}
+
+async fn verify_agent(
+    client: &reqwest::Client,
+    agent: &AgentTarget,
+) -> Result<String, RecoveryError> {
     #[derive(serde::Deserialize)]
     struct Identity {
         id: String,
         failure_domain: String,
+        incarnation_id: String,
     }
     let response = client
         .get(format!("{}/v1/health", agent.base_url))
@@ -588,7 +637,7 @@ async fn verify_agent(client: &reqwest::Client, agent: &AgentTarget) -> Result<(
     if identity.id != agent.id || identity.failure_domain != agent.failure_domain {
         return Err(RecoveryError::AgentIdentity(agent.id.clone()));
     }
-    Ok(())
+    Ok(identity.incarnation_id)
 }
 
 #[derive(Debug, Error)]

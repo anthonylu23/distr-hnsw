@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::object::{ObjectHash, ObjectKind};
 
 pub const MAX_INVENTORY_PAGE: usize = 1_000;
+const INCARNATION_FILE: &str = "incarnation";
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct InventoryObject {
@@ -38,6 +39,52 @@ impl DurableStore {
             ensure_child_directory(&objects, &objects.join(kind.as_str()))?;
         }
         Ok(Self { root })
+    }
+
+    /// Load the immutable incarnation identity of this volume, creating it
+    /// durably on first use. Reusing an agent name on a fresh volume yields a
+    /// new incarnation; a malformed identity fails closed.
+    pub fn load_or_create_incarnation(&self) -> Result<String, StoreError> {
+        let path = self.root.join(INCARNATION_FILE);
+        match fs::read_to_string(&path) {
+            Ok(contents) => {
+                let value = contents.trim();
+                Uuid::parse_str(value)
+                    .map(|_| value.to_owned())
+                    .map_err(|_| StoreError::MalformedIncarnation(path))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let value = Uuid::new_v4().to_string();
+                let temporary = self.root.join(format!(".{INCARNATION_FILE}.{value}.tmp"));
+                let result = (|| {
+                    let mut file = OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(&temporary)?;
+                    file.write_all(value.as_bytes())?;
+                    file.write_all(b"\n")?;
+                    sync_regular_file(&file)?;
+                    drop(file);
+                    // A concurrent creator wins; never overwrite an identity.
+                    match fs::hard_link(&temporary, &path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                            let _ = fs::remove_file(&temporary);
+                            return self.load_or_create_incarnation();
+                        }
+                        Err(error) => return Err(StoreError::Io(error)),
+                    }
+                    fs::remove_file(&temporary)?;
+                    sync_directory(&self.root)?;
+                    Ok(value.clone())
+                })();
+                if result.is_err() {
+                    let _ = fs::remove_file(&temporary);
+                }
+                result
+            }
+            Err(error) => Err(StoreError::Io(error)),
+        }
     }
 
     pub fn put(
@@ -268,6 +315,8 @@ pub enum StoreError {
     InvalidInventoryLimit(usize),
     #[error("malformed object-store inventory entry: {0}")]
     MalformedInventoryEntry(PathBuf),
+    #[error("malformed agent incarnation identity: {0}")]
+    MalformedIncarnation(PathBuf),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -328,6 +377,42 @@ mod tests {
         assert!(store
             .inventory(ObjectKind::Manifest, None, MAX_INVENTORY_PAGE + 1)
             .is_ok());
+    }
+
+    #[test]
+    fn incarnation_is_created_once_and_survives_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(directory.path()).unwrap();
+        let first = store.load_or_create_incarnation().unwrap();
+        assert!(Uuid::parse_str(&first).is_ok());
+        let reopened = DurableStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.load_or_create_incarnation().unwrap(), first);
+        assert!(!directory.path().read_dir().unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+
+        fs::write(directory.path().join(INCARNATION_FILE), "not-a-uuid\n").unwrap();
+        assert!(matches!(
+            store.load_or_create_incarnation(),
+            Err(StoreError::MalformedIncarnation(_))
+        ));
+    }
+
+    #[test]
+    fn wiped_volume_yields_a_new_incarnation() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = DurableStore::open(directory.path())
+            .unwrap()
+            .load_or_create_incarnation()
+            .unwrap();
+        fs::remove_dir_all(directory.path()).unwrap();
+        let second = DurableStore::open(directory.path())
+            .unwrap()
+            .load_or_create_incarnation()
+            .unwrap();
+        assert_ne!(first, second);
     }
 
     #[test]

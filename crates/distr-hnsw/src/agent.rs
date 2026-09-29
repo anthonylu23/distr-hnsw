@@ -20,13 +20,24 @@ use crate::{
 #[derive(Clone)]
 struct AgentState {
     store: Arc<DurableStore>,
-    identity: AgentIdentity,
+    health: AgentHealth,
 }
 
+/// Operator-configured agent identity. The incarnation is not configured; it
+/// is loaded from the volume so a wiped volume cannot impersonate its past.
 #[derive(Clone, Debug, Serialize)]
 pub struct AgentIdentity {
     pub id: String,
     pub failure_domain: String,
+}
+
+/// Identity reported by `GET /v1/health`, including the immutable incarnation
+/// of the volume this agent serves.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AgentHealth {
+    pub id: String,
+    pub failure_domain: String,
+    pub incarnation_id: String,
 }
 
 pub async fn serve_agent(
@@ -35,7 +46,7 @@ pub async fn serve_agent(
     identity: AgentIdentity,
 ) -> anyhow::Result<()> {
     let store = DurableStore::open(volume)?;
-    let router = router(store, identity);
+    let router = router(store, identity)?;
     axum::serve(listener, router).await?;
     Ok(())
 }
@@ -52,21 +63,26 @@ pub async fn bind_and_serve_agent(
     serve_agent(listener, volume, identity).await
 }
 
-pub fn router(store: DurableStore, identity: AgentIdentity) -> Router {
+pub fn router(store: DurableStore, identity: AgentIdentity) -> Result<Router, StoreError> {
+    let incarnation_id = store.load_or_create_incarnation()?;
     let state = AgentState {
         store: Arc::new(store),
-        identity,
+        health: AgentHealth {
+            id: identity.id,
+            failure_domain: identity.failure_domain,
+            incarnation_id,
+        },
     };
-    Router::new()
+    Ok(Router::new()
         .route("/v1/health", get(health))
         .route("/v1/inventory/{kind}", get(inventory))
         .route("/v1/objects/{kind}/{hash}", get(get_object).put(put_object))
         .layer(DefaultBodyLimit::max(CHUNK_SIZE + 1024 * 1024))
-        .with_state(state)
+        .with_state(state))
 }
 
-async fn health(State(state): State<AgentState>) -> Json<AgentIdentity> {
-    Json(state.identity)
+async fn health(State(state): State<AgentState>) -> Json<AgentHealth> {
+    Json(state.health)
 }
 
 #[derive(Deserialize)]
@@ -132,9 +148,8 @@ impl IntoResponse for AgentError {
             Self::Store(StoreError::NotFound(_)) => StatusCode::NOT_FOUND,
             Self::Store(StoreError::HashMismatch { .. }) => StatusCode::CONFLICT,
             Self::Store(StoreError::InvalidInventoryLimit(_)) => StatusCode::BAD_REQUEST,
-            Self::Store(StoreError::MalformedInventoryEntry(_)) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::Store(StoreError::MalformedInventoryEntry(_))
+            | Self::Store(StoreError::MalformedIncarnation(_)) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Store(StoreError::InvalidPath(_))
             | Self::Store(StoreError::Io(_))
             | Self::Join(_) => StatusCode::INTERNAL_SERVER_ERROR,

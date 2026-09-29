@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 use axum::{extract::DefaultBodyLimit, http::StatusCode, routing::get, Json, Router};
 use distr_hnsw::{
-    agent::{serve_agent, AgentIdentity},
+    agent::{serve_agent, AgentHealth, AgentIdentity},
     crypto::MasterKey,
     durability::DurableStore,
     metadata::Database,
@@ -51,9 +51,10 @@ async fn start_agent(id: &str, failure_domain: &str) -> TestAgent {
 async fn start_rejecting_agent(id: &str, failure_domain: &str) -> (AgentTarget, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let identity = AgentIdentity {
+    let identity = AgentHealth {
         id: id.to_owned(),
         failure_domain: failure_domain.to_owned(),
+        incarnation_id: format!("rejecting-{id}"),
     };
     let router = Router::new()
         .route(

@@ -10,7 +10,14 @@ use crate::{
     object::{ObjectHash, ObjectKind},
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+
+/// SQL predicate selecting placements that count toward the live durability
+/// floor: confirmed rows whose agent incarnation is still active. Legacy rows
+/// without an incarnation count until the agent is observed and adopts them.
+const LIVE_CONFIRMED: &str =
+    "state = 'confirmed' AND (incarnation_id IS NULL OR incarnation_id IN (
+    SELECT incarnation_id FROM agent_incarnations WHERE status = 'active'))";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UploadState {
@@ -209,6 +216,267 @@ pub struct DeleteOperation {
     pub state: DeleteState,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementState {
+    Pending,
+    Confirmed,
+    Missing,
+    Corrupt,
+}
+
+impl PlacementState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Confirmed => "confirmed",
+            Self::Missing => "missing",
+            Self::Corrupt => "corrupt",
+        }
+    }
+}
+
+impl FromStr for PlacementState {
+    type Err = MetadataError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "confirmed" => Ok(Self::Confirmed),
+            "missing" => Ok(Self::Missing),
+            "corrupt" => Ok(Self::Corrupt),
+            _ => Err(MetadataError::InvalidPlacementState(value.to_owned())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncarnationStatus {
+    Active,
+    Superseded,
+    Retired,
+}
+
+impl IncarnationStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Superseded => "superseded",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+impl FromStr for IncarnationStatus {
+    type Err = MetadataError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "active" => Ok(Self::Active),
+            "superseded" => Ok(Self::Superseded),
+            "retired" => Ok(Self::Retired),
+            _ => Err(MetadataError::InvalidIncarnationStatus(value.to_owned())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct AgentIncarnation {
+    pub agent_id: String,
+    pub incarnation_id: String,
+    pub failure_domain: String,
+    pub status: IncarnationStatus,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
+    pub superseded_by: Option<String>,
+}
+
+/// Outcome of recording an agent's reported incarnation.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum IncarnationObservation {
+    /// The active incarnation was seen again.
+    Known,
+    /// First incarnation ever recorded for this agent id. Legacy placement
+    /// rows without an incarnation were attributed to it.
+    Adopted { adopted_placements: usize },
+    /// A different incarnation replaced the previously active one. The old
+    /// incarnation's placements no longer count toward durability.
+    Superseded { previous: String },
+}
+
+/// The agent and incarnation a placement row belongs to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementTarget {
+    pub agent_id: String,
+    pub failure_domain: String,
+    pub incarnation_id: String,
+}
+
+/// The latest complete inventory observation of one namespace on one active
+/// incarnation.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct CompleteScan {
+    pub agent_id: String,
+    pub incarnation_id: String,
+    pub kind: ObjectKind,
+    pub inventory_digest: String,
+    pub completed_at: i64,
+}
+
+/// One object the current file projection requires to be durable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequiredObject {
+    pub kind: ObjectKind,
+    pub hash: ObjectHash,
+    pub file_id: Uuid,
+    pub generation: u64,
+    pub expected_len: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobMode {
+    Verify,
+    Repair,
+}
+
+impl JobMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verify => "verify",
+            Self::Repair => "repair",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStatus {
+    Running,
+    Complete,
+    Failed,
+    Interrupted,
+}
+
+impl JobStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+impl FromStr for JobStatus {
+    type Err = MetadataError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "running" => Ok(Self::Running),
+            "complete" => Ok(Self::Complete),
+            "failed" => Ok(Self::Failed),
+            "interrupted" => Ok(Self::Interrupted),
+            _ => Err(MetadataError::InvalidJobStatus(value.to_owned())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct ReconcileJob {
+    pub job_id: Uuid,
+    pub mode: JobMode,
+    pub status: JobStatus,
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
+    pub report: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanStatus {
+    Running,
+    Complete,
+    Failed,
+}
+
+impl ScanStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// A complete inventory observation of one namespace on one incarnation.
+#[derive(Clone, Debug)]
+pub struct ScanCompletion {
+    pub scan_id: Uuid,
+    pub final_cursor: Option<ObjectHash>,
+    pub object_count: u64,
+    pub inventory_digest: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectHealthState {
+    Durable,
+    Degraded,
+    AtRisk,
+    Lost,
+}
+
+impl ObjectHealthState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::Degraded => "degraded",
+            Self::AtRisk => "at_risk",
+            Self::Lost => "lost",
+        }
+    }
+}
+
+impl FromStr for ObjectHealthState {
+    type Err = MetadataError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "durable" => Ok(Self::Durable),
+            "degraded" => Ok(Self::Degraded),
+            "at_risk" => Ok(Self::AtRisk),
+            "lost" => Ok(Self::Lost),
+            _ => Err(MetadataError::InvalidHealthState(value.to_owned())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct ObjectHealth {
+    pub kind: ObjectKind,
+    pub hash: ObjectHash,
+    pub file_id: Uuid,
+    pub generation: u64,
+    pub verified_copies: usize,
+    pub verified_domains: usize,
+    pub state: ObjectHealthState,
+    pub job_id: Uuid,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct ObjectHealthSummary {
+    pub durable: usize,
+    pub degraded: usize,
+    pub at_risk: usize,
+    pub lost: usize,
+}
+
 pub struct Database {
     connection: Connection,
 }
@@ -224,16 +492,25 @@ impl Database {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         match version {
-            0 => connection.execute_batch(SCHEMA)?,
-            1 => migrate_v1_to_v3(&mut connection)?,
-            2 => migrate_v2_to_v3(&mut connection)?,
-            SCHEMA_VERSION => connection.execute_batch(SCHEMA)?,
+            0 => apply_schema(&connection)?,
+            1 => {
+                migrate_v1_to_v3(&mut connection)?;
+                migrate_v3_to_v4(&mut connection)?;
+            }
+            2 => {
+                migrate_v2_to_v3(&mut connection)?;
+                migrate_v3_to_v4(&mut connection)?;
+            }
+            3 => migrate_v3_to_v4(&mut connection)?,
+            SCHEMA_VERSION => apply_schema(&connection)?,
             _ => return Err(MetadataError::UnsupportedSchemaVersion(version)),
         }
+        let mut database = Self { connection };
+        database.interrupt_running_jobs()?;
         if let Some(parent) = path.parent() {
             sync_directory(parent)?;
         }
-        Ok(Self { connection })
+        Ok(database)
     }
 
     pub fn create_upload(&mut self, upload: &NewUpload) -> Result<(), MetadataError> {
@@ -395,21 +672,585 @@ impl Database {
         Ok(())
     }
 
+    /// Record a pending placement for the agent's current incarnation. A row
+    /// left by a superseded incarnation is reset to pending so the object is
+    /// written again; a legacy row without an incarnation is adopted as is.
     pub fn ensure_pending_placement(
         &mut self,
         kind: ObjectKind,
         hash: &ObjectHash,
         agent_id: &str,
         failure_domain: &str,
+        incarnation_id: &str,
     ) -> Result<(), MetadataError> {
         self.connection.execute(
             "INSERT INTO placements
-             (object_kind, object_hash, agent_id, failure_domain, state)
-             VALUES (?1, ?2, ?3, ?4, 'pending')
-             ON CONFLICT(object_kind, object_hash, agent_id) DO NOTHING",
-            params![kind.as_str(), hash.as_str(), agent_id, failure_domain],
+             (object_kind, object_hash, agent_id, failure_domain, incarnation_id, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending')
+             ON CONFLICT(object_kind, object_hash, agent_id) DO UPDATE SET
+                 failure_domain = excluded.failure_domain,
+                 incarnation_id = excluded.incarnation_id,
+                 state = CASE
+                     WHEN placements.incarnation_id IS NULL
+                       OR placements.incarnation_id = excluded.incarnation_id
+                     THEN placements.state ELSE 'pending' END,
+                 confirmed_at = CASE
+                     WHEN placements.incarnation_id IS NULL
+                       OR placements.incarnation_id = excluded.incarnation_id
+                     THEN placements.confirmed_at ELSE NULL END,
+                 last_verified_at = CASE
+                     WHEN placements.incarnation_id IS NULL
+                       OR placements.incarnation_id = excluded.incarnation_id
+                     THEN placements.last_verified_at ELSE NULL END,
+                 last_verified_job = CASE
+                     WHEN placements.incarnation_id IS NULL
+                       OR placements.incarnation_id = excluded.incarnation_id
+                     THEN placements.last_verified_job ELSE NULL END
+             WHERE placements.incarnation_id IS NOT excluded.incarnation_id",
+            params![
+                kind.as_str(),
+                hash.as_str(),
+                agent_id,
+                failure_domain,
+                incarnation_id
+            ],
         )?;
         Ok(())
+    }
+
+    /// Persist the verification outcome of one placement. Verification never
+    /// removes rows; it only changes their state.
+    pub fn set_placement_verification(
+        &mut self,
+        kind: ObjectKind,
+        hash: &ObjectHash,
+        target: &PlacementTarget,
+        state: PlacementState,
+        job_id: Uuid,
+    ) -> Result<(), MetadataError> {
+        if state == PlacementState::Pending {
+            return Err(MetadataError::InvalidPlacementState(
+                "verification cannot reset a placement to pending".to_owned(),
+            ));
+        }
+        self.ensure_pending_placement(
+            kind,
+            hash,
+            &target.agent_id,
+            &target.failure_domain,
+            &target.incarnation_id,
+        )?;
+        self.connection.execute(
+            "UPDATE placements
+             SET state = ?4,
+                 confirmed_at = CASE WHEN ?4 = 'confirmed'
+                     THEN COALESCE(confirmed_at, unixepoch()) ELSE confirmed_at END,
+                 last_verified_at = unixepoch(),
+                 last_verified_job = ?5
+             WHERE object_kind = ?1 AND object_hash = ?2 AND agent_id = ?3",
+            params![
+                kind.as_str(),
+                hash.as_str(),
+                target.agent_id,
+                state.as_str(),
+                job_id.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn placement_states(
+        &self,
+        kind: ObjectKind,
+        hash: &ObjectHash,
+    ) -> Result<Vec<(String, PlacementState, Option<String>)>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT agent_id, state, incarnation_id FROM placements
+             WHERE object_kind = ?1 AND object_hash = ?2 ORDER BY agent_id",
+        )?;
+        let rows = statement
+            .query_map(params![kind.as_str(), hash.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(agent, state, incarnation)| {
+                Ok((agent, PlacementState::from_str(&state)?, incarnation))
+            })
+            .collect()
+    }
+
+    /// Record the incarnation an agent reports on contact. See
+    /// [`IncarnationObservation`] for the outcomes. A retired incarnation
+    /// attempting to rejoin fails closed.
+    pub fn observe_agent_incarnation(
+        &mut self,
+        agent_id: &str,
+        failure_domain: &str,
+        incarnation_id: &str,
+    ) -> Result<IncarnationObservation, MetadataError> {
+        let transaction = self.connection.transaction()?;
+        let observed_status: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM agent_incarnations WHERE incarnation_id = ?1",
+                [incarnation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(status) = &observed_status {
+            match IncarnationStatus::from_str(status)? {
+                IncarnationStatus::Retired => {
+                    return Err(MetadataError::RetiredIncarnation {
+                        agent_id: agent_id.to_owned(),
+                        incarnation_id: incarnation_id.to_owned(),
+                    });
+                }
+                IncarnationStatus::Superseded => {
+                    return Err(MetadataError::SupersededIncarnation {
+                        agent_id: agent_id.to_owned(),
+                        incarnation_id: incarnation_id.to_owned(),
+                    });
+                }
+                IncarnationStatus::Active => {}
+            }
+        }
+        let active: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT incarnation_id, failure_domain FROM agent_incarnations
+                 WHERE agent_id = ?1 AND status = 'active'",
+                [agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let outcome = match active {
+            Some((current, _)) if current == incarnation_id => {
+                transaction.execute(
+                    "UPDATE agent_incarnations
+                     SET last_seen_at = unixepoch(), failure_domain = ?2
+                     WHERE incarnation_id = ?1",
+                    params![incarnation_id, failure_domain],
+                )?;
+                IncarnationObservation::Known
+            }
+            Some((previous, _)) => {
+                transaction.execute(
+                    "UPDATE agent_incarnations
+                     SET status = 'superseded', superseded_by = ?2, last_seen_at = unixepoch()
+                     WHERE incarnation_id = ?1",
+                    params![previous, incarnation_id],
+                )?;
+                transaction.execute(
+                    "INSERT INTO agent_incarnations
+                     (incarnation_id, agent_id, failure_domain, status)
+                     VALUES (?1, ?2, ?3, 'active')",
+                    params![incarnation_id, agent_id, failure_domain],
+                )?;
+                IncarnationObservation::Superseded { previous }
+            }
+            None => {
+                transaction.execute(
+                    "INSERT INTO agent_incarnations
+                     (incarnation_id, agent_id, failure_domain, status)
+                     VALUES (?1, ?2, ?3, 'active')",
+                    params![incarnation_id, agent_id, failure_domain],
+                )?;
+                let adopted = transaction.execute(
+                    "UPDATE placements SET incarnation_id = ?2
+                     WHERE agent_id = ?1 AND incarnation_id IS NULL",
+                    params![agent_id, incarnation_id],
+                )?;
+                IncarnationObservation::Adopted {
+                    adopted_placements: adopted,
+                }
+            }
+        };
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    pub fn agent_incarnations(&self) -> Result<Vec<AgentIncarnation>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT agent_id, incarnation_id, failure_domain, status, first_seen_at,
+                    last_seen_at, superseded_by
+             FROM agent_incarnations ORDER BY agent_id, first_seen_at, incarnation_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(agent_id, incarnation_id, failure_domain, status, first, last, by)| {
+                    Ok(AgentIncarnation {
+                        agent_id,
+                        incarnation_id,
+                        failure_domain,
+                        status: IncarnationStatus::from_str(&status)?,
+                        first_seen_at: first,
+                        last_seen_at: last,
+                        superseded_by: by,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Objects the current projection requires: the manifest and every chunk of
+    /// each committed file and the marker of each deleted file. Files blocked
+    /// in recovery are owned by `recover` and are not listed.
+    pub fn required_objects(&self) -> Result<Vec<RequiredObject>, MetadataError> {
+        let mut required = Vec::new();
+        for projection in self.all_file_projections()? {
+            match projection.state {
+                FileState::Committed => {
+                    let manifest_hash = projection
+                        .manifest_hash
+                        .ok_or(MetadataError::MissingManifest)?;
+                    required.push(RequiredObject {
+                        kind: ObjectKind::Manifest,
+                        hash: manifest_hash,
+                        file_id: projection.file_id,
+                        generation: projection.generation,
+                        expected_len: None,
+                    });
+                    let mut statement = self.connection.prepare(
+                        "SELECT ciphertext_hash, ciphertext_len FROM file_chunks
+                         WHERE file_id = ?1 AND generation = ?2 ORDER BY ordinal",
+                    )?;
+                    let chunks = statement
+                        .query_map(
+                            params![
+                                projection.file_id.to_string(),
+                                to_i64(projection.generation)?
+                            ],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                        )?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for (hash, len) in chunks {
+                        required.push(RequiredObject {
+                            kind: ObjectKind::Chunk,
+                            hash: ObjectHash::parse(hash)?,
+                            file_id: projection.file_id,
+                            generation: projection.generation,
+                            expected_len: Some(
+                                u64::try_from(len).map_err(|_| MetadataError::NumericOverflow)?,
+                            ),
+                        });
+                    }
+                }
+                FileState::Deleted => {
+                    let marker = projection
+                        .deletion_hash
+                        .ok_or(MetadataError::MissingDeletionMarker)?;
+                    required.push(RequiredObject {
+                        kind: ObjectKind::DeletionMarker,
+                        hash: marker,
+                        file_id: projection.file_id,
+                        generation: projection.generation,
+                        expected_len: None,
+                    });
+                }
+                FileState::RecoveryBlocked => {}
+            }
+        }
+        Ok(required)
+    }
+
+    pub fn create_reconcile_job(&mut self, mode: JobMode) -> Result<Uuid, MetadataError> {
+        let job_id = Uuid::new_v4();
+        self.connection.execute(
+            "INSERT INTO reconcile_jobs (job_id, kind, mode, started_at, status)
+             VALUES (?1, 'scrub', ?2, unixepoch(), 'running')",
+            params![job_id.to_string(), mode.as_str()],
+        )?;
+        Ok(job_id)
+    }
+
+    pub fn finish_reconcile_job(
+        &mut self,
+        job_id: Uuid,
+        status: JobStatus,
+        report: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        if status == JobStatus::Running {
+            return Err(MetadataError::InvalidJobStatus(
+                "a job cannot finish as running".to_owned(),
+            ));
+        }
+        let changed = self.connection.execute(
+            "UPDATE reconcile_jobs
+             SET status = ?2, completed_at = unixepoch(), report = ?3
+             WHERE job_id = ?1 AND status = 'running'",
+            params![job_id.to_string(), status.as_str(), report],
+        )?;
+        if changed != 1 {
+            return Err(MetadataError::MissingJob(job_id));
+        }
+        Ok(())
+    }
+
+    /// Mark jobs left `running` by a previous process as interrupted. Their
+    /// scans prove nothing; the next job repeats the work.
+    pub fn interrupt_running_jobs(&mut self) -> Result<usize, MetadataError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE scan_observations SET status = 'failed',
+                 completed_at = unixepoch(), detail = 'job interrupted before completion'
+             WHERE status = 'running'",
+            [],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE reconcile_jobs SET status = 'interrupted', completed_at = unixepoch()
+             WHERE status = 'running'",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    pub fn latest_reconcile_job(&self) -> Result<Option<ReconcileJob>, MetadataError> {
+        self.connection
+            .query_row(
+                "SELECT job_id, mode, status, started_at, completed_at, report
+                 FROM reconcile_jobs ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(job_id, mode, status, started, completed, report)| {
+                Ok(ReconcileJob {
+                    job_id: Uuid::parse_str(&job_id)
+                        .map_err(|_| MetadataError::InvalidBinaryField("job id".to_owned()))?,
+                    mode: match mode.as_str() {
+                        "verify" => JobMode::Verify,
+                        "repair" => JobMode::Repair,
+                        other => return Err(MetadataError::InvalidJobStatus(other.to_owned())),
+                    },
+                    status: JobStatus::from_str(&status)?,
+                    started_at: started,
+                    completed_at: completed,
+                    report,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn start_scan(
+        &mut self,
+        job_id: Uuid,
+        agent_id: &str,
+        incarnation_id: &str,
+        kind: ObjectKind,
+    ) -> Result<Uuid, MetadataError> {
+        let scan_id = Uuid::new_v4();
+        self.connection.execute(
+            "INSERT INTO scan_observations
+             (scan_id, job_id, agent_id, incarnation_id, object_kind, started_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), 'running')",
+            params![
+                scan_id.to_string(),
+                job_id.to_string(),
+                agent_id,
+                incarnation_id,
+                kind.as_str()
+            ],
+        )?;
+        Ok(scan_id)
+    }
+
+    pub fn complete_scan(&mut self, completion: &ScanCompletion) -> Result<(), MetadataError> {
+        let changed = self.connection.execute(
+            "UPDATE scan_observations
+             SET status = 'complete', completed_at = unixepoch(), final_cursor = ?2,
+                 object_count = ?3, inventory_digest = ?4
+             WHERE scan_id = ?1 AND status = 'running'",
+            params![
+                completion.scan_id.to_string(),
+                completion.final_cursor.as_ref().map(ObjectHash::as_str),
+                to_i64(completion.object_count)?,
+                completion.inventory_digest
+            ],
+        )?;
+        if changed != 1 {
+            return Err(MetadataError::MissingScan(completion.scan_id));
+        }
+        Ok(())
+    }
+
+    pub fn fail_scan(&mut self, scan_id: Uuid, detail: &str) -> Result<(), MetadataError> {
+        let changed = self.connection.execute(
+            "UPDATE scan_observations
+             SET status = 'failed', completed_at = unixepoch(), detail = ?2
+             WHERE scan_id = ?1 AND status = 'running'",
+            params![scan_id.to_string(), detail],
+        )?;
+        if changed != 1 {
+            return Err(MetadataError::MissingScan(scan_id));
+        }
+        Ok(())
+    }
+
+    /// Latest complete observation per active incarnation and namespace.
+    pub fn latest_complete_scans(&self) -> Result<Vec<CompleteScan>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT agent_id, incarnation_id, object_kind, inventory_digest, completed_at
+             FROM (
+                 SELECT s.agent_id, s.incarnation_id, s.object_kind, s.inventory_digest,
+                        s.completed_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY s.incarnation_id, s.object_kind
+                            ORDER BY s.completed_at DESC, s.rowid DESC
+                        ) AS recency
+                 FROM scan_observations AS s
+                 JOIN agent_incarnations AS i ON i.incarnation_id = s.incarnation_id
+                 WHERE s.status = 'complete' AND i.status = 'active'
+             )
+             WHERE recency = 1
+             ORDER BY agent_id, object_kind",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(agent_id, incarnation_id, kind, inventory_digest, completed_at)| {
+                    Ok(CompleteScan {
+                        agent_id,
+                        incarnation_id,
+                        kind: kind.parse()?,
+                        inventory_digest,
+                        completed_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub fn replace_object_health(
+        &mut self,
+        job_id: Uuid,
+        health: &[ObjectHealth],
+    ) -> Result<(), MetadataError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM object_health", [])?;
+        for object in health {
+            transaction.execute(
+                "INSERT INTO object_health
+                 (object_kind, object_hash, file_id, generation, verified_copies,
+                  verified_domains, state, job_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())",
+                params![
+                    object.kind.as_str(),
+                    object.hash.as_str(),
+                    object.file_id.to_string(),
+                    to_i64(object.generation)?,
+                    to_i64(object.verified_copies as u64)?,
+                    to_i64(object.verified_domains as u64)?,
+                    object.state.as_str(),
+                    job_id.to_string(),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn object_health_summary(&self) -> Result<ObjectHealthSummary, MetadataError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT state, COUNT(*) FROM object_health GROUP BY state")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut summary = ObjectHealthSummary::default();
+        for (state, count) in rows {
+            let count = usize::try_from(count).map_err(|_| MetadataError::NumericOverflow)?;
+            match ObjectHealthState::from_str(&state)? {
+                ObjectHealthState::Durable => summary.durable = count,
+                ObjectHealthState::Degraded => summary.degraded = count,
+                ObjectHealthState::AtRisk => summary.at_risk = count,
+                ObjectHealthState::Lost => summary.lost = count,
+            }
+        }
+        Ok(summary)
+    }
+
+    pub fn unhealthy_objects(&self) -> Result<Vec<ObjectHealth>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT object_kind, object_hash, file_id, generation, verified_copies,
+                    verified_domains, state, job_id, updated_at
+             FROM object_health WHERE state != 'durable'
+             ORDER BY file_id, generation, object_kind, object_hash",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(kind, hash, file_id, generation, copies, domains, state, job, at)| {
+                    Ok(ObjectHealth {
+                        kind: kind.parse()?,
+                        hash: ObjectHash::parse(hash)?,
+                        file_id: Uuid::parse_str(&file_id)
+                            .map_err(|_| MetadataError::InvalidBinaryField("file id".to_owned()))?,
+                        generation: u64::try_from(generation)
+                            .map_err(|_| MetadataError::NumericOverflow)?,
+                        verified_copies: usize::try_from(copies)
+                            .map_err(|_| MetadataError::NumericOverflow)?,
+                        verified_domains: usize::try_from(domains)
+                            .map_err(|_| MetadataError::NumericOverflow)?,
+                        state: ObjectHealthState::from_str(&state)?,
+                        job_id: Uuid::parse_str(&job)
+                            .map_err(|_| MetadataError::InvalidBinaryField("job id".to_owned()))?,
+                        updated_at: at,
+                    })
+                },
+            )
+            .collect()
     }
 
     pub fn confirm_placement(
@@ -435,16 +1276,16 @@ impl Database {
         hash: &ObjectHash,
         agent_id: &str,
     ) -> Result<bool, MetadataError> {
-        let state: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT state FROM placements
-                 WHERE object_kind = ?1 AND object_hash = ?2 AND agent_id = ?3",
-                params![kind.as_str(), hash.as_str(), agent_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(state.as_deref() == Some("confirmed"))
+        let live: bool = self.connection.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM placements
+                 WHERE object_kind = ?1 AND object_hash = ?2 AND agent_id = ?3
+                   AND {LIVE_CONFIRMED})"
+            ),
+            params![kind.as_str(), hash.as_str(), agent_id],
+            |row| row.get(0),
+        )?;
+        Ok(live)
     }
 
     pub fn confirmed_domains(
@@ -453,8 +1294,10 @@ impl Database {
         hash: &ObjectHash,
     ) -> Result<usize, MetadataError> {
         let count: i64 = self.connection.query_row(
-            "SELECT COUNT(DISTINCT failure_domain) FROM placements
-             WHERE object_kind = ?1 AND object_hash = ?2 AND state = 'confirmed'",
+            &format!(
+                "SELECT COUNT(DISTINCT failure_domain) FROM placements
+                 WHERE object_kind = ?1 AND object_hash = ?2 AND {LIVE_CONFIRMED}"
+            ),
             params![kind.as_str(), hash.as_str()],
             |row| row.get(0),
         )?;
@@ -792,11 +1635,11 @@ impl Database {
         kind: ObjectKind,
         hash: &ObjectHash,
     ) -> Result<Vec<String>, MetadataError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare(&format!(
             "SELECT agent_id FROM placements
-             WHERE object_kind = ?1 AND object_hash = ?2 AND state = 'confirmed'
-             ORDER BY agent_id",
-        )?;
+             WHERE object_kind = ?1 AND object_hash = ?2 AND {LIVE_CONFIRMED}
+             ORDER BY agent_id"
+        ))?;
         let agents = statement
             .query_map(params![kind.as_str(), hash.as_str()], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()
@@ -1026,8 +1869,10 @@ fn require_replica_floor(
     minimum_replicas: usize,
 ) -> Result<(), MetadataError> {
     let count: i64 = transaction.query_row(
-        "SELECT COUNT(DISTINCT failure_domain) FROM placements
-         WHERE object_kind = ?1 AND object_hash = ?2 AND state = 'confirmed'",
+        &format!(
+            "SELECT COUNT(DISTINCT failure_domain) FROM placements
+             WHERE object_kind = ?1 AND object_hash = ?2 AND {LIVE_CONFIRMED}"
+        ),
         params![kind.as_str(), hash.as_str()],
         |row| row.get(0),
     )?;
@@ -1199,7 +2044,7 @@ fn metadata_to_sql(error: MetadataError) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(error))
 }
 
-const SCHEMA: &str = r#"
+const BASE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS uploads (
     upload_id TEXT PRIMARY KEY,
     idempotency_key TEXT NOT NULL UNIQUE,
@@ -1241,8 +2086,11 @@ CREATE TABLE IF NOT EXISTS placements (
     object_hash TEXT NOT NULL,
     agent_id TEXT NOT NULL,
     failure_domain TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('pending', 'confirmed')),
+    incarnation_id TEXT,
+    state TEXT NOT NULL CHECK(state IN ('pending', 'confirmed', 'missing', 'corrupt')),
     confirmed_at INTEGER,
+    last_verified_at INTEGER,
+    last_verified_job TEXT,
     PRIMARY KEY(object_kind, object_hash, agent_id)
 );
 
@@ -1322,9 +2170,118 @@ CREATE TABLE IF NOT EXISTS recovery_issues (
     resolved_at INTEGER,
     PRIMARY KEY(file_id, generation, issue_kind)
 );
-
-PRAGMA user_version = 3;
 "#;
+
+const LIFECYCLE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_incarnations (
+    incarnation_id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    failure_domain TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('active', 'superseded', 'retired')),
+    first_seen_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_seen_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    superseded_by TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS agent_incarnations_one_active
+    ON agent_incarnations(agent_id) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS reconcile_jobs (
+    job_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('scrub')),
+    mode TEXT NOT NULL CHECK(mode IN ('verify', 'repair')),
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    status TEXT NOT NULL CHECK(status IN (
+        'running', 'complete', 'failed', 'interrupted'
+    )),
+    report TEXT
+);
+
+CREATE TABLE IF NOT EXISTS scan_observations (
+    scan_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES reconcile_jobs(job_id),
+    agent_id TEXT NOT NULL,
+    incarnation_id TEXT NOT NULL,
+    object_kind TEXT NOT NULL CHECK(object_kind IN (
+        'chunk', 'manifest', 'deletion_marker'
+    )),
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    status TEXT NOT NULL CHECK(status IN ('running', 'complete', 'failed')),
+    final_cursor TEXT,
+    object_count INTEGER,
+    inventory_digest TEXT,
+    detail TEXT,
+    CHECK (status != 'complete' OR (object_count IS NOT NULL AND inventory_digest IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS object_health (
+    object_kind TEXT NOT NULL,
+    object_hash TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    verified_copies INTEGER NOT NULL CHECK(verified_copies >= 0),
+    verified_domains INTEGER NOT NULL CHECK(verified_domains >= 0),
+    state TEXT NOT NULL CHECK(state IN ('durable', 'degraded', 'at_risk', 'lost')),
+    job_id TEXT NOT NULL REFERENCES reconcile_jobs(job_id),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY(object_kind, object_hash)
+);
+"#;
+
+fn apply_schema(connection: &Connection) -> Result<(), MetadataError> {
+    connection.execute_batch(BASE_SCHEMA)?;
+    connection.execute_batch(LIFECYCLE_SCHEMA)?;
+    connection.execute_batch("PRAGMA user_version = 4;")?;
+    Ok(())
+}
+
+/// Rebuild `placements` with incarnation and verification columns and the
+/// expanded state set, then add the lifecycle tables. Existing rows keep a
+/// NULL incarnation until their agent is observed and adopts them.
+fn migrate_v3_to_v4(connection: &mut Connection) -> Result<(), MetadataError> {
+    let migration: Result<(), MetadataError> = (|| {
+        connection.execute_batch("BEGIN IMMEDIATE;")?;
+        if !table_has_column(connection, "placements", "incarnation_id")? {
+            connection.execute_batch(
+                r#"
+ALTER TABLE placements RENAME TO placements_v3;
+
+CREATE TABLE placements (
+    object_kind TEXT NOT NULL CHECK(object_kind IN (
+        'chunk', 'manifest', 'deletion_marker'
+    )),
+    object_hash TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    failure_domain TEXT NOT NULL,
+    incarnation_id TEXT,
+    state TEXT NOT NULL CHECK(state IN ('pending', 'confirmed', 'missing', 'corrupt')),
+    confirmed_at INTEGER,
+    last_verified_at INTEGER,
+    last_verified_job TEXT,
+    PRIMARY KEY(object_kind, object_hash, agent_id)
+);
+
+INSERT INTO placements
+    (object_kind, object_hash, agent_id, failure_domain, state, confirmed_at)
+SELECT object_kind, object_hash, agent_id, failure_domain, state, confirmed_at
+FROM placements_v3;
+
+DROP TABLE placements_v3;
+"#,
+            )?;
+        }
+        connection.execute_batch(LIFECYCLE_SCHEMA)?;
+        connection.execute_batch("PRAGMA user_version = 4; COMMIT;")?;
+        Ok(())
+    })();
+    if migration.is_err() {
+        let _ = connection.execute_batch("ROLLBACK;");
+    }
+    migration?;
+    apply_schema(connection)
+}
 
 fn migrate_v1_to_v3(connection: &mut Connection) -> Result<(), MetadataError> {
     migrate_projection_schema_to_v3(connection, true)
@@ -1495,7 +2452,7 @@ COMMIT;
     }
     connection.pragma_update(None, "foreign_keys", "ON")?;
     migration?;
-    connection.execute_batch(SCHEMA)?;
+    connection.execute_batch(BASE_SCHEMA)?;
     Ok(())
 }
 
@@ -1527,7 +2484,7 @@ fn migrate_recovery_schema_to_v3(
         let _ = connection.execute_batch("ROLLBACK;");
     }
     migration?;
-    connection.execute_batch(SCHEMA)?;
+    connection.execute_batch(BASE_SCHEMA)?;
     Ok(())
 }
 
@@ -1551,6 +2508,7 @@ fn table_has_column(
     let pragma = match table {
         "upload_chunks" => "PRAGMA table_info(upload_chunks)",
         "file_chunks" => "PRAGMA table_info(file_chunks)",
+        "placements" => "PRAGMA table_info(placements)",
         _ => return Err(MetadataError::UnknownSchemaTable(table.to_owned())),
     };
     let mut statement = connection.prepare(pragma)?;
@@ -1572,6 +2530,30 @@ pub enum MetadataError {
     InvalidFileState(String),
     #[error("invalid delete-operation state: {0}")]
     InvalidDeleteState(String),
+    #[error("invalid placement state: {0}")]
+    InvalidPlacementState(String),
+    #[error("invalid agent incarnation status: {0}")]
+    InvalidIncarnationStatus(String),
+    #[error("invalid reconcile job status: {0}")]
+    InvalidJobStatus(String),
+    #[error("invalid object health state: {0}")]
+    InvalidHealthState(String),
+    #[error("agent {agent_id} presented retired incarnation {incarnation_id}; a retired incarnation cannot rejoin")]
+    RetiredIncarnation {
+        agent_id: String,
+        incarnation_id: String,
+    },
+    #[error("agent {agent_id} presented superseded incarnation {incarnation_id}; two incarnations cannot alternate under one agent id")]
+    SupersededIncarnation {
+        agent_id: String,
+        incarnation_id: String,
+    },
+    #[error("deleted file has no deletion marker hash")]
+    MissingDeletionMarker,
+    #[error("reconcile job is not running: {0}")]
+    MissingJob(Uuid),
+    #[error("scan observation is not running: {0}")]
+    MissingScan(Uuid),
     #[error("illegal upload transition from {current:?} to {next:?}")]
     IllegalTransition {
         current: UploadState,
@@ -1857,6 +2839,156 @@ PRAGMA user_version = 1;
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_v3_placements_migrate_to_v4_and_adopt_the_first_incarnation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v3.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(BASE_SCHEMA).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE placements_shadow AS SELECT * FROM placements;
+                 DROP TABLE placements;
+                 CREATE TABLE placements (
+                    object_kind TEXT NOT NULL,
+                    object_hash TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    failure_domain TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('pending', 'confirmed')),
+                    confirmed_at INTEGER,
+                    PRIMARY KEY(object_kind, object_hash, agent_id)
+                 );
+                 DROP TABLE placements_shadow;
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        let hash = ObjectHash::digest(b"object");
+        connection
+            .execute(
+                "INSERT INTO placements VALUES ('chunk', ?1, 'agent-a', 'host-a', 'confirmed', 7)",
+                [hash.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO placements VALUES ('chunk', ?1, 'agent-b', 'host-b', 'confirmed', 8)",
+                [hash.as_str()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut database = Database::open(&path).unwrap();
+        let version: i64 = database
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(
+            database
+                .confirmed_domains(ObjectKind::Chunk, &hash)
+                .unwrap(),
+            2
+        );
+
+        let outcome = database
+            .observe_agent_incarnation("agent-a", "host-a", "inc-a1")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            IncarnationObservation::Adopted {
+                adopted_placements: 1
+            }
+        );
+        assert_eq!(
+            database
+                .observe_agent_incarnation("agent-a", "host-a", "inc-a1")
+                .unwrap(),
+            IncarnationObservation::Known
+        );
+        assert_eq!(
+            database
+                .confirmed_domains(ObjectKind::Chunk, &hash)
+                .unwrap(),
+            2
+        );
+
+        let outcome = database
+            .observe_agent_incarnation("agent-a", "host-a", "inc-a2")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            IncarnationObservation::Superseded {
+                previous: "inc-a1".to_owned()
+            }
+        );
+        assert_eq!(
+            database
+                .confirmed_domains(ObjectKind::Chunk, &hash)
+                .unwrap(),
+            1
+        );
+        assert!(!database
+            .placement_confirmed(ObjectKind::Chunk, &hash, "agent-a")
+            .unwrap());
+        assert!(matches!(
+            database.observe_agent_incarnation("agent-a", "host-a", "inc-a1"),
+            Err(MetadataError::SupersededIncarnation { .. })
+        ));
+
+        database
+            .ensure_pending_placement(ObjectKind::Chunk, &hash, "agent-a", "host-a", "inc-a2")
+            .unwrap();
+        let states = database.placement_states(ObjectKind::Chunk, &hash).unwrap();
+        assert_eq!(
+            states[0],
+            (
+                "agent-a".to_owned(),
+                PlacementState::Pending,
+                Some("inc-a2".to_owned())
+            )
+        );
+        database
+            .confirm_placement(ObjectKind::Chunk, &hash, "agent-a")
+            .unwrap();
+        assert_eq!(
+            database
+                .confirmed_domains(ObjectKind::Chunk, &hash)
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn interrupted_jobs_are_marked_on_open_and_scans_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.sqlite");
+        let mut database = Database::open(&path).unwrap();
+        let job = database.create_reconcile_job(JobMode::Verify).unwrap();
+        let scan = database
+            .start_scan(job, "agent-a", "inc-a1", ObjectKind::Chunk)
+            .unwrap();
+        drop(database);
+
+        let mut database = Database::open(&path).unwrap();
+        let latest = database.latest_reconcile_job().unwrap().unwrap();
+        assert_eq!(latest.job_id, job);
+        assert_eq!(latest.status, JobStatus::Interrupted);
+        assert!(matches!(
+            database.complete_scan(&ScanCompletion {
+                scan_id: scan,
+                final_cursor: None,
+                object_count: 0,
+                inventory_digest: "digest".to_owned(),
+            }),
+            Err(MetadataError::MissingScan(_))
+        ));
+        assert!(matches!(
+            database.finish_reconcile_job(job, JobStatus::Complete, None),
+            Err(MetadataError::MissingJob(_))
+        ));
+        assert!(database.latest_complete_scans().unwrap().is_empty());
     }
 
     #[test]
