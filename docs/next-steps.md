@@ -21,17 +21,19 @@ requirement.
 
 ## Phase 1 — next pass
 
-The implemented contract and dependency graph are in
+The implemented contracts and dependency graph are in
 [m1-storage-contract.md](m1-storage-contract.md) and
-[m1-implementation-plan.md](m1-implementation-plan.md). Passes 1 and 2 now
-provide restart-safe RF2 upload/download, durable logical deletion, strict
-agent inventories, and explicit plan/apply recovery with recovery-only repair.
-M1 remains **In progress**.
+[m1-implementation-plan.md](m1-implementation-plan.md). Passes 1 and 2 plus the
+compatibility-hardening pass now provide restart-safe RF2 upload/download,
+durable logical deletion, strict agent inventories, canonical schema-v3
+migration, and explicit plan/apply recovery with recovery-only repair. M1
+remains **In progress**.
 
 The next lifecycle pass should:
 
-1. Pin the node observation, degraded-placement, retention, and retirement
-   model before any physical deletion.
+1. Implement the node-incarnation, complete-observation, degraded-placement,
+   retention, and retirement model pinned in
+   [m1-lifecycle-contract.md](m1-lifecycle-contract.md).
 2. Add continuous inventory comparison and scrub using the pass-2 inventory
    and verification primitives; keep repair policy explicit and observable.
 3. Implement safe placement movement and node retirement, proving replacement

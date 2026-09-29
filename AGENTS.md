@@ -1,8 +1,9 @@
 # distr-hnsw
 
-Pre-implementation design for a self-hosted, Tailscale-native distributed
-semantic storage service: replicated encrypted blobs plus distributed HNSW
-vector search. The full design is in `DESIGN.md`.
+Self-hosted, Tailscale-native distributed semantic storage service: replicated
+encrypted blobs plus distributed HNSW vector search. Product design lives in
+`DESIGN.md`. M0 is accepted; M1 blob-plane implementation is in progress under
+`crates/distr-hnsw/`.
 
 
 ## Stack
@@ -44,6 +45,8 @@ vector search. The full design is in `DESIGN.md`.
 - `docs/m1-storage-contract.md` — persistent-format and durability contract for
   the implemented M1 blob-plane passes.
 - `docs/m1-implementation-plan.md` — M1 work packages and dependency order.
+- `docs/m1-lifecycle-contract.md` — safety gates for reconciliation, movement,
+  retirement, and physical deletion.
 - `crates/distr-hnsw/` — product service and CLI; keep this separate from the
   disposable phase-0 prototype.
 - `prototype/` — **disposable** phase-0 validation CLI (`distr-hnsw-validate`).
@@ -87,8 +90,10 @@ DESIGN §15 (`docs/phase-0-validation.md`). Do not retune the holdout or grow th
 prototype into product code. M1 is unblocked and starts with the recovery-first
 blob-plane slice in `docs/roadmap.md`.
 
-**M1 status:** In progress. Passes 1 and 2 implement the RF2 commit spine,
-logical deletion, strict inventories, SQLite v2 migration, and explicit
-plan/apply recovery with recovery-only repair. Do not add agent DELETE or GC
-until node observation, retention, and retirement invariants are pinned. Large
-storage/recovery matrices remain `anthonypc` work.
+**M1 status:** In progress. Passes 1, 2, and the compatibility hardening pass
+implement the RF2 commit spine, logical deletion, strict inventories, canonical
+SQLite v3 migration, and explicit plan/apply recovery with recovery-only
+repair. Do not add agent DELETE or GC until
+`docs/m1-lifecycle-contract.md` is implemented and its observation, retention,
+and retirement gates pass. Large storage/recovery matrices remain `anthonypc`
+work.
