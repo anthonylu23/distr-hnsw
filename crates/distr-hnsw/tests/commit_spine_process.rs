@@ -589,3 +589,309 @@ fn recovery_bundle_ceremony_restores_the_key_and_refuses_the_wrong_one() {
     assert_eq!(shown.len(), 32);
     assert!(String::from_utf8_lossy(&verified.stdout).contains(&shown));
 }
+
+/// Empty-infrastructure restore drill (DESIGN §11.1, roadmap M1 exit gate,
+/// light local form): back up, destroy every cluster artifact, and rebuild
+/// from the backup set, the recovery bundle, and an off-cluster passphrase.
+#[test]
+fn empty_infrastructure_restore_drill_rebuilds_files_from_backup_alone() {
+    use std::io::Write as _;
+
+    let binary = Path::new(env!("CARGO_BIN_EXE_distr-hnsw"));
+    let workspace = tempfile::tempdir().unwrap();
+    let cluster = workspace.path().join("cluster");
+    let volume_a = cluster.join("agent-a");
+    let volume_b = cluster.join("agent-b");
+    fs::create_dir_all(&volume_a).unwrap();
+    fs::create_dir_all(&volume_b).unwrap();
+    let (agent_a, target_a) = start_agent(binary, "agent-a", "host-a", &volume_a);
+    let (agent_b, target_b) = start_agent(binary, "agent-b", "host-b", &volume_b);
+    let agents = vec![target_a, target_b];
+    let database = cluster.join("portal.sqlite");
+    let master_key = cluster.join("master.key");
+    let backup_dir = workspace.path().join("offsite");
+    let target = format!("dir:{}", backup_dir.display());
+    let floor = [
+        "--kdf-memory-kib",
+        "19456",
+        "--kdf-time",
+        "2",
+        "--kdf-parallelism",
+        "1",
+    ];
+    let passphrase = "drill passphrase kept off cluster\n";
+
+    let mut init = Command::new(binary)
+        .args(["portal", "init", "--passphrase-stdin", "--database"])
+        .arg(&database)
+        .arg("--master-key")
+        .arg(&master_key)
+        .args(floor)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    init.stdin
+        .take()
+        .unwrap()
+        .write_all(passphrase.as_bytes())
+        .unwrap();
+    let init = init.wait_with_output().unwrap();
+    assert!(init.status.success());
+    let stdout = String::from_utf8(init.stdout).unwrap();
+    let begin = stdout
+        .find("-----BEGIN DISTR-HNSW RECOVERY BUNDLE-----")
+        .unwrap();
+    let end_marker = "-----END DISTR-HNSW RECOVERY BUNDLE-----";
+    let end = stdout.find(end_marker).unwrap() + end_marker.len();
+    // The bundle lives outside the cluster directory, like a printed sheet.
+    let bundle_path = workspace.path().join("bundle.txt");
+    fs::write(&bundle_path, &stdout[begin..end]).unwrap();
+
+    let kept_source = workspace.path().join("kept.bin");
+    let kept_bytes: Vec<u8> = (0..CHUNK_SIZE + 4096)
+        .map(|index| ((index * 7 + 3) % 251) as u8)
+        .collect();
+    fs::write(&kept_source, &kept_bytes).unwrap();
+    let deleted_source = workspace.path().join("deleted.bin");
+    fs::write(&deleted_source, vec![9_u8; 2048]).unwrap();
+    let put_file = |source: &Path, key: &str| {
+        let output = portal_command(binary, "put", &database, &master_key, &agents)
+            .args(["--idempotency-key", key])
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let kept_id = put_file(&kept_source, "drill-kept");
+    let deleted_id = put_file(&deleted_source, "drill-deleted");
+    let delete = portal_command(binary, "delete", &database, &master_key, &agents)
+        .args(["--idempotency-key", "drill-delete"])
+        .arg(&deleted_id)
+        .output()
+        .unwrap();
+    assert!(
+        delete.status.success(),
+        "{}",
+        String::from_utf8_lossy(&delete.stderr)
+    );
+
+    let run_backup = || {
+        let output = Command::new(binary)
+            .args(["portal", "backup", "--database"])
+            .arg(&database)
+            .args(agents.iter().flat_map(|agent| ["--agent", agent.as_str()]))
+            .args(["--target", &target])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let first = run_backup();
+    assert_eq!(first["report_type"], "BackupReportV1");
+    // Two manifests, three chunks, one deletion marker: history is retained.
+    assert_eq!(first["totals"]["history_objects"], 6);
+    assert_eq!(first["totals"]["copied_now"], 6);
+    assert_eq!(first["totals"]["failed"], 0);
+    assert_eq!(first["snapshot_skipped_identical"], false);
+    assert_eq!(first["backup_lag_seconds"], 0);
+    let second = run_backup();
+    assert_eq!(second["totals"]["verified_before"], 6);
+    assert_eq!(second["totals"]["copied_now"], 0);
+    assert_eq!(second["snapshot_skipped_identical"], true);
+    assert_eq!(second["snapshot"]["name"], first["snapshot"]["name"]);
+
+    let health = Command::new(binary)
+        .args(["portal", "health", "--database"])
+        .arg(&database)
+        .output()
+        .unwrap();
+    let health: serde_json::Value = serde_json::from_slice(&health.stdout).unwrap();
+    assert_eq!(health["backup"]["targets"][0]["objects_verified"], 6);
+    assert_eq!(health["backup"]["targets"][0]["objects_pending"], 0);
+    assert_eq!(health["backup"]["recovery_ready"], false);
+
+    // Total loss: agents, volumes, database, key file.
+    drop(agent_a);
+    drop(agent_b);
+    fs::remove_dir_all(&cluster).unwrap();
+    assert!(!database.exists() && !master_key.exists());
+
+    // 1. Key from the bundle and passphrase alone.
+    let restored = workspace.path().join("restored");
+    fs::create_dir_all(&restored).unwrap();
+    let new_key = restored.join("master.key");
+    let mut restore_key = Command::new(binary)
+        .args(["portal", "key", "restore", "--bundle"])
+        .arg(&bundle_path)
+        .arg("--master-key")
+        .arg(&new_key)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    restore_key
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(passphrase.as_bytes())
+        .unwrap();
+    let restore_key = restore_key.wait_with_output().unwrap();
+    assert!(
+        restore_key.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restore_key.stderr)
+    );
+
+    // 2. Metadata from the latest snapshot into a new database path.
+    let new_database = restored.join("portal.sqlite");
+    let metadata = Command::new(binary)
+        .args([
+            "portal",
+            "restore",
+            "metadata",
+            "--target",
+            &target,
+            "--database",
+        ])
+        .arg(&new_database)
+        .output()
+        .unwrap();
+    assert!(
+        metadata.status.success(),
+        "{}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+    assert_eq!(metadata["snapshot"]["name"], first["snapshot"]["name"]);
+    assert!(
+        metadata["catalog"].is_string(),
+        "snapshot hash was checked against a catalog"
+    );
+    let again = Command::new(binary)
+        .args([
+            "portal",
+            "restore",
+            "metadata",
+            "--target",
+            &target,
+            "--database",
+        ])
+        .arg(&new_database)
+        .output()
+        .unwrap();
+    assert!(
+        !again.status.success(),
+        "restore never overwrites a database"
+    );
+
+    // 3. Objects into fresh agents on fresh volumes (new incarnations).
+    let volume_c = restored.join("agent-a");
+    let volume_d = restored.join("agent-b");
+    fs::create_dir_all(&volume_c).unwrap();
+    fs::create_dir_all(&volume_d).unwrap();
+    let (_agent_c, target_c) = start_agent(binary, "agent-a", "host-a", &volume_c);
+    let (_agent_d, target_d) = start_agent(binary, "agent-b", "host-b", &volume_d);
+    let new_agents = vec![target_c, target_d];
+    let objects = Command::new(binary)
+        .args(["portal", "restore", "objects", "--target", &target])
+        .args(
+            new_agents
+                .iter()
+                .flat_map(|agent| ["--agent", agent.as_str()]),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        objects.status.success(),
+        "{}",
+        String::from_utf8_lossy(&objects.stderr)
+    );
+    let objects: serde_json::Value = serde_json::from_slice(&objects.stdout).unwrap();
+    assert_eq!(objects["objects"], 6);
+    assert_eq!(objects["placed"], 12);
+    assert_eq!(objects["failed"], 0);
+
+    // 4. Recovery rebinds placements to the new incarnations and converges.
+    let recover = portal_command(binary, "recover", &new_database, &new_key, &new_agents)
+        .arg("--apply")
+        .output()
+        .unwrap();
+    assert!(
+        recover.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recover.stderr)
+    );
+    let recover: serde_json::Value = serde_json::from_slice(&recover.stdout).unwrap();
+    assert_eq!(recover["totals"]["blocked"], 0);
+    assert_eq!(recover["totals"]["files"], 2);
+
+    // 5. Bytes match; the deleted file stays deleted; health is durable.
+    let destination = restored.join("kept.bin");
+    let get = portal_command(binary, "get", &new_database, &new_key, &new_agents)
+        .arg(&kept_id)
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(
+        get.status.success(),
+        "{}",
+        String::from_utf8_lossy(&get.stderr)
+    );
+    assert_eq!(fs::read(&destination).unwrap(), kept_bytes);
+    let denied = portal_command(binary, "get", &new_database, &new_key, &new_agents)
+        .arg(&deleted_id)
+        .arg(restored.join("deleted.bin"))
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    let scrub = Command::new(binary)
+        .args(["portal", "scrub", "--database"])
+        .arg(&new_database)
+        .args(
+            new_agents
+                .iter()
+                .flat_map(|agent| ["--agent", agent.as_str()]),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        scrub.status.success(),
+        "{}",
+        String::from_utf8_lossy(&scrub.stderr)
+    );
+    let scrub: serde_json::Value = serde_json::from_slice(&scrub.stdout).unwrap();
+    // Kept manifest, its two chunks, and the deletion marker.
+    assert_eq!(scrub["health"]["durable"], 4, "{scrub}");
+
+    // A wrong-key bundle cannot restore against the recovered database.
+    let verify = Command::new(binary)
+        .args(["portal", "key", "restore", "--verify", "--bundle"])
+        .arg(&bundle_path)
+        .arg("--master-key")
+        .arg(restored.join("unused.key"))
+        .arg("--database")
+        .arg(&new_database)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut verify = verify;
+    verify
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(passphrase.as_bytes())
+        .unwrap();
+    assert!(verify.wait().unwrap().success());
+}

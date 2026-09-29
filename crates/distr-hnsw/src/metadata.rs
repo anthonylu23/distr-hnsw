@@ -10,8 +10,9 @@ use crate::{
     object::{ObjectHash, ObjectKind},
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MASTER_KEY_ID_META: &str = "master_key_id";
+const CONTENT_GENERATION_META: &str = "content_generation";
 
 /// SQL predicate selecting placements that count toward the live durability
 /// floor: confirmed rows whose agent incarnation is still active. Legacy rows
@@ -335,6 +336,26 @@ pub struct CompleteScan {
     pub completed_at: i64,
 }
 
+/// A SQLite snapshot shipped to a backup target.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct BackupSnapshot {
+    pub name: String,
+    pub snapshot_hash: String,
+    pub content_generation: i64,
+    pub size: u64,
+    pub created_at: i64,
+}
+
+/// One immutable object referenced by any generation in history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryObject {
+    pub kind: ObjectKind,
+    pub hash: ObjectHash,
+    pub expected_len: Option<u64>,
+    /// When the owning file projection last changed; used for backup lag.
+    pub committed_at: i64,
+}
+
 /// One object the current file projection requires to be durable.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequiredObject {
@@ -512,7 +533,7 @@ impl Database {
                 migrate_v3_to_v4(&mut connection)?;
             }
             3 => migrate_v3_to_v4(&mut connection)?,
-            4 => migrate_v4_to_v5(&connection)?,
+            4 | 5 => apply_schema(&connection)?,
             SCHEMA_VERSION => apply_schema(&connection)?,
             _ => return Err(MetadataError::UnsupportedSchemaVersion(version)),
         }
@@ -554,6 +575,21 @@ impl Database {
         };
         transaction.commit()?;
         Ok(outcome)
+    }
+
+    /// Monotonic counter bumped by every file-visible mutation (commit,
+    /// delete, recovery apply). Backup uses it to skip snapshots when no
+    /// content changed.
+    pub fn content_generation(&self) -> Result<i64, MetadataError> {
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM portal_meta WHERE key = ?1",
+                [CONTENT_GENERATION_META],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.and_then(|text| text.parse().ok()).unwrap_or(0))
     }
 
     pub fn master_key_id(&self) -> Result<Option<String>, MetadataError> {
@@ -1056,10 +1092,252 @@ impl Database {
         Ok(())
     }
 
+    /// Every immutable object any generation in history references, so the
+    /// backup set retains deleted generations until offsite retention expires.
+    pub fn history_objects(&self) -> Result<Vec<HistoryObject>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT 'manifest', m.manifest_hash, NULL, f.updated_at
+             FROM file_manifests AS m JOIN files AS f ON f.file_id = m.file_id
+             UNION ALL
+             SELECT 'chunk', c.ciphertext_hash, c.ciphertext_len, f.updated_at
+             FROM file_chunks AS c JOIN files AS f ON f.file_id = c.file_id
+             UNION ALL
+             SELECT 'deletion_marker', d.marker_hash, NULL, f.updated_at
+             FROM deletion_markers AS d JOIN files AS f ON f.file_id = d.file_id
+             ORDER BY 1, 2",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut objects = Vec::with_capacity(rows.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for (kind, hash, len, committed_at) in rows {
+            if !seen.insert((kind.clone(), hash.clone())) {
+                continue;
+            }
+            objects.push(HistoryObject {
+                kind: kind.parse()?,
+                hash: ObjectHash::parse(hash)?,
+                expected_len: len
+                    .map(|value| u64::try_from(value).map_err(|_| MetadataError::NumericOverflow))
+                    .transpose()?,
+                committed_at,
+            });
+        }
+        Ok(objects)
+    }
+
+    pub fn create_backup_job(&mut self, target_id: &str) -> Result<Uuid, MetadataError> {
+        let job_id = Uuid::new_v4();
+        self.connection.execute(
+            "INSERT INTO backup_jobs (job_id, target_id, started_at, status)
+             VALUES (?1, ?2, unixepoch(), 'running')",
+            params![job_id.to_string(), target_id],
+        )?;
+        Ok(job_id)
+    }
+
+    pub fn finish_backup_job(
+        &mut self,
+        job_id: Uuid,
+        status: JobStatus,
+        report: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        if status == JobStatus::Running {
+            return Err(MetadataError::InvalidJobStatus(
+                "a job cannot finish as running".to_owned(),
+            ));
+        }
+        let changed = self.connection.execute(
+            "UPDATE backup_jobs SET status = ?2, completed_at = unixepoch(), report = ?3
+             WHERE job_id = ?1 AND status = 'running'",
+            params![job_id.to_string(), status.as_str(), report],
+        )?;
+        if changed != 1 {
+            return Err(MetadataError::MissingJob(job_id));
+        }
+        Ok(())
+    }
+
+    pub fn latest_backup_job(
+        &self,
+        target_id: &str,
+    ) -> Result<Option<ReconcileJob>, MetadataError> {
+        self.connection
+            .query_row(
+                "SELECT job_id, status, started_at, completed_at, report
+                 FROM backup_jobs WHERE target_id = ?1
+                 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                [target_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(job_id, status, started, completed, report)| {
+                Ok(ReconcileJob {
+                    job_id: Uuid::parse_str(&job_id)
+                        .map_err(|_| MetadataError::InvalidBinaryField("job id".to_owned()))?,
+                    mode: JobMode::Repair,
+                    status: JobStatus::from_str(&status)?,
+                    started_at: started,
+                    completed_at: completed,
+                    report,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn backup_target_ids(&self) -> Result<Vec<String>, MetadataError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT target_id FROM backup_jobs ORDER BY target_id")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    pub fn backup_object_verified(
+        &self,
+        target_id: &str,
+        kind: ObjectKind,
+        hash: &ObjectHash,
+    ) -> Result<bool, MetadataError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM backup_objects
+                 WHERE target_id = ?1 AND object_kind = ?2 AND object_hash = ?3)",
+                params![target_id, kind.as_str(), hash.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn record_backup_object(
+        &mut self,
+        target_id: &str,
+        kind: ObjectKind,
+        hash: &ObjectHash,
+        size: u64,
+        job_id: Uuid,
+    ) -> Result<(), MetadataError> {
+        self.connection.execute(
+            "INSERT INTO backup_objects
+             (target_id, object_kind, object_hash, size, verified_at, job_id)
+             VALUES (?1, ?2, ?3, ?4, unixepoch(), ?5)
+             ON CONFLICT(target_id, object_kind, object_hash) DO UPDATE SET
+                 verified_at = unixepoch(), job_id = excluded.job_id",
+            params![
+                target_id,
+                kind.as_str(),
+                hash.as_str(),
+                to_i64(size)?,
+                job_id.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn backup_object_count(&self, target_id: &str) -> Result<usize, MetadataError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM backup_objects WHERE target_id = ?1",
+            [target_id],
+            |row| row.get(0),
+        )?;
+        usize::try_from(count).map_err(|_| MetadataError::NumericOverflow)
+    }
+
+    pub fn record_backup_snapshot(
+        &mut self,
+        target_id: &str,
+        name: &str,
+        snapshot_hash: &str,
+        content_generation: i64,
+        size: u64,
+        job_id: Uuid,
+    ) -> Result<(), MetadataError> {
+        self.connection.execute(
+            "INSERT INTO backup_snapshots
+             (target_id, name, snapshot_hash, content_generation, size, job_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                target_id,
+                name,
+                snapshot_hash,
+                content_generation,
+                to_i64(size)?,
+                job_id.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Latest shipped snapshot for a target.
+    pub fn latest_backup_snapshot(
+        &self,
+        target_id: &str,
+    ) -> Result<Option<BackupSnapshot>, MetadataError> {
+        self.connection
+            .query_row(
+                "SELECT name, snapshot_hash, content_generation, size, created_at
+                 FROM backup_snapshots
+                 WHERE target_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                [target_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(name, hash, generation, size, created_at)| {
+                Ok(BackupSnapshot {
+                    name,
+                    snapshot_hash: hash,
+                    content_generation: generation,
+                    size: u64::try_from(size).map_err(|_| MetadataError::NumericOverflow)?,
+                    created_at,
+                })
+            })
+            .transpose()
+    }
+
+    /// Write a transactional, fsynced copy of the database to `path`.
+    pub fn snapshot_into(&self, path: &Path) -> Result<(), MetadataError> {
+        let target = path
+            .to_str()
+            .ok_or_else(|| MetadataError::InvalidBinaryField("snapshot path".to_owned()))?;
+        self.connection.execute("VACUUM INTO ?1", [target])?;
+        Ok(())
+    }
+
     /// Mark jobs left `running` by a previous process as interrupted. Their
     /// scans prove nothing; the next job repeats the work.
     pub fn interrupt_running_jobs(&mut self) -> Result<usize, MetadataError> {
         let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE backup_jobs SET status = 'interrupted', completed_at = unixepoch()
+             WHERE status = 'running'",
+            [],
+        )?;
         transaction.execute(
             "UPDATE scan_observations SET status = 'failed',
                  completed_at = unixepoch(), detail = 'job interrupted before completion'
@@ -1503,6 +1781,7 @@ impl Database {
             "UPDATE uploads SET state = 'committed' WHERE upload_id = ?1",
             [upload_id.to_string()],
         )?;
+        bump_content_generation(&transaction)?;
         transaction.commit()?;
         self.file_by_id(upload.file_id)?
             .ok_or(MetadataError::MissingCommittedFile)
@@ -1679,6 +1958,7 @@ impl Database {
              WHERE operation_id = ?1",
             [operation.operation_id.to_string()],
         )?;
+        bump_content_generation(&transaction)?;
         transaction.commit()?;
         self.delete_by_idempotency(&operation.idempotency_key)?
             .ok_or(MetadataError::MissingDeleteOperation)
@@ -1781,6 +2061,7 @@ impl Database {
             "DELETE FROM recovery_issues WHERE file_id = ?1",
             [manifest.file_id.to_string()],
         )?;
+        bump_content_generation(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1836,6 +2117,7 @@ impl Database {
             "DELETE FROM recovery_issues WHERE file_id = ?1",
             [marker.file_id.to_string()],
         )?;
+        bump_content_generation(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1882,9 +2164,21 @@ impl Database {
              VALUES (?1, ?2, 'recovery_blocked', ?3)",
             params![file_id.to_string(), to_i64(generation)?, issue],
         )?;
+        bump_content_generation(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn bump_content_generation(transaction: &Transaction<'_>) -> Result<(), MetadataError> {
+    transaction.execute(
+        "INSERT INTO portal_meta (key, value) VALUES (?1, '1')
+         ON CONFLICT(key) DO UPDATE SET
+             value = CAST(CAST(portal_meta.value AS INTEGER) + 1 AS TEXT),
+             updated_at = unixepoch()",
+        [CONTENT_GENERATION_META],
+    )?;
+    Ok(())
 }
 
 fn file_projection_transaction(
@@ -2288,16 +2582,49 @@ fn apply_schema(connection: &Connection) -> Result<(), MetadataError> {
     connection.execute_batch(BASE_SCHEMA)?;
     connection.execute_batch(LIFECYCLE_SCHEMA)?;
     connection.execute_batch(META_SCHEMA)?;
-    connection.execute_batch("PRAGMA user_version = 5;")?;
+    connection.execute_batch(BACKUP_SCHEMA)?;
+    connection.execute_batch("PRAGMA user_version = 6;")?;
     Ok(())
 }
 
-/// Schema v5 adds `portal_meta`, which records the bound master-key
-/// identifier. Existing data is untouched; the first key to open the database
-/// binds it.
-fn migrate_v4_to_v5(connection: &Connection) -> Result<(), MetadataError> {
-    apply_schema(connection)
-}
+/// Schema v5 added `portal_meta` (bound master-key identifier); v6 adds the
+/// backup job, object, and snapshot tables. Both are additive, so applying the
+/// full schema migrates either version.
+const BACKUP_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS backup_jobs (
+    job_id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    status TEXT NOT NULL CHECK(status IN (
+        'running', 'complete', 'failed', 'interrupted'
+    )),
+    report TEXT
+);
+
+CREATE TABLE IF NOT EXISTS backup_objects (
+    target_id TEXT NOT NULL,
+    object_kind TEXT NOT NULL CHECK(object_kind IN (
+        'chunk', 'manifest', 'deletion_marker'
+    )),
+    object_hash TEXT NOT NULL,
+    size INTEGER NOT NULL CHECK(size >= 0),
+    verified_at INTEGER NOT NULL,
+    job_id TEXT NOT NULL REFERENCES backup_jobs(job_id),
+    PRIMARY KEY(target_id, object_kind, object_hash)
+);
+
+CREATE TABLE IF NOT EXISTS backup_snapshots (
+    target_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    content_generation INTEGER NOT NULL,
+    size INTEGER NOT NULL CHECK(size >= 0),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    job_id TEXT NOT NULL REFERENCES backup_jobs(job_id),
+    PRIMARY KEY(target_id, name)
+);
+"#;
 
 const META_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS portal_meta (

@@ -9,6 +9,7 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use distr_hnsw::{
     agent::{bind_and_serve_agent, AgentIdentity},
+    backup::{self, BackupTargetSpec},
     crypto::MasterKey,
     metadata::{Database, JobMode, KeyBinding},
     portal::{prepare_agents, AgentTarget, Failpoint, FailpointAction, Portal},
@@ -128,10 +129,50 @@ enum PortalCommand {
         #[arg(long)]
         interval: Option<u64>,
     },
-    /// Print persisted lifecycle health without contacting agents.
+    /// Print persisted lifecycle and backup health without contacting agents.
     Health {
         #[arg(long)]
         database: PathBuf,
+    },
+    /// Copy every historical object to a backup target, verify each copy,
+    /// ship a SQLite snapshot, and write a catalog. Needs no master key.
+    Backup {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long = "agent", required = true)]
+        agents: Vec<AgentTarget>,
+        /// Backup target, e.g. `dir:/mnt/backup`.
+        #[arg(long)]
+        target: BackupTargetSpec,
+        /// Repeat continuously, sleeping this many seconds between jobs.
+        #[arg(long)]
+        interval: Option<u64>,
+    },
+    /// Rebuild a portal from a backup set.
+    Restore {
+        #[command(subcommand)]
+        command: RestoreCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RestoreCommand {
+    /// Restore the latest (or named) SQLite snapshot into a new database file.
+    Metadata {
+        #[arg(long)]
+        target: BackupTargetSpec,
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        snapshot: Option<String>,
+    },
+    /// Copy every backed-up object into the agents at RF2, read-back verified.
+    /// Run `portal recover --apply` afterwards to rebuild file records.
+    Objects {
+        #[arg(long)]
+        target: BackupTargetSpec,
+        #[arg(long = "agent", required = true)]
+        agents: Vec<AgentTarget>,
     },
 }
 
@@ -464,6 +505,54 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(())
             }
+            PortalCommand::Backup {
+                database: database_path,
+                agents,
+                target,
+                interval,
+            } => {
+                let agents = prepare_agents(agents)?;
+                let mut database = Database::open(&database_path)?;
+                let client = reqwest::Client::new();
+                loop {
+                    let report =
+                        backup::backup(&mut database, &agents, &client, &target, &database_path)
+                            .await?;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    match interval {
+                        Some(seconds) => {
+                            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+                        }
+                        None => {
+                            if report.exit_code() == 2 {
+                                std::process::exit(2);
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            PortalCommand::Restore { command } => match command {
+                RestoreCommand::Metadata {
+                    target,
+                    database,
+                    snapshot,
+                } => {
+                    let report = backup::restore_metadata(&target, &database, snapshot.as_deref())?;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(())
+                }
+                RestoreCommand::Objects { target, agents } => {
+                    let agents = prepare_agents(agents)?;
+                    let report =
+                        backup::restore_objects(&target, &agents, &reqwest::Client::new()).await?;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    if report.exit_code() == 2 {
+                        std::process::exit(2);
+                    }
+                    Ok(())
+                }
+            },
         },
     }
 }

@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod backup;
 pub mod crypto;
 pub mod durability;
 pub mod format;

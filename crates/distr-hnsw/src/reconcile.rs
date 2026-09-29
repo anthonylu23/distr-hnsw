@@ -140,6 +140,7 @@ pub struct HealthReportV1 {
     pub latest_complete_scans: Vec<ScanSummary>,
     pub health: ObjectHealthSummary,
     pub unhealthy_objects: Vec<ObjectHealth>,
+    pub backup: crate::backup::BackupStatusV1,
 }
 
 impl HealthReportV1 {
@@ -181,6 +182,8 @@ pub fn health_report(database: &Database) -> Result<HealthReportV1, ScrubError> 
         latest_complete_scans,
         health: database.object_health_summary()?,
         unhealthy_objects: database.unhealthy_objects()?,
+        backup: crate::backup::backup_status(database)
+            .map_err(|error| ScrubError::Backup(error.to_string()))?,
     })
 }
 
@@ -874,4 +877,6 @@ pub enum ScrubError {
     Object(#[from] crate::object::ObjectError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("backup status unavailable: {0}")]
+    Backup(String),
 }
