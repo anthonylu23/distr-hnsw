@@ -20,7 +20,12 @@ encrypted blobs plus distributed HNSW vector search. Product design lives in
 - Preserve storage, durability, and epoch invariants; call out any intentional
   tradeoff or deviation.
 - As you work, update the AGENTS.md and documentation.
-- I am currently developing on my personal laptop. This machine should only be used for developement and light testing. For larger tests where we might have large artifacts (like testing storage flow), use anthonylu@anthony pc on my tailscale network.
+- Two machines share this repository over Tailscale: the MacBook (`ssh
+  macbook`, development and light testing) and the Fedora desktop `anthonypc`
+  (RTX 3060 Ti, btrfs). Sessions may run on either; check `hostname` first.
+  Large tests with large artifacts (storage flows, GPU embedding, corruption
+  and movement matrices) belong on `anthonypc`. Both checkouts track
+  `origin/main`; sync through git, not by copying trees.
 
 ## Documentation
 
@@ -47,6 +52,10 @@ encrypted blobs plus distributed HNSW vector search. Product design lives in
 - `docs/m1-implementation-plan.md` — M1 work packages and dependency order.
 - `docs/m1-lifecycle-contract.md` — safety gates for reconciliation, movement,
   retirement, and physical deletion.
+- `docs/m1-filesystem-qualification.md` — durable-write review per filesystem
+  and the power-loss drill still owed.
+- `docs/m1-phase-1-decisions.md` — proposed answers to the phase-1 key
+  custody, backup, and admission questions (awaiting ratification).
 - `crates/distr-hnsw/` — product service and CLI; keep this separate from the
   disposable phase-0 prototype.
 - `prototype/` — **disposable** phase-0 validation CLI (`distr-hnsw-validate`).
@@ -90,10 +99,12 @@ DESIGN §15 (`docs/phase-0-validation.md`). Do not retune the holdout or grow th
 prototype into product code. M1 is unblocked and starts with the recovery-first
 blob-plane slice in `docs/roadmap.md`.
 
-**M1 status:** In progress. Passes 1, 2, and the compatibility hardening pass
-implement the RF2 commit spine, logical deletion, strict inventories, canonical
-SQLite v3 migration, and explicit plan/apply recovery with recovery-only
-repair. Do not add agent DELETE or GC until
-`docs/m1-lifecycle-contract.md` is implemented and its observation, retention,
-and retirement gates pass. Large storage/recovery matrices remain `anthonypc`
-work.
+**M1 status:** In progress. Passes 1 through 3 implement the RF2 commit spine,
+logical deletion, strict inventories, canonical SQLite v4 migration, explicit
+plan/apply recovery with recovery-only repair, agent incarnations,
+complete-scan observations, durability health, and copy-first scrub/repair
+(`portal scrub`, `portal health`). Next: movement and retirement, quota
+admission, dry-run GC. Do not add agent DELETE until every gate in
+`docs/m1-lifecycle-contract.md` passes. Tests use `TMPDIR=target/` via
+`.cargo/config.toml` so they run on a real filesystem. Large storage/recovery
+matrices remain `anthonypc` work.

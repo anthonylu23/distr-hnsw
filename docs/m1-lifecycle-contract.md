@@ -90,8 +90,17 @@ the proof above.
 ## Implementation order
 
 1. Persist agent incarnations, complete scan observations, desired-placement
-   health, and restartable reconcile jobs.
+   health, and restartable reconcile jobs. **Implemented** (pass 3): see
+   `m1-storage-contract.md`, "Agent incarnations" and "Scrub and durability
+   health". A newly observed incarnation supersedes the active one
+   automatically; the superseded one is refused if it returns. Legacy
+   placement rows are adopted by the first incarnation observed for their
+   agent, an accepted migration limitation that live revalidation and scrub
+   correct.
 2. Add continuous inventory comparison and scrub/repair without DELETE.
+   **Implemented** (pass 3): `portal scrub [--repair] [--interval]`.
+   Unreferenced objects (older generations, staging garbage) are counted but
+   not verified or persisted; GC planning owns them.
 3. Add copy-first movement and formal retirement.
 4. Add quota/headroom admission and ENOSPC failure injection.
 5. Add proof-producing GC planning; keep it dry-run.

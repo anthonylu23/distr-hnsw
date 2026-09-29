@@ -23,33 +23,45 @@ requirement.
 
 The implemented contracts and dependency graph are in
 [m1-storage-contract.md](m1-storage-contract.md) and
-[m1-implementation-plan.md](m1-implementation-plan.md). Passes 1 and 2 plus the
-compatibility-hardening pass now provide restart-safe RF2 upload/download,
-durable logical deletion, strict agent inventories, canonical schema-v3
-migration, and explicit plan/apply recovery with recovery-only repair. M1
-remains **In progress**.
+[m1-implementation-plan.md](m1-implementation-plan.md). Passes 1 through 3
+provide restart-safe RF2 upload/download, durable logical deletion, strict
+agent inventories, canonical schema-v4 migration, explicit plan/apply
+recovery, agent incarnations, complete-scan observations, durability health,
+and copy-first scrub/repair. M1 remains **In progress**.
+
+Decisions awaiting the owner (2026-09-29):
+
+- Ratify or amend the three proposals in
+  [m1-phase-1-decisions.md](m1-phase-1-decisions.md): master-key recovery
+  bundle, first backup target with RPO/retention defaults, and over-budget
+  admission. Once ratified, update DESIGN §10, §11, §11.1, §15 first.
 
 The next lifecycle pass should:
 
-1. Implement the node-incarnation, complete-observation, degraded-placement,
-   retention, and retirement model pinned in
-   [m1-lifecycle-contract.md](m1-lifecycle-contract.md).
-2. Add continuous inventory comparison and scrub using the pass-2 inventory
-   and verification primitives; keep repair policy explicit and observable.
-3. Implement safe placement movement and node retirement, proving replacement
-   durability before old-copy removal.
-4. Add quota/admission behavior and then GC only for generations proven
-   unreachable after the retention horizon.
-5. Run large storage, corruption, and movement matrices on `anthonypc`, not the
-   laptop.
+1. Implement copy-first placement movement and formal node retirement
+   (`m1-lifecycle-contract.md`, order steps 3), proving replacement
+   durability before any obsolete placement is marked orphaned.
+2. Add quota/headroom admission and ENOSPC failure injection (step 4) per
+   decision 3 once ratified.
+3. Add proof-producing GC planning in dry-run mode (step 5); agent DELETE
+   stays unimplemented until stale-node, interrupted-move, retention, and
+   proof-invalidation tests pass (step 6).
+4. Run the `dm-log-writes` power-loss drill from
+   [m1-filesystem-qualification.md](m1-filesystem-qualification.md) on
+   `anthonypc` for btrfs, ext4, and XFS, and add the fsync fault-injection
+   test it recommends.
+5. Run large storage, corruption, and movement matrices on `anthonypc`.
 
-In parallel, resolve supported-filesystem qualification, the first versioned
-backup target, SQLite history restore, and independent master-key recovery.
-The empty-infrastructure restore drill waits for those inputs and remains the
-M1 exit gate.
+In parallel, implement the key-custody and backup lanes from the decisions
+page. The empty-infrastructure restore drill waits for those inputs and
+remains the M1 exit gate.
 
 ## Ops notes
 
+- Sessions may run directly on `anthonypc`; the MacBook is reachable as
+  `ssh macbook`. Both checkouts track `origin/main`.
+- Tests write temporary data under `target/` (see `.cargo/config.toml`), not
+  tmpfs, so durability tests exercise the real filesystem.
 - `ssh anthonylu@anthonypc` may require a one-time Tailscale SSH browser check.
 - Remote `OLLAMA_HOST` is `127.0.0.1:11434` (no scheme); the CLI normalizes this.
 - Canonical corpus stage: `~/distr-hnsw-proto/corpora/mixed-v4-20260719`

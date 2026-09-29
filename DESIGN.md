@@ -278,7 +278,11 @@ the blob plane never depends on the vector plane.
   failure domains. The default class desires RF3 and requires at least two
   durable copies; a single-copy acknowledgement is an explicit opt-in unsafe
   class, never an implicit degraded mode. Placements are `pending` /
-  `confirmed` / `orphaned` — an explicit state machine.
+  `confirmed` / `orphaned` — an explicit state machine — and scrub records
+  verification outcomes (`missing`, `corrupt`) on the same rows without
+  removing them. Every placement is bound to an immutable agent incarnation;
+  a wiped volume returning under the same name is a new incarnation whose
+  predecessor's copies no longer count.
 - **Scrub + reconcile + move**: agents re-hash locally; the portal audits
   replica counts and policy conformance and schedules rate-limited repairs.
 - **Agents stay dumb.** PUT/GET/DELETE/list/health. All intelligence lives

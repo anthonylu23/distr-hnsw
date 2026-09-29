@@ -1,7 +1,7 @@
 # M1 storage contract
 
 This document pins the implemented M1 blob-plane contract through the
-compatibility-hardening pass after pass 2. It is subordinate to `DESIGN.md` and
+lifecycle observation and scrub pass (pass 3). It is subordinate to `DESIGN.md` and
 `docs/roadmap.md`; later M1 work may extend these rules but must not weaken
 their durability or recovery invariants.
 
@@ -18,10 +18,12 @@ treats RF2 as a floor when extra agents fail, live-revalidates every required
 object before file or tombstone commit, and lets already-committed idempotent
 retries succeed without a source file or live agents.
 
-Agents remain loopback-only and unauthenticated for M1 development. Physical
-deletion, continuous reconciliation, movement, node retirement, quotas, GC,
-offsite backup, independent key recovery, and blank-infrastructure restore are
-not implemented. Until the full M1 exit gate passes, the service must not hold
+Pass 3 adds immutable agent incarnations, complete-scan observations,
+placement verification states, per-object durability health, and a
+copy-first scrub/repair job that never deletes. Agents remain loopback-only
+and unauthenticated for M1 development. Physical deletion, movement, node
+retirement, quotas, GC, offsite backup, independent key recovery, and
+blank-infrastructure restore are not implemented. Until the full M1 exit gate passes, the service must not hold
 the only copy of a file or claim recovery readiness.
 
 ## Immutable object namespaces
@@ -37,8 +39,37 @@ objects/<kind>/<hash[0..2]>/<hash[2..4]>/<hash>
 Agents treat bytes as opaque. PUT verifies the supplied digest before
 acknowledgement; GET verifies stored bytes. Acknowledgement follows a
 same-directory temporary write, file sync, atomic rename, and parent-directory
-sync. Linux uses `fsync`; macOS requests `F_FULLFSYNC` for regular files and
-uses directory `fsync` for rename persistence.
+sync. Linux uses `fsync`. On macOS both the file and directory syncs issue
+`F_FULLFSYNC` (the standard library's `sync_all` does so on Apple targets);
+whether a directory `F_FULLFSYNC` persists a rename on APFS is unverified, and
+no filesystem is yet qualified for power loss. See
+[m1-filesystem-qualification.md](m1-filesystem-qualification.md).
+
+## Agent incarnations
+
+Each volume carries an immutable incarnation identity, a UUID created durably
+on first open and reported by `GET /v1/health` as `incarnation_id` beside the
+configured `id` and `failure_domain`. A wiped or replaced volume yields a new
+incarnation even under the same agent name; a malformed identity file fails
+the agent closed.
+
+The portal records every reported incarnation in `agent_incarnations` with
+status `active`, `superseded`, or `retired`, and at most one active
+incarnation per agent id. On contact:
+
+- the first incarnation ever seen for an agent id becomes active and adopts
+  that agent's legacy placement rows (rows without an incarnation);
+- the same incarnation refreshes `last_seen_at`;
+- a different incarnation supersedes the active one; the previous
+  incarnation's placements no longer count toward the durability floor and
+  are reset to `pending` when the object is next written to that agent;
+- a superseded or retired incarnation presenting itself again is refused, so
+  two volumes cannot alternate under one name and a retired node cannot
+  rejoin. Formal retirement is a later pass.
+
+Every placement counted toward RF2 must be `confirmed` on an active
+incarnation (or a not-yet-adopted legacy row). Upload, delete, recovery, and
+scrub all verify identity and incarnation before recording any placement.
 
 `GET /v1/inventory/{kind}?after=<hash>&limit=<n>` returns hash-sorted
 `{objects:[{hash,size}],next_after}` pages. The cursor is exclusive and the
@@ -80,7 +111,7 @@ or returns the same success. A key reused for another file conflicts; a new key
 for an already deleted file returns `AlreadyDeleted`. Logical deletion never
 calls agent DELETE and never removes older manifests or chunks.
 
-## SQLite schema v3
+## SQLite schema v4
 
 Schema v3 stores `files` as the current projection with generation and
 `committed`, `deleted`, or `recovery_blocked` state. It adds immutable
@@ -89,12 +120,20 @@ Schema v3 stores `files` as the current projection with generation and
 kinds. Per-chunk envelope versions are persisted in upload and recovered-file
 history; manifest v1 implies chunk envelope v1.
 
+Schema v4 rebuilds `placements` with `incarnation_id`, `last_verified_at`,
+and `last_verified_job` columns and the state set `pending`, `confirmed`,
+`missing`, `corrupt`. It adds `agent_incarnations`, `reconcile_jobs`,
+`scan_observations`, and `object_health`. Migrated placement rows keep a NULL
+incarnation until their agent is observed. Opening a database marks any job
+still `running` from a previous process as `interrupted` and fails its open
+scans; interrupted scans prove nothing.
+
 The two earlier development lines both used schema version 2 for incompatible
 layouts. Opening a v2 database inspects its table shape and atomically migrates
 either the audited commit-spine layout or the recovery-history layout to
-canonical v3. V1 also migrates directly to v3. Existing manifest bytes,
-ciphertext hashes, and chunk-v1 AAD remain unchanged. Unknown or unrecognized
-schema layouts fail closed.
+canonical v3, then to v4. V1 also migrates through v3 to v4. Existing manifest
+bytes, ciphertext hashes, and chunk-v1 AAD remain unchanged. Unknown or
+unrecognized schema layouts fail closed.
 
 ## Recovery contract
 
@@ -119,6 +158,43 @@ or corrupt required objects persist a recovery issue and make a live winner
 when its marker cannot regain RF2. Wrong keys, malformed inventories,
 unavailable agents, or another untrustworthy global scan abort without
 mutation.
+
+## Scrub and durability health
+
+`portal scrub` needs no master key. It verifies each configured agent's
+identity and incarnation, then lists every namespace with strict paginated
+inventories. A namespace is observed only when every page arrived in
+hash-sorted order and the final page carried no cursor; each observation is
+persisted in `scan_observations` with its incarnation, final cursor, object
+count, and BLAKE3 inventory digest. A malformed page fails that scan and
+proves nothing.
+
+The required set is derived from the projection: the manifest and every
+chunk of each `committed` file and the marker of each `deleted` file. Files
+in `recovery_blocked` belong to `recover`. For every required object and
+every reachable agent, scrub reads the listed copy and checks its hash and
+size, recording `confirmed` or `corrupt`; a copy absent from a complete scan
+of an active incarnation is recorded `missing` if a placement row existed.
+Copies on unreachable agents or behind failed scans stay in their recorded
+state and are reported as unverified. Verification never removes rows or
+objects.
+
+Per-object health is persisted in `object_health` from the copies verified in
+this job: `lost` (no valid copy), `at_risk` (fewer than two verified failure
+domains), `degraded` (floor met but a configured copy is missing or corrupt,
+or fewer copies than desired), or `durable`. Only `confirmed` placements on
+active incarnations serve downloads and count toward commit.
+
+`portal scrub --repair` restores non-durable objects copy-first: PUT the
+verified bytes to a destination, read them back and hash-verify, and only
+then confirm the placement. A corrupt copy is replaced in place by the
+agent's atomic rename; nothing is deleted first. Repair runs only under a
+complete observation (every agent reachable, every scan complete); otherwise
+repairs are deferred and reported. `--interval` repeats the job
+continuously. `portal health` prints the persisted job, incarnation, scan,
+and health state without contacting agents. Exit status is 0 only for a
+complete observation with every required object durable, 2 otherwise, and 1
+for an identity, incarnation, or operational failure.
 
 ## Named crash boundaries
 

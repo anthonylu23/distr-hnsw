@@ -1,0 +1,5 @@
+# Keep test temporary directories on the real filesystem under target/ rather
+# than /tmp, which is tmpfs on Fedora. Durability tests must exercise a disk-
+# backed filesystem; see docs/m1-filesystem-qualification.md.
+[env]
+TMPDIR = { value = "target", relative = true }

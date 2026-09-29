@@ -6,17 +6,23 @@ next dependency boundary.
 
 ## Current status
 
-Passes 1 and 2 plus the compatibility-hardening pass are implemented locally.
-The product crate provides loopback agents plus portal `init`, `put`, `get`,
-`delete`, and `recover` commands. Pass 2 adds deletion-marker v1, paginated
+Passes 1, 2, the compatibility-hardening pass, and pass 3 (lifecycle
+observation and scrub) are implemented and pushed. The product crate provides
+loopback agents plus portal `init`, `put`, `get`, `delete`, `recover`,
+`scrub`, and `health` commands. Pass 2 adds deletion-marker v1, paginated
 inventories, plan/apply recovery reports, highest-generation selection,
 recovery-only RF2 repair, per-file convergence, and fail-closed recovery
 issues. The hardening pass integrates the audited commit spine, introduces
-canonical SQLite schema v3, and migrates both prior schema-v2 layouts.
+canonical SQLite schema v3, and migrates both prior schema-v2 layouts. Pass 3
+adds agent incarnations, complete-scan observations, placement verification
+states, per-object durability health, and copy-first scrub/repair on schema
+v4.
 
-This is not M1 acceptance. Physical lifecycle work, continuous reconciliation,
-supported-filesystem review, offsite backup, independent key recovery, portal
-metadata restore, and the blank-infrastructure drill remain open.
+This is not M1 acceptance. Movement, retirement, quotas, GC, offsite backup,
+independent key recovery, portal metadata restore, filesystem power-loss
+qualification, and the blank-infrastructure drill remain open. The three
+phase-1 design questions have proposed answers awaiting ratification in
+[`m1-phase-1-decisions.md`](m1-phase-1-decisions.md).
 
 ## Pass 1 — commit spine
 
@@ -63,6 +69,26 @@ downloadable. Those gates now pass in the light local matrix.
 This pass exits when all Pass 1 and Pass 2 regression suites run against the
 same source tree and every supported historical schema fixture converges on v3.
 
+## Pass 3 — lifecycle observation and scrub
+
+1. Give every volume an immutable incarnation identity and report it from
+   agent health; record, adopt, supersede, and refuse incarnations in the
+   portal (`docs/m1-lifecycle-contract.md`, "Node identity and observation").
+2. Persist reconcile jobs and per-namespace scan observations with final
+   cursor, count, and inventory digest; mark interrupted jobs on open.
+3. Verify every required copy by reading it back; record `confirmed`,
+   `corrupt`, or `missing` on placement rows without deleting anything.
+4. Derive and persist per-object health; expose it with `portal health`.
+5. Repair copy-first under a complete observation only; defer otherwise.
+6. Exercise healthy repeatability, corruption, deletion of a copy, a wiped
+   volume returning under the same name, a superseded incarnation returning,
+   a malformed inventory, an unreachable agent, deleted-file requirements,
+   and the CLI end to end.
+
+Pass 3 exits when every required object's durability is observable from
+persisted state and a lost or corrupt copy is restored without any physical
+deletion. Those gates pass in the light local matrix on btrfs.
+
 ### Validation
 
 Run on the development machine:
@@ -73,8 +99,10 @@ cargo clippy -p distr-hnsw --all-targets -- -D warnings
 cargo test -p distr-hnsw
 ```
 
-The process-level test launches two real agent children and abruptly exits the
-portal at each crash boundary. Larger future storage matrices belong on
+`.cargo/config.toml` points `TMPDIR` at `target/` so tests exercise the real
+filesystem rather than tmpfs. The process-level tests launch two real agent
+children, abruptly exit the portal at each crash boundary, and drive `scrub`
+and `health` through the binary. Larger storage matrices belong on
 `anthonypc`.
 
 ## Parallel lanes for the next pass
@@ -91,8 +119,11 @@ The safety model for that owner is pinned in
 
 ## Remaining M1 passes
 
-- continuous scrub/reconciliation and explicit degraded-state reporting;
-- safe movement, quotas, observation, retirement, and garbage collection;
+- copy-first placement movement and formal node retirement;
+- quota/headroom admission and ENOSPC failure injection;
+- proof-producing GC planning (dry-run first) and, last, agent DELETE;
 - versioned offsite backup, SQLite history replication, and independent key
-  recovery;
+  recovery (proposals in `m1-phase-1-decisions.md`);
+- filesystem power-loss qualification drill
+  (`m1-filesystem-qualification.md`);
 - portal-loss and empty-infrastructure restore drills.
