@@ -33,8 +33,10 @@ The three phase-1 decisions were ratified on 2026-09-29 and recorded in
 DESIGN §10, §11, §11.1, §15; see
 [m1-phase-1-decisions.md](m1-phase-1-decisions.md) for the tests each must
 pass. Lane B (key custody) is implemented: bound key identifier, recovery
-bundle v1, `portal key` commands. Lane C (backup set with `VACUUM INTO`
-snapshot shipping, directory adapter, then S3-compatible) is next.
+bundle v1, `portal key` commands. Lane C's first target is implemented:
+backup set v1, directory adapter, `VACUUM INTO` snapshot shipping, catalogs,
+backup status, and `restore metadata` / `restore objects`, proven by a light
+local empty-infrastructure drill.
 
 The next lifecycle pass should:
 
@@ -52,9 +54,10 @@ The next lifecycle pass should:
    test it recommends.
 5. Run large storage, corruption, and movement matrices on `anthonypc`.
 
-In parallel, implement lane C from the decisions page. The
-empty-infrastructure restore drill waits for it and remains the M1 exit
-gate.
+In parallel, finish lane C: the S3-compatible adapter with governance-mode
+Object Lock against MinIO on `anthonypc`, retention and expiry of deleted
+generations, weekly integrity sampling, and the representative drill with
+recorded RPO/RTO. That drill remains the M1 exit gate.
 
 ## Ops notes
 

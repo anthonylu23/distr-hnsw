@@ -104,9 +104,11 @@ logical deletion, strict inventories, canonical SQLite v5 migration, explicit
 plan/apply recovery with recovery-only repair, agent incarnations,
 complete-scan observations, durability health, and copy-first scrub/repair
 (`portal scrub`, `portal health`). Lane B adds the bound master-key id and
-recovery bundle (`portal key`). Phase-1 decisions are ratified (DESIGN §10,
-§11.1, §15). Next: lane C backup set, then movement and retirement, quota
-admission, dry-run GC. Do not add agent DELETE until every gate in
+recovery bundle (`portal key`); lane C adds backup set v1 with a directory
+target and restore (`portal backup`, `portal restore`), drilled locally.
+Phase-1 decisions are ratified (DESIGN §10, §11.1, §15). Next: S3-compatible
+target with Object Lock, then movement and retirement, quota admission,
+dry-run GC. Do not add agent DELETE until every gate in
 `docs/m1-lifecycle-contract.md` passes. Tests use `TMPDIR=target/` via
 `.cargo/config.toml` so they run on a real filesystem. Large storage/recovery
 matrices remain `anthonypc` work.

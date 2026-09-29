@@ -1,8 +1,8 @@
 # M1 storage contract
 
 This document pins the implemented M1 blob-plane contract through the
-lifecycle observation and scrub pass (pass 3) and the master-key custody
-lane. It is subordinate to `DESIGN.md` and
+lifecycle observation and scrub pass (pass 3), the master-key custody lane,
+and the backup-set lane. It is subordinate to `DESIGN.md` and
 `docs/roadmap.md`; later M1 work may extend these rules but must not weaken
 their durability or recovery invariants.
 
@@ -21,10 +21,13 @@ retries succeed without a source file or live agents.
 
 Pass 3 adds immutable agent incarnations, complete-scan observations,
 placement verification states, per-object durability health, and a
-copy-first scrub/repair job that never deletes. Agents remain loopback-only
-and unauthenticated for M1 development. Physical deletion, movement, node
-retirement, quotas, GC, offsite backup, independent key recovery, and
-blank-infrastructure restore are not implemented. Until the full M1 exit gate passes, the service must not hold
+copy-first scrub/repair job that never deletes. The custody and backup lanes
+add the bound key identifier, recovery bundle, backup set v1 with a
+versioned-directory target, and the restore path that rebuilt a cluster
+from backup alone in the light local drill. Agents remain loopback-only and
+unauthenticated for M1 development. Physical deletion, movement, node
+retirement, quotas, GC, the S3-compatible target, and the representative
+restore drill on `anthonypc` are not implemented. Until the full M1 exit gate passes, the service must not hold
 the only copy of a file or claim recovery readiness.
 
 ## Immutable object namespaces
@@ -143,7 +146,54 @@ or returns the same success. A key reused for another file conflicts; a new key
 for an already deleted file returns `AlreadyDeleted`. Logical deletion never
 calls agent DELETE and never removes older manifests or chunks.
 
-## SQLite schema v5
+## Backup set v1
+
+`portal backup --target dir:<path>` needs no master key. It copies every
+immutable object any generation in history references (manifests, chunks,
+deletion markers), so deleted generations stay in the set until offsite
+retention expires. Each object is fetched from an agent with a hash-verified
+live copy, written to `backup/v1/objects/<kind>/<hash>` with `create_new`
+semantics (identical bytes are accepted, different bytes are a conflict),
+read back from the target and hash-verified, and only then recorded in
+`backup_objects`. A verified object is skipped on later runs; the job is
+restartable.
+
+A `VACUUM INTO` snapshot of the database is shipped to
+`backup/v1/sqlite/<utc>-<hash8>.db`, read back and verified, whenever the
+content generation changed since the last shipped snapshot. The content
+generation is a `portal_meta` counter bumped by file commit, delete commit,
+and recovery apply; backup bookkeeping alone does not trigger a snapshot.
+Each job then writes `backup/v1/catalog/<utc>-<job>.json` listing the
+verified objects, the snapshot, and the bound key identifier. Objects are
+self-verifying by content address; the catalog is advisory and the set's
+authenticity rests on the target's versioning and immutability.
+
+`portal health` reports per target the last job, verified and pending object
+counts, backup lag (age of the oldest unverified object's file change), and
+the last snapshot. `recovery_ready` is always false until the representative
+empty-infrastructure drill has passed for the deployment.
+
+The versioned-directory adapter provides layout-level immutability only and
+durable writes through the same temp-write, sync, link, directory-sync
+sequence as agents. Offsite protection requires a rotated or remote disk; the
+S3-compatible adapter with Object Lock is the first supported network target
+and is not yet implemented.
+
+### Restore
+
+`portal restore metadata --target … --database <new>` copies the latest (or
+named) snapshot into a path that must not exist and checks its hash against
+the newest catalog that names it. `portal restore objects --target … --agent
+…` copies every backed-up object into the agents until two distinct failure
+domains hold read-back-verified copies; it needs neither key nor database.
+`portal recover --apply` then rebinds placements to the new incarnations and
+converges file records. The light local drill (`commit_spine_process.rs`)
+destroys agents, volumes, database, and key file, then rebuilds from the
+backup set, the recovery bundle, and an off-cluster passphrase, and
+downloads the committed file byte for byte while the deleted file stays
+unreadable.
+
+## SQLite schema v6
 
 Schema v3 stores `files` as the current projection with generation and
 `committed`, `deleted`, or `recovery_blocked` state. It adds immutable
@@ -159,12 +209,14 @@ and `last_verified_job` columns and the state set `pending`, `confirmed`,
 incarnation until their agent is observed. Opening a database marks any job
 still `running` from a previous process as `interrupted` and fails its open
 scans; interrupted scans prove nothing. Schema v5 adds `portal_meta`, which
-holds the bound master-key identifier.
+holds the bound master-key identifier and the content generation. Schema v6
+adds `backup_jobs`, `backup_objects`, and `backup_snapshots`.
 
 The two earlier development lines both used schema version 2 for incompatible
 layouts. Opening a v2 database inspects its table shape and atomically migrates
 either the audited commit-spine layout or the recovery-history layout to
-canonical v3, then v4, then v5. V1 also migrates through the same chain. Existing manifest
+canonical v3, then v4, then v6 (v5 and v6 are additive). V1 also migrates
+through the same chain. Existing manifest
 bytes, ciphertext hashes, and chunk-v1 AAD remain unchanged. Unknown or
 unrecognized schema layouts fail closed.
 

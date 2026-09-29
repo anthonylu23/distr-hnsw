@@ -231,7 +231,10 @@ bytes, durability is undemonstrated and `DESIGN.md` §11.1 forbids claiming it.
 - Note: the Rust `object_store` crate is a candidate for both adapters;
   confirm conditional-put support before adopting it.
 
-**Status: Ratified 2026-09-29 with the snapshot amendment; not yet implemented (lane C).**
+**Status: Ratified 2026-09-29 with the snapshot amendment; directory adapter,
+snapshot shipping, catalogs, status, and restore implemented and drilled
+locally. S3-compatible adapter, retention/expiry, integrity sampling, and the
+representative `anthonypc` drill remain before this closes for M1.**
 
 ---
 
