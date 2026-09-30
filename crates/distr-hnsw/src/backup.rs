@@ -357,7 +357,20 @@ pub struct BackupReportV1 {
     pub snapshot_skipped_identical: bool,
     pub catalog: String,
     pub backup_lag_seconds: i64,
+    /// Result of re-downloading and hashing a sample of previously verified
+    /// objects from the target, when requested.
+    pub integrity_sample: Option<IntegritySample>,
     pub issues: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IntegritySample {
+    pub sampled_at: i64,
+    pub requested: usize,
+    pub sampled: usize,
+    pub valid: usize,
+    pub corrupt: Vec<String>,
+    pub missing: Vec<String>,
 }
 
 impl BackupReportV1 {
@@ -380,6 +393,21 @@ pub async fn backup(
     spec: &BackupTargetSpec,
     snapshot_path_hint: &Path,
 ) -> Result<BackupReportV1, BackupError> {
+    backup_with_sample(database, agents, client, spec, snapshot_path_hint, 0).await
+}
+
+/// Like [`backup`], additionally re-downloading and hashing `sample`
+/// previously verified objects spread across the set (integrity sampling,
+/// DESIGN §11.1). A corrupt or missing offsite copy is an issue, not a
+/// silent re-copy: the target is expected to be immutable.
+pub async fn backup_with_sample(
+    database: &mut Database,
+    agents: &[AgentTarget],
+    client: &reqwest::Client,
+    spec: &BackupTargetSpec,
+    snapshot_path_hint: &Path,
+    sample: usize,
+) -> Result<BackupReportV1, BackupError> {
     let target = spec.open().await?;
     let target_id = spec.id();
     let job_id = database.create_backup_job(&target_id)?;
@@ -391,6 +419,7 @@ pub async fn backup(
         &target_id,
         job_id,
         snapshot_path_hint,
+        sample,
     )
     .await;
     match result {
@@ -407,6 +436,7 @@ pub async fn backup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_backup(
     database: &mut Database,
     agents: &[AgentTarget],
@@ -415,6 +445,7 @@ async fn run_backup(
     target_id: &str,
     job_id: Uuid,
     snapshot_path_hint: &Path,
+    sample: usize,
 ) -> Result<BackupReportV1, BackupError> {
     let history = database.history_objects()?;
     let mut totals = BackupTotals {
@@ -539,6 +570,38 @@ async fn run_backup(
         objects: catalog_objects,
         snapshot: snapshot.clone(),
     };
+    // Integrity sampling: every k-th verified object by hash order, offset by
+    // the job id so successive runs cover different objects.
+    let integrity_sample = if sample > 0 {
+        let verified: Vec<&CatalogObject> = catalog.objects.iter().collect();
+        let mut record = IntegritySample {
+            sampled_at: now,
+            requested: sample,
+            ..IntegritySample::default()
+        };
+        if !verified.is_empty() {
+            let stride = (verified.len() / sample).max(1);
+            let offset = (job_id.as_u128() % stride as u128) as usize;
+            for object in verified.iter().skip(offset).step_by(stride).take(sample) {
+                let hash = ObjectHash::parse(object.hash.clone())
+                    .map_err(|error| BackupError::S3(format!("catalog hash: {error}")))?;
+                let path = object_path(object.kind, &hash);
+                record.sampled += 1;
+                match target.get(&path).await? {
+                    Some(bytes) if ObjectHash::digest(&bytes) == hash => record.valid += 1,
+                    Some(_) => record.corrupt.push(path),
+                    None => record.missing.push(path),
+                }
+            }
+        }
+        for path in record.corrupt.iter().chain(record.missing.iter()) {
+            issues.push(format!("offsite copy {path} failed integrity sampling"));
+        }
+        Some(record)
+    } else {
+        None
+    };
+
     let catalog_name = format!("{}-{job_id}.json", utc_stamp(now));
     target
         .put_new(
@@ -557,6 +620,7 @@ async fn run_backup(
         snapshot_skipped_identical: skipped,
         catalog: catalog_name,
         backup_lag_seconds: oldest_unverified.map_or(0, |oldest| (now - oldest).max(0)),
+        integrity_sample,
         issues,
     })
 }
@@ -607,6 +671,12 @@ pub struct BackupTargetStatus {
     pub backup_lag_seconds: i64,
     pub last_snapshot: Option<SnapshotRecord>,
     pub last_snapshot_at: Option<i64>,
+    pub last_integrity_sample: Option<IntegritySample>,
+}
+
+#[derive(Deserialize)]
+struct ReportSampleOnly {
+    integrity_sample: Option<IntegritySample>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -634,8 +704,16 @@ pub fn backup_status(database: &Database) -> Result<BackupStatusV1, BackupError>
             }
         }
         let snapshot = database.latest_backup_snapshot(&target_id)?;
+        let last_job = database.latest_backup_job(&target_id)?;
+        let last_integrity_sample = last_job
+            .as_ref()
+            .filter(|job| job.status == JobStatus::Complete)
+            .and_then(|job| job.report.as_deref())
+            .and_then(|report| serde_json::from_str::<ReportSampleOnly>(report).ok())
+            .and_then(|report| report.integrity_sample);
         targets.push(BackupTargetStatus {
-            last_job: database.latest_backup_job(&target_id)?,
+            last_job,
+            last_integrity_sample,
             objects_verified: database.backup_object_count(&target_id)?,
             objects_pending: pending,
             backup_lag_seconds: oldest.map_or(0, |oldest| (now - oldest).max(0)),

@@ -159,6 +159,10 @@ enum PortalCommand {
         /// Repeat continuously, sleeping this many seconds between jobs.
         #[arg(long)]
         interval: Option<u64>,
+        /// Re-download and hash this many previously verified objects each
+        /// run (integrity sampling).
+        #[arg(long, default_value_t = 0)]
+        verify_sample: usize,
     },
     /// Rebuild a portal from a backup set.
     Restore {
@@ -582,14 +586,21 @@ async fn main() -> anyhow::Result<()> {
                 agents,
                 target,
                 interval,
+                verify_sample,
             } => {
                 let agents = prepare_agents(agents)?;
                 let mut database = Database::open(&database_path)?;
                 let client = reqwest::Client::new();
                 loop {
-                    let report =
-                        backup::backup(&mut database, &agents, &client, &target, &database_path)
-                            .await?;
+                    let report = backup::backup_with_sample(
+                        &mut database,
+                        &agents,
+                        &client,
+                        &target,
+                        &database_path,
+                        verify_sample,
+                    )
+                    .await?;
                     println!("{}", serde_json::to_string_pretty(&report)?);
                     match interval {
                         Some(seconds) => {
