@@ -998,6 +998,7 @@ dependencies = [
 name = "distr-hnsw-index"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "proptest",
  "rayon",
  "thiserror 2.0.18",

@@ -14,9 +14,10 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use distr_hnsw_index::{
     distance::{distance, normalize},
+    hnsw::{Hnsw, HnswParams},
     oracle::{recall, recall_by_distance, search},
     vector::FlatVectors,
-    Metric, RecordId,
+    Hit, Metric, RecordId,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,34 @@ enum Command {
         /// are always measured single-threaded on a sample.
         #[arg(long)]
         threads: Option<usize>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Build an HNSW graph over a dataset and report recall and latency at
+    /// one or more `ef_search` values.
+    Hnsw {
+        dataset: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Comma-separated ef_search values.
+        #[arg(long, default_value = "50,100,200")]
+        ef: String,
+        #[arg(long, default_value_t = 16)]
+        m: usize,
+        #[arg(long, default_value_t = 200)]
+        ef_construction: usize,
+        /// Use only the first N base vectors (default: all).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Use only the first N queries (default: all).
+        #[arg(long)]
+        queries: Option<usize>,
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Insert sequentially (the WAL apply path) instead of the parallel
+        /// bulk build.
+        #[arg(long)]
+        sequential: bool,
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -162,6 +191,39 @@ struct BenchReportV1 {
     batch_threads: usize,
     host: String,
     source_revision: String,
+}
+
+#[derive(Serialize)]
+struct HnswReportV1 {
+    report_type: &'static str,
+    version: u16,
+    dataset: String,
+    metric: String,
+    dims: usize,
+    base_count: usize,
+    queries_evaluated: usize,
+    k: usize,
+    parameters: BTreeMap<String, serde_json::Value>,
+    build_seconds: f64,
+    build_vectors_per_second: f64,
+    accounted_bytes: usize,
+    accounted_bytes_per_vector: f64,
+    rss_bytes_after_build: u64,
+    max_level: u8,
+    points: Vec<EfPoint>,
+    host: String,
+    source_revision: String,
+}
+
+#[derive(Serialize)]
+struct EfPoint {
+    ef_search: usize,
+    recall_at_k: f64,
+    recall_min: f64,
+    id_recall_at_k: f64,
+    latency_single_thread_ms: Percentiles,
+    batch_queries_per_second: f64,
+    batch_threads: usize,
 }
 
 #[derive(Serialize)]
@@ -300,7 +362,191 @@ fn main() -> anyhow::Result<()> {
             println!("{json}");
             Ok(())
         }
+        Command::Hnsw {
+            dataset,
+            k,
+            ef,
+            m,
+            ef_construction,
+            limit,
+            queries,
+            threads,
+            sequential,
+            out,
+        } => {
+            let loaded = load(&dataset)?;
+            if k > loaded.manifest.groundtruth_k {
+                bail!(
+                    "k={k} exceeds ground-truth depth {}",
+                    loaded.manifest.groundtruth_k
+                );
+            }
+            let base_count = limit.unwrap_or(loaded.base.len()).min(loaded.base.len());
+            if base_count < loaded.base.len() {
+                eprintln!(
+                    "note: ground truth covers the full base; recall against a {base_count}-row prefix is a lower bound"
+                );
+            }
+            let count = queries
+                .unwrap_or(loaded.queries.len())
+                .min(loaded.queries.len());
+            let threads = threads.unwrap_or_else(num_threads);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build_global()
+                .ok();
+            let efs: Vec<usize> = ef
+                .split(',')
+                .map(|v| v.trim().parse::<usize>())
+                .collect::<Result<_, _>>()
+                .context("parsing --ef")?;
+
+            let params = HnswParams {
+                m,
+                m0: 2 * m,
+                ef_construction,
+                seed: 0x5eed,
+            };
+            eprintln!(
+                "building HNSW over {base_count} vectors (m={m}, ef_construction={ef_construction}, {})",
+                if sequential { "sequential" } else { "parallel" }
+            );
+            let started = Instant::now();
+            let index = if sequential {
+                let mut index = Hnsw::new(loaded.base.dims(), loaded.metric, params);
+                for slot in 0..base_count {
+                    index.insert(loaded.base.get(slot as RecordId).unwrap())?;
+                    if slot % 100_000 == 99_999 {
+                        eprintln!(
+                            "  {} inserted, {:.0} vectors/s",
+                            slot + 1,
+                            (slot + 1) as f64 / started.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+                index
+            } else {
+                let mut subset = FlatVectors::with_capacity(loaded.base.dims(), base_count);
+                for slot in 0..base_count {
+                    // Rows were normalized on load for cosine; store as given.
+                    subset.push(loaded.base.get(slot as RecordId).unwrap(), Metric::L2)?;
+                }
+                Hnsw::build_parallel(subset, loaded.metric, params)
+            };
+            let build_seconds = started.elapsed().as_secs_f64();
+            let rss = rss_bytes();
+            eprintln!(
+                "built in {build_seconds:.1}s; max level {}",
+                index.max_level()
+            );
+
+            let mut points = Vec::new();
+            for &ef_search in &efs {
+                let sample = count.min(200);
+                let mut latencies = Vec::with_capacity(sample);
+                for index_q in 0..sample {
+                    let query = loaded.queries.get(index_q as RecordId).unwrap();
+                    let started = Instant::now();
+                    let hits = index.search(query, k, ef_search, None);
+                    latencies.push(started.elapsed().as_secs_f64() * 1e3);
+                    std::hint::black_box(hits);
+                }
+                let started = Instant::now();
+                let per_query: Vec<(f64, f64)> = (0..count)
+                    .into_par_iter()
+                    .map(|index_q| {
+                        let query = loaded.queries.get(index_q as RecordId).unwrap();
+                        let hits = index.search(query, k, ef_search, None);
+                        recalls(&loaded, index_q, query, &hits, k)
+                    })
+                    .collect();
+                let batch_seconds = started.elapsed().as_secs_f64();
+                let n = per_query.len().max(1) as f64;
+                points.push(EfPoint {
+                    ef_search,
+                    recall_at_k: per_query.iter().map(|r| r.0).sum::<f64>() / n,
+                    recall_min: per_query.iter().map(|r| r.0).fold(1.0, f64::min),
+                    id_recall_at_k: per_query.iter().map(|r| r.1).sum::<f64>() / n,
+                    latency_single_thread_ms: percentiles(latencies),
+                    batch_queries_per_second: count as f64 / batch_seconds,
+                    batch_threads: threads,
+                });
+                eprintln!(
+                    "  ef={ef_search}: recall@{k}={:.4} p50={:.3}ms qps={:.0}",
+                    points.last().unwrap().recall_at_k,
+                    points.last().unwrap().latency_single_thread_ms.p50,
+                    points.last().unwrap().batch_queries_per_second
+                );
+            }
+
+            let mut parameters = BTreeMap::new();
+            parameters.insert("m".to_owned(), serde_json::json!(m));
+            parameters.insert("m0".to_owned(), serde_json::json!(2 * m));
+            parameters.insert(
+                "ef_construction".to_owned(),
+                serde_json::json!(ef_construction),
+            );
+            parameters.insert("seed".to_owned(), serde_json::json!(params.seed));
+            parameters.insert(
+                "build".to_owned(),
+                serde_json::json!(if sequential { "sequential" } else { "parallel" }),
+            );
+            let report = HnswReportV1 {
+                report_type: "HnswReportV1",
+                version: 1,
+                dataset: loaded.manifest.name.clone(),
+                metric: loaded.metric.as_str().to_owned(),
+                dims: loaded.base.dims(),
+                base_count,
+                queries_evaluated: count,
+                k,
+                parameters,
+                build_seconds,
+                build_vectors_per_second: base_count as f64 / build_seconds,
+                accounted_bytes: index.accounted_bytes(),
+                accounted_bytes_per_vector: index.accounted_bytes() as f64
+                    / base_count.max(1) as f64,
+                rss_bytes_after_build: rss,
+                max_level: index.max_level(),
+                points,
+                host: hostname(),
+                source_revision: option_env!("DISTR_HNSW_REV")
+                    .unwrap_or("unknown")
+                    .to_owned(),
+            };
+            let json = serde_json::to_string_pretty(&report)?;
+            if let Some(out) = out {
+                fs::write(&out, &json)?;
+            }
+            println!("{json}");
+            Ok(())
+        }
     }
+}
+
+fn rss_bytes() -> u64 {
+    fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .map(|pages| pages * 4096)
+        .unwrap_or(0)
+}
+
+/// Distance-based and id-based recall for one query against the reference.
+fn recalls(loaded: &Dataset, index: usize, query: &[f32], hits: &[Hit], k: usize) -> (f64, f64) {
+    let truth = &loaded.groundtruth[index][..k];
+    let kth = truth
+        .iter()
+        .map(|id| {
+            let row = loaded.base.get(*id).expect("ground-truth id in range");
+            distance(loaded.metric, query, row)
+        })
+        .fold(f32::MIN, f32::max);
+    (recall_by_distance(kth, hits, k), recall(truth, hits))
 }
 
 fn num_threads() -> usize {

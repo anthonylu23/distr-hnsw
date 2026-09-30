@@ -6,6 +6,7 @@
 //! (`docs/m3-implementation-plan.md`). No networking, no async runtime.
 
 pub mod distance;
+pub mod hnsw;
 pub mod oracle;
 pub mod vector;
 
