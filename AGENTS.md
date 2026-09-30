@@ -54,8 +54,10 @@ encrypted blobs plus distributed HNSW vector search. Product design lives in
   retirement, and physical deletion.
 - `docs/m1-filesystem-qualification.md` — durable-write review per filesystem
   and the power-loss drill still owed.
-- `docs/m1-phase-1-decisions.md` — proposed answers to the phase-1 key
-  custody, backup, and admission questions (awaiting ratification).
+- `docs/m1-phase-1-decisions.md` — ratified phase-1 decisions (key custody,
+  backup target, admission) and the tests each must pass.
+- `docs/m1-restore-drill.md` — empty-infrastructure restore drill evidence.
+- `scripts/` — operational drills (`power-loss-drill.sh`, `restore-drill.sh`).
 - `crates/distr-hnsw/` — product service and CLI; keep this separate from the
   disposable phase-0 prototype.
 - `prototype/` — **disposable** phase-0 validation CLI (`distr-hnsw-validate`).

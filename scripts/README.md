@@ -55,3 +55,20 @@ leftover count from `losetup -a` and `dmsetup ls`. Nothing outside
 
 Do not run this on the laptop; it needs root and a Linux block layer. It
 takes about 10 seconds per filesystem on `anthonypc`.
+
+## restore-drill.sh
+
+Empty-infrastructure restore drill (roadmap M1 exit gate). Builds a
+three-agent cluster, commits and deletes files, backs up, destroys the
+database, key, and volumes, and rebuilds from the backup set, the recovery
+bundle, and the passphrase; verifies every kept file by SHA-256 and every
+deleted file stays unreadable; records declared vs. actual RPO/RTO. Results
+and interpretation: [docs/m1-restore-drill.md](../docs/m1-restore-drill.md).
+
+```sh
+scripts/restore-drill.sh --files 64 --max-mib 8            # local directory target
+scripts/restore-drill.sh --target s3:bucket/prefix          # offsite target
+```
+
+Needs no root. Writes `$HOME/distr-hnsw-drill/restore-report-<utc>.json`
+and exits 0 only on a `pass` verdict.

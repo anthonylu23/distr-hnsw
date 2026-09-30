@@ -39,9 +39,11 @@ v1 (versioned-directory target, snapshot shipping, restore) are implemented,
 and a light local empty-infrastructure drill passes through the binary. Pass 4 adds copy-first drain, floor-proving retirement, capacity admission,
 and proof-based garbage collection with agent DELETE. The `dm-log-writes`
 power-loss drill passed on btrfs, ext4, and XFS (loop devices, kernel
-7.1.9; physical drive cache untested). The full M1 gate remains open pending
-the S3-compatible target with retention, and the representative restore
-drill on `anthonypc` with recorded RPO/RTO. See [m1-implementation-plan.md](m1-implementation-plan.md),
+7.1.9; physical drive cache untested). The representative empty-infrastructure restore drill passed on
+`anthonypc` with the versioned-directory target
+([m1-restore-drill.md](m1-restore-drill.md)). The full M1 gate remains open
+pending the S3-compatible offsite target with retention and a rerun of the
+drill against it. See [m1-implementation-plan.md](m1-implementation-plan.md),
 [m1-filesystem-qualification.md](m1-filesystem-qualification.md), and the
 proposed decisions in [m1-phase-1-decisions.md](m1-phase-1-decisions.md).
 

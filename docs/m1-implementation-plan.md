@@ -25,9 +25,10 @@ with its `init` ceremony and `key` commands. Lane C adds backup set v1
 backup status in `health`, and `restore metadata` / `restore objects`.
 
 This is not M1 acceptance. The S3-compatible target with Object Lock,
-offsite retention and integrity sampling, and the representative
-empty-infrastructure drill on `anthonypc` remain open. The power-loss drill
-qualified btrfs, ext4, and XFS with caveats. The light local drill passes through the binary. The three phase-1 design questions
+offsite retention and integrity sampling, and the S3 rerun of the restore
+drill remain open. The power-loss drill qualified btrfs, ext4, and XFS with
+caveats, and the representative restore drill passed with the directory
+target (`m1-restore-drill.md`). The light local drill passes through the binary. The three phase-1 design questions
 were ratified on 2026-09-29; see
 [`m1-phase-1-decisions.md`](m1-phase-1-decisions.md).
 
@@ -189,4 +190,4 @@ The safety model for that owner is pinned in
 - a real `ENOSPC` injection on a small loop-device filesystem on `anthonypc`;
 - power-loss drill extensions (deletion markers, concurrent writers, a
   physical volume);
-- portal-loss and empty-infrastructure restore drills.
+- the S3 rerun of the empty-infrastructure restore drill.

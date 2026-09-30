@@ -45,9 +45,9 @@ remains for M1:
 
 1. Land the S3-compatible backup target with Object Lock (MinIO test
    double), then offsite retention/expiry and integrity sampling.
-2. Run the representative empty-infrastructure restore drill on `anthonypc`
-   with the S3 target and record declared vs. actual RPO/RTO as the M1
-   evidence package.
+2. Rerun `scripts/restore-drill.sh --target s3:...` against the S3 target
+   and attach the report to [m1-restore-drill.md](m1-restore-drill.md); the
+   directory-target run already passed.
 3. Inject a real `ENOSPC` on a small loop-device filesystem and confirm the
    507 mapping and admission behavior end to end; extend the power-loss
    drill to deletion markers and concurrent writers.
