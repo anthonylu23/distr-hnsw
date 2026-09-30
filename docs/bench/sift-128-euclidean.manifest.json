@@ -1,0 +1,27 @@
+{
+  "manifest_type": "BenchDatasetV1",
+  "version": 1,
+  "name": "sift-128-euclidean",
+  "source": "https://ann-benchmarks.com/sift-128-euclidean.hdf5",
+  "source_file_blake3": "67cf88746e8b1659c63c45b5592f6fc16ed94bbcb02f98951c78675432e88933",
+  "converted_with": "scripts/bench/convert-annb.py",
+  "metric": "l2",
+  "dims": 128,
+  "base_count": 1000000,
+  "query_count": 10000,
+  "groundtruth_k": 100,
+  "files": {
+    "base.f32le": {
+      "bytes": 512000000,
+      "blake3": "469b86b5ecc294e9a73b8a96861dae52069c9b31c84b6c24f861aeccec35fa4a"
+    },
+    "queries.f32le": {
+      "bytes": 5120000,
+      "blake3": "f4729314ed05edd8108139169dafaab32d0e0d9291582630fa199041d45d80aa"
+    },
+    "groundtruth.i32le": {
+      "bytes": 4000000,
+      "blake3": "5510175aa33f2819a77b70591107ccbfc13ed3b607c1e543fea227ac8ba5129d"
+    }
+  }
+}

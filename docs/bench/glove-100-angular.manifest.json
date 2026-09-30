@@ -1,0 +1,27 @@
+{
+  "manifest_type": "BenchDatasetV1",
+  "version": 1,
+  "name": "glove-100-angular",
+  "source": "https://ann-benchmarks.com/glove-100-angular.hdf5",
+  "source_file_blake3": "804223f5dfd56998e9d1a616ed39f218590ec9e83c4dd7f292637998bfc856f1",
+  "converted_with": "scripts/bench/convert-annb.py",
+  "metric": "cosine",
+  "dims": 100,
+  "base_count": 1183514,
+  "query_count": 10000,
+  "groundtruth_k": 100,
+  "files": {
+    "base.f32le": {
+      "bytes": 473405600,
+      "blake3": "b3481891ce34951cc61f34ed7a15a2cc83da1e57fee7abcfc7c633e112968527"
+    },
+    "queries.f32le": {
+      "bytes": 4000000,
+      "blake3": "35fcb914ff83e1b16874fd3166ade0722ed6a98a17b59144296f0e78d125fe21"
+    },
+    "groundtruth.i32le": {
+      "bytes": 4000000,
+      "blake3": "82273ec7dfe3d909206ffea59440ce392d727427fbaf5596e7ba0b76fdf42c51"
+    }
+  }
+}

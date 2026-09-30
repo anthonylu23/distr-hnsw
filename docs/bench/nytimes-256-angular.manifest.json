@@ -1,0 +1,27 @@
+{
+  "manifest_type": "BenchDatasetV1",
+  "version": 1,
+  "name": "nytimes-256-angular",
+  "source": "https://ann-benchmarks.com/nytimes-256-angular.hdf5",
+  "source_file_blake3": "6a7cd61df0c81a89182ae631e8893376fcac9ab0364261433cc6de90ca0496fb",
+  "converted_with": "scripts/bench/convert-annb.py",
+  "metric": "cosine",
+  "dims": 256,
+  "base_count": 290000,
+  "query_count": 10000,
+  "groundtruth_k": 100,
+  "files": {
+    "base.f32le": {
+      "bytes": 296960000,
+      "blake3": "4c4bee5243540c4a394b779b4a00c1ceadd2e7f7274f38d01c54b78f33e57a5d"
+    },
+    "queries.f32le": {
+      "bytes": 10240000,
+      "blake3": "f91b4de19e99c94050b74ad9740e9b62848183dd1a2f101aa6c3b24912943c83"
+    },
+    "groundtruth.i32le": {
+      "bytes": 4000000,
+      "blake3": "b9d8c7aedc7fc2670d90823f9ec5de5471683e45caea54870e455d23abc4007e"
+    }
+  }
+}
