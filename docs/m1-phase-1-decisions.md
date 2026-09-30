@@ -231,10 +231,11 @@ bytes, durability is undemonstrated and `DESIGN.md` §11.1 forbids claiming it.
 - Note: the Rust `object_store` crate is a candidate for both adapters;
   confirm conditional-put support before adopting it.
 
-**Status: Ratified 2026-09-29 with the snapshot amendment; directory adapter,
-snapshot shipping, catalogs, status, and restore implemented and drilled
-locally. S3-compatible adapter, retention/expiry, integrity sampling, and the
-representative `anthonypc` drill remain before this closes for M1.**
+**Status: Ratified 2026-09-29 with the snapshot amendment; implemented and
+drilled (directory and S3 targets, snapshot shipping, catalogs, integrity
+sampling, status, restore; `m1-restore-drill.md`). Retention and expiry are
+delegated to bucket lifecycle and Object Lock configuration rather than a
+portal expiry job (accepted limitation). Closed for M1 on 2026-09-30.**
 
 ---
 

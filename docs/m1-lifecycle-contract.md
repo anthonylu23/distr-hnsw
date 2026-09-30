@@ -105,8 +105,9 @@ the proof above.
    `portal drain [--dry-run]`, `portal retire`.
 4. Add quota/headroom admission and ENOSPC failure injection.
    **Implemented** (pass 4): agent capacity policy with HTTP 507 refusals,
-   portal two-domain admission with CLI exit 3. Real `ENOSPC` is mapped by
-   errno; the test matrix exercises quota exhaustion, not a full filesystem.
+   portal two-domain admission with CLI exit 3. Real `ENOSPC` on a loop
+   device is exercised by `scripts/enospc-drill.sh`
+   (`m1-capacity-drill.md`).
 5. Add proof-producing GC planning; keep it dry-run. **Implemented**
    (pass 4): `portal gc` records a proof per object.
 6. Add agent DELETE only after stale-node, interrupted-move, retention, and

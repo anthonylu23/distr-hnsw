@@ -1,7 +1,7 @@
 # M1 empty-infrastructure restore drill
 
-Status: **passed on `anthonypc` with the versioned-directory target
-(2026-09-30)**. The S3-compatible offsite rerun is pending that adapter.
+Status: **passed on `anthonypc` with both the versioned-directory target and
+the S3-compatible target (MinIO with Object Lock), 2026-09-30.**
 
 This is the evidence package the roadmap requires for the M1 exit gate: a
 representative cluster is destroyed and rebuilt into empty infrastructure
@@ -56,6 +56,26 @@ Step timings (seconds): commit 7.3, backup 3.7, destroy 0.2, key restore
 0.1, restore metadata 0.02, restore objects 4.3, recover 3.1, scrub repair
 2.8, verify 3.8.
 
+## Result with the S3-compatible target (run `20260930T001413Z`)
+
+Same procedure against MinIO `RELEASE.2025-09-07T16-13-09Z` on this machine,
+bucket created with Object Lock enabled (versioning on, no default retention,
+which the adapter warns about), prefix `site-a`, source revision `c6228e7`.
+
+| Field | Value |
+|---|---|
+| Corpus | 64 files, 253,674,286 bytes; 56 kept, 8 deleted; 3 agents |
+| Backup set | 164 objects copied and read-back verified through S3; second run copied 0 and skipped the snapshot |
+| Restore | 164 objects placed to 2 domains each (328 placements, 0 failed); recovery converged 64/64, 0 blocked |
+| Verification | 56/56 kept files match SHA-256; 8/8 deleted files unreadable; final health all durable |
+| Actual recovery point lag | 3.9 s |
+| Actual recovery time | 4.2 s |
+| Report digest (SHA-256, first 16) | `bb955c0b3a8bc149` |
+
+Step timings (seconds): commit 6.8, backup 3.9, key restore 0.1, restore
+metadata 0.02, restore objects 2.6, recover 1.3, scrub repair 2.4, verify
+3.0.
+
 ## What this proves and what it does not
 
 - The backup set, the bundle, and the passphrase are sufficient to rebuild
@@ -63,10 +83,11 @@ Step timings (seconds): commit 7.3, backup 3.7, destroy 0.2, key restore
   database, and deleted files stay deleted through the rebuild.
 - Recovery rebinds placements to the new agent incarnations; the old
   incarnations are superseded, not trusted.
-- The target was a local directory on the same machine. It demonstrates the
-  layout and the restore path, not offsite protection; the drill must be
-  repeated with the S3-compatible target before the deployment may be
-  called recovery ready.
+- Both targets ran on the same machine. The directory run demonstrates the
+  layout and restore path; the S3 run demonstrates the offsite adapter
+  end to end against an Object-Lock-enabled bucket, but a MinIO on the same
+  host is not offsite. A deployment is recovery ready only after this drill
+  passes against its real offsite bucket.
 - The corpus is hundreds of megabytes, not the multi-gigabyte scale of the
   v1 operating envelope. Timings will scale with object count and size.
 

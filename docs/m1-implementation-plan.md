@@ -24,11 +24,10 @@ with its `init` ceremony and `key` commands. Lane C adds backup set v1
 (schema v6), the directory target, `VACUUM INTO` snapshot shipping, catalogs,
 backup status in `health`, and `restore metadata` / `restore objects`.
 
-This is not M1 acceptance. The S3-compatible target with Object Lock,
-offsite retention and integrity sampling, and the S3 rerun of the restore
-drill remain open. The power-loss drill qualified btrfs, ext4, and XFS with
-caveats, and the representative restore drill passed with the directory
-target (`m1-restore-drill.md`). The light local drill passes through the binary. The three phase-1 design questions
+M1 was accepted on 2026-09-30 with recorded limitations (`roadmap.md`).
+The S3-compatible target, integrity sampling, the power-loss, capacity,
+lifecycle-matrix, and restore drills all have evidence documents under
+`docs/`. The light local drill passes through the binary. The three phase-1 design questions
 were ratified on 2026-09-29; see
 [`m1-phase-1-decisions.md`](m1-phase-1-decisions.md).
 
@@ -150,10 +149,10 @@ empty-infrastructure drill will repeat them from blank infrastructure.
    snapshot, objects into fresh agents, `recover --apply`, byte-for-byte
    download, deleted file still unreadable, scrub durable.
 
-Remaining in lane C: the S3-compatible adapter with bucket versioning and
-governance-mode Object Lock (MinIO test double on `anthonypc`), retention
-and expiry of deleted generations, integrity sampling, and the
-representative drill with recorded RPO/RTO.
+Lane C also delivered the S3-compatible adapter (`backup/s3.rs`, MinIO test
+double via `scripts/minio-test.sh`) and integrity sampling
+(`--verify-sample`). Retention and expiry are delegated to the target's
+lifecycle and Object Lock configuration.
 
 ### Validation
 
@@ -183,11 +182,12 @@ and `health` through the binary. Larger storage matrices belong on
 The safety model for that owner is pinned in
 [`m1-lifecycle-contract.md`](m1-lifecycle-contract.md).
 
-## Remaining M1 passes
+## After M1
 
-- S3-compatible backup target with Object Lock, offsite retention/expiry,
-  and integrity sampling (lane C, `m1-phase-1-decisions.md`);
-- a real `ENOSPC` injection on a small loop-device filesystem on `anthonypc`;
-- power-loss drill extensions (deletion markers, concurrent writers, a
-  physical volume);
-- the S3 rerun of the empty-infrastructure restore drill.
+- Deployment documentation must carry the accepted limitations from
+  `roadmap.md` and require each deployment to pass `scripts/restore-drill.sh`
+  against its own offsite bucket before claiming recovery readiness.
+- Power-loss drill extensions (deletion markers, concurrent writers, a
+  physical volume) and an APFS qualification remain optional hardening.
+- M2 (Tailscale identity) and M3 (single-partition vector engine) are ready
+  to start; see `roadmap.md`.

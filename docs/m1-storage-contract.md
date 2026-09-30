@@ -177,9 +177,20 @@ empty-infrastructure drill has passed for the deployment.
 
 The versioned-directory adapter provides layout-level immutability only and
 durable writes through the same temp-write, sync, link, directory-sync
-sequence as agents. Offsite protection requires a rotated or remote disk; the
-S3-compatible adapter with Object Lock is the first supported network target
-and is not yet implemented.
+sequence as agents; offsite protection requires a rotated or remote disk.
+The S3-compatible adapter (`s3:<bucket>[/<prefix>]`, endpoint and
+credentials from the environment) keeps the same layout under the prefix,
+enforces never-overwrite with `If-None-Match: *`, refuses a bucket without
+versioning, and reports Object Lock and default retention as capabilities,
+warning when they are absent. It needs no delete permission. Backblaze B2 is
+the reference deployment and MinIO the test double.
+
+`portal backup --verify-sample N` re-downloads and hashes N previously
+verified objects, spread across the set and rotated per job; a corrupt or
+missing offsite copy is reported as an issue and in `portal health`, never
+silently re-copied. Offsite retention and expiry of deleted generations are
+enforced by the target's lifecycle rules and Object Lock retention (DESIGN
+§11.1 defaults), not by the portal, which never deletes from a backup set.
 
 ### Restore
 

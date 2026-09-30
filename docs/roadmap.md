@@ -11,9 +11,9 @@ design first and then bring this document back into alignment.
 | Milestone | State | Exit gate |
 |---|---|---|
 | M0 — Semantic validation | **Accepted** | Larger representative bake-off produces a documented go decision and locks the default local model and dimensions |
-| M1 — Blob plane and recovery foundation | **In progress** | Blob durability and an empty-infrastructure restore drill pass |
-| M2 — Tailscale identity and authorization | Not started | Network identity, sessions, grants, and API-key boundaries pass adversarial tests |
-| M3 — Single-partition vector engine | Not started | Persistence, recovery, recall, filtering, and compaction gates pass against brute force |
+| M1 — Blob plane and recovery foundation | **Accepted** (2026-09-30, with recorded limitations) | Blob durability and an empty-infrastructure restore drill pass |
+| M2 — Tailscale identity and authorization | Ready to start | Network identity, sessions, grants, and API-key boundaries pass adversarial tests |
+| M3 — Single-partition vector engine | Ready to start | Persistence, recovery, recall, filtering, and compaction gates pass against brute force |
 | M4 — Distributed vector plane | Not started | Quorum, fencing, promotion, movement, and balancing survive failure injection |
 | M5 — File extraction and semantic retrieval | Not started | Files flow safely from extraction through reproducible hybrid search |
 | M6 — Dashboard and operations | Not started | User and operator workflows are complete, truthful, and accessible |
@@ -29,21 +29,27 @@ to the best eligible dimension. M0 is accepted and M1 is unblocked. See
 [phase-0-validation.md](phase-0-validation.md) and
 [next-steps.md](next-steps.md).
 
-M1 passes 1 through 3 now implement the loopback-only RF2 commit spine,
-durable logical deletion, strict paginated inventories, canonical SQLite v4
-migration, live pre-commit replica validation, explicit plan/apply recovery
-with recovery-only RF2 repair, agent incarnations, complete-scan
-observations, per-object durability health, and copy-first scrub/repair that
-never deletes. Master-key custody (bound key identifier, recovery bundle) and backup set
-v1 (versioned-directory target, snapshot shipping, restore) are implemented,
-and a light local empty-infrastructure drill passes through the binary. Pass 4 adds copy-first drain, floor-proving retirement, capacity admission,
-and proof-based garbage collection with agent DELETE. The `dm-log-writes`
-power-loss drill passed on btrfs, ext4, and XFS (loop devices, kernel
-7.1.9; physical drive cache untested). The representative empty-infrastructure restore drill passed on
-`anthonypc` with the versioned-directory target
-([m1-restore-drill.md](m1-restore-drill.md)). The full M1 gate remains open
-pending the S3-compatible offsite target with retention and a rerun of the
-drill against it. See [m1-implementation-plan.md](m1-implementation-plan.md),
+M1 is **Accepted** as of 2026-09-30. The blob plane provides the RF2
+commit spine, durable logical deletion, recovery from immutable objects,
+agent incarnations and complete-scan observations, copy-first scrub and
+repair, drain and retirement, capacity admission, proof-based garbage
+collection, master-key recovery bundles, and backup set v1 with directory and
+S3-compatible targets. Evidence: the test suite (72 tests), the power-loss
+drill ([m1-filesystem-qualification.md](m1-filesystem-qualification.md)), the
+capacity drill ([m1-capacity-drill.md](m1-capacity-drill.md)), the lifecycle
+matrix ([m1-lifecycle-matrix.md](m1-lifecycle-matrix.md)), and the
+empty-infrastructure restore drill against both targets
+([m1-restore-drill.md](m1-restore-drill.md)).
+
+Accepted limitations, to be carried into deployment documentation rather
+than blocking the milestone: agents are loopback-only and unauthenticated
+until M2; drills ran on one machine with logical failure domains; the
+power-loss drill used loop devices, not a physical drive's cache; APFS is
+unqualified; offsite retention and expiry are enforced by the target's
+lifecycle and Object Lock configuration, not by the portal; the S3 run used
+MinIO on the same host, so every real deployment must repeat the restore
+drill against its own offsite bucket before it may be called recovery
+ready. See [m1-implementation-plan.md](m1-implementation-plan.md),
 [m1-filesystem-qualification.md](m1-filesystem-qualification.md), and the
 proposed decisions in [m1-phase-1-decisions.md](m1-phase-1-decisions.md).
 
@@ -228,8 +234,9 @@ closed only when its listed tests and drills pass.
 
 #### Durable storage and commit
 
-- [ ] Acknowledged object writes survive immediate process and host restart on
+- [x] Acknowledged object writes survive immediate process and host restart on
   each supported storage platform.
+  Evidence: process-exit tests at every boundary; `dm-log-writes` power-loss drill on btrfs, ext4, XFS ([m1-filesystem-qualification.md](m1-filesystem-qualification.md)). Accepted limitation: loop devices, not a physical drive cache; APFS unqualified and not a production target.
 - [x] Identical retries converge on the same ciphertext objects and one file
   record; conflicting reuse of an idempotency key is rejected.
 - [x] No staging or partially replicated file is visible or downloadable.
@@ -237,21 +244,26 @@ closed only when its listed tests and drills pass.
   chunk meets `minimum_write_replicas` across distinct failure domains.
 - [x] RF2 stops accepting new writes when both required durable copies cannot
   be established; the system never silently falls back to one copy.
-- [ ] Policy shortfalls remain visible as degraded even when the durability
+- [x] Policy shortfalls remain visible as degraded even when the durability
   floor permits acknowledgement.
+  Evidence: scrub reports `degraded` for a missing or corrupt configured copy while the floor holds (`tests/lifecycle_scrub.rs`, [m1-restore-drill.md](m1-restore-drill.md) step 6).
 
 #### Delete, repair, and capacity safety
 
 - [x] Delete makes a file unreadable only after its deletion marker is durable;
   a stale SQLite restore or returning stale node cannot resurrect it.
-- [ ] Repair, rebalance, quota changes, and garbage collection never remove an
+- [x] Repair, rebalance, quota changes, and garbage collection never remove an
   old copy before a replacement is durable and confirmed.
-- [ ] Bit flips are detected by ciphertext hash verification and repaired from
+  Evidence: copy-first repair, drain, and retire (`tests/lifecycle_gc.rs`, [m1-lifecycle-matrix.md](m1-lifecycle-matrix.md)); GC deletes only through an applied proof.
+- [x] Bit flips are detected by ciphertext hash verification and repaired from
   a valid replica without serving corrupt plaintext.
-- [ ] Staging garbage and unreferenced chunks are collected only after the
+  Evidence: 24 injected flips, truncations, and removals detected and repaired with every sampled download intact ([m1-lifecycle-matrix.md](m1-lifecycle-matrix.md)).
+- [x] Staging garbage and unreferenced chunks are collected only after the
   documented grace, reference, observation, and node-retirement gates.
-- [ ] ENOSPC and global budget exhaustion produce admission-control errors and
+  Evidence: `portal gc` proofs: observation after deletion, retention or grace, no pending movement, deferral when an agent is unreachable (`tests/lifecycle_gc.rs`, [m1-lifecycle-matrix.md](m1-lifecycle-matrix.md)).
+- [x] ENOSPC and global budget exhaustion produce admission-control errors and
   actionable health state without violating the replica floor.
+  Evidence: agent HTTP 507 and portal exit 3 with the floor intact; real `ENOSPC` on a loop device ([m1-capacity-drill.md](m1-capacity-drill.md)).
 
 #### Recovery
 
@@ -260,15 +272,19 @@ closed only when its listed tests and drills pass.
   garbage—never a visible partial file.
 - [x] Core file records newer than an older SQLite restore point can be
   reconstructed from manifests, deletion markers, and inventories.
-- [ ] The master key can be recovered without relying on any surviving cluster
+- [x] The master key can be recovered without relying on any surviving cluster
   machine, and wrong or missing key material fails closed.
-- [ ] A representative cluster restores into empty infrastructure from the
+  Evidence: recovery bundle v1 and `portal key`; wrong key, wrong passphrase, tampering, and out-of-range KDF parameters fail closed (`tests/commit_spine_process.rs`).
+- [x] A representative cluster restores into empty infrastructure from the
   versioned offsite objects, SQLite history, and independent key material;
   regular-file bytes match their original hashes.
-- [ ] Backup lag, last integrity verification, RPO/RTO targets, retention, and
+  Evidence: [m1-restore-drill.md](m1-restore-drill.md): 64 files, ~250 MB, directory and S3 (MinIO, Object Lock) targets; 7.7 s and 4.2 s recovery time.
+- [x] Backup lag, last integrity verification, RPO/RTO targets, retention, and
   last restore-drill result are externally observable.
-- [ ] Master-key custody, backup defaults, and globally-over-budget admission
+  Evidence: `portal health` backup status (lag, verified and pending objects, last snapshot, last integrity sample, `recovery_ready`); declared vs. actual RPO/RTO in the drill report. Accepted limitation: retention is enforced by the target's lifecycle and Object Lock rules, not by the portal.
+- [x] Master-key custody, backup defaults, and globally-over-budget admission
   behavior are documented decisions with tested recovery/failure behavior.
+  Evidence: ratified in DESIGN §10, §11.1, §15 with tests listed in [m1-phase-1-decisions.md](m1-phase-1-decisions.md).
 
 ### Verification and evidence
 

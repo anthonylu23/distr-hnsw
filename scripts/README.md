@@ -72,3 +72,27 @@ scripts/restore-drill.sh --target s3:bucket/prefix          # offsite target
 
 Needs no root. Writes `$HOME/distr-hnsw-drill/restore-report-<utc>.json`
 and exits 0 only on a `pass` verdict.
+
+## lifecycle-matrix.sh
+
+Large corruption, movement, retirement, and GC matrix: commits ~2 GB across
+three agents, injects byte flips, truncations, and removals, repairs, drains
+and retires an agent, joins a replacement, deletes files, and garbage-collects
+with proofs. Results: [docs/m1-lifecycle-matrix.md](../docs/m1-lifecycle-matrix.md).
+
+```sh
+scripts/lifecycle-matrix.sh --files 160 --max-mib 24 --flip 24
+```
+
+## enospc-drill.sh
+
+Capacity and real-`ENOSPC` failure injection on a small ext4 loop device
+(needs sudo). Results: [docs/m1-capacity-drill.md](../docs/m1-capacity-drill.md).
+
+## minio-test.sh
+
+Runs the S3 backup target tests against a throwaway MinIO
+(`start|test|stop`, or no argument for all three). Used by the S3 leg of the
+restore drill: start MinIO, create an Object-Lock bucket, run
+`restore-drill.sh --target s3:<bucket>/<prefix>` with the MinIO credentials in
+the environment, then stop.

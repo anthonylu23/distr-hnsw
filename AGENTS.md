@@ -56,8 +56,10 @@ encrypted blobs plus distributed HNSW vector search. Product design lives in
   and the power-loss drill still owed.
 - `docs/m1-phase-1-decisions.md` — ratified phase-1 decisions (key custody,
   backup target, admission) and the tests each must pass.
-- `docs/m1-restore-drill.md` — empty-infrastructure restore drill evidence.
-- `scripts/` — operational drills (`power-loss-drill.sh`, `restore-drill.sh`).
+- `docs/m1-restore-drill.md`, `docs/m1-lifecycle-matrix.md`,
+  `docs/m1-capacity-drill.md` — M1 drill evidence.
+- `scripts/` — operational drills and the MinIO test harness (see
+  `scripts/README.md`).
 - `crates/distr-hnsw/` — product service and CLI; keep this separate from the
   disposable phase-0 prototype.
 - `prototype/` — **disposable** phase-0 validation CLI (`distr-hnsw-validate`).
@@ -101,18 +103,14 @@ DESIGN §15 (`docs/phase-0-validation.md`). Do not retune the holdout or grow th
 prototype into product code. M1 is unblocked and starts with the recovery-first
 blob-plane slice in `docs/roadmap.md`.
 
-**M1 status:** In progress. Passes 1 through 4 implement the RF2 commit spine,
-logical deletion, strict inventories, canonical SQLite v7 migration, explicit
-plan/apply recovery, agent incarnations, complete-scan observations,
-durability health, copy-first scrub/repair (`portal scrub`, `portal health`),
-copy-first `drain`, floor-proving `retire`, agent capacity policy (HTTP 507,
-portal exit 3), and proof-based `gc` (agent DELETE only through an applied
-proof). Lane B adds the bound master-key id and recovery bundle (`portal
-key`); lane C adds backup set v1 with a directory target and restore
-(`portal backup`, `portal restore`), drilled locally. The power-loss drill
-(`scripts/power-loss-drill.sh`, needs sudo) qualified btrfs/ext4/XFS with
-caveats. Phase-1 decisions are ratified (DESIGN §10, §11.1, §15). Remaining
-for M1: S3-compatible target with Object Lock and the representative restore
-drill on `anthonypc`. Tests use `TMPDIR=target/` via `.cargo/config.toml` so
-they run on a real filesystem. Large storage/recovery matrices remain
-`anthonypc` work.
+**M1 status:** Accepted 2026-09-30 with recorded limitations (`docs/roadmap.md`).
+The blob plane (`crates/distr-hnsw/`) provides the RF2 commit spine, logical
+deletion, recovery, incarnations and observations, scrub/repair, drain,
+retire, capacity admission, proof-based GC, master-key recovery bundles, and
+backup set v1 with directory and S3 targets (`portal init|put|get|delete|
+recover|scrub|health|key|backup|restore|drain|retire|gc`). Drills and their
+evidence: `scripts/` and `docs/m1-*-drill.md`, `docs/m1-lifecycle-matrix.md`,
+`docs/m1-filesystem-qualification.md`. Agents stay loopback-only until M2.
+Tests use `TMPDIR=target/` via `.cargo/config.toml` so they run on a real
+filesystem; `aws-lc-sys` needs a C compiler. Large matrices and drills run on
+`anthonypc`.
