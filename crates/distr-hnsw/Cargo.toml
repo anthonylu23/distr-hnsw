@@ -12,6 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# Default features would add a second, legacy hyper 0.14 / rustls 0.21 stack
+# next to the hyper 1 / rustls 0.23 one; only the latter is wanted.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "rt-tokio",
+] }
 argon2 = "0.6"
 axum = "0.8"
 base64 = "0.23"

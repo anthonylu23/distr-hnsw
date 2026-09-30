@@ -152,7 +152,8 @@ enum PortalCommand {
         database: PathBuf,
         #[arg(long = "agent", required = true)]
         agents: Vec<AgentTarget>,
-        /// Backup target, e.g. `dir:/mnt/backup`.
+        /// Backup target: `dir:/mnt/backup` or `s3:<bucket>[/<prefix>]` (S3
+        /// endpoint and credentials come from the environment).
         #[arg(long)]
         target: BackupTargetSpec,
         /// Repeat continuously, sleeping this many seconds between jobs.
@@ -673,7 +674,8 @@ async fn main() -> anyhow::Result<()> {
                     database,
                     snapshot,
                 } => {
-                    let report = backup::restore_metadata(&target, &database, snapshot.as_deref())?;
+                    let report =
+                        backup::restore_metadata(&target, &database, snapshot.as_deref()).await?;
                     println!("{}", serde_json::to_string_pretty(&report)?);
                     Ok(())
                 }

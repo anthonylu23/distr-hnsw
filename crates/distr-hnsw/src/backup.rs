@@ -12,6 +12,10 @@
 //! Objects are self-verifying by content address, so the catalog is advisory;
 //! authenticity of the set rests on the target's versioning and immutability.
 //! The backup job needs no master key: it copies ciphertext.
+//!
+//! Targets: a versioned directory (`dir:<path>`) and an S3-compatible bucket
+//! (`s3:<bucket>[/<prefix>]`, see [`s3`]). Both are dispatched through
+//! [`BackupTargetKind`]; adapters never overwrite.
 
 use std::{
     collections::BTreeSet,
@@ -26,6 +30,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod s3;
+
+pub use s3::S3Target;
+
 use crate::{
     durability::{ensure_directory, sync_directory, sync_regular_file},
     metadata::{Database, HistoryObject, JobStatus, MetadataError, ReconcileJob},
@@ -36,22 +44,32 @@ use crate::{
 const LAYOUT_ROOT: &str = "backup/v1";
 const MINIMUM_REPLICAS: usize = 2;
 
-/// Operator-facing target specification, e.g. `dir:/mnt/backup`.
+/// Operator-facing target specification: `dir:<path>` or
+/// `s3:<bucket>[/<prefix>]`. The S3 form takes its endpoint and credentials
+/// from the environment (see [`s3`]); neither is part of the target id.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BackupTargetSpec {
     Directory(PathBuf),
+    S3 { bucket: String, prefix: String },
 }
 
 impl BackupTargetSpec {
+    /// Stable identifier persisted with the backup bookkeeping.
     pub fn id(&self) -> String {
         match self {
             Self::Directory(path) => format!("dir:{}", path.display()),
+            Self::S3 { bucket, prefix } => s3::target_id(bucket, prefix),
         }
     }
 
-    pub fn open(&self) -> Result<Box<dyn BackupTarget>, BackupError> {
+    /// Open the target, verifying its preconditions (an S3 bucket must have
+    /// versioning enabled).
+    pub async fn open(&self) -> Result<BackupTargetKind, BackupError> {
         match self {
-            Self::Directory(path) => Ok(Box::new(DirectoryTarget::open(path)?)),
+            Self::Directory(path) => Ok(BackupTargetKind::Directory(DirectoryTarget::open(path)?)),
+            Self::S3 { bucket, prefix } => Ok(BackupTargetKind::S3(
+                S3Target::open_from_env(bucket, prefix).await?,
+            )),
         }
     }
 }
@@ -62,6 +80,17 @@ impl FromStr for BackupTargetSpec {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.split_once(':') {
             Some(("dir", path)) if !path.is_empty() => Ok(Self::Directory(PathBuf::from(path))),
+            Some(("s3", rest)) if !rest.is_empty() => {
+                let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+                let prefix = prefix.trim_matches('/');
+                if bucket.is_empty() || (!prefix.is_empty() && validate_path(prefix).is_err()) {
+                    return Err(BackupError::InvalidTarget(value.to_owned()));
+                }
+                Ok(Self::S3 {
+                    bucket: bucket.to_owned(),
+                    prefix: prefix.to_owned(),
+                })
+            }
             _ => Err(BackupError::InvalidTarget(value.to_owned())),
         }
     }
@@ -75,14 +104,59 @@ pub enum PutOutcome {
     Identical,
 }
 
-/// A versioned object-store-like backup destination. Implementations must
-/// never overwrite: an existing path with different bytes is a conflict.
-pub trait BackupTarget {
-    fn id(&self) -> String;
-    fn put_new(&self, path: &str, bytes: &[u8]) -> Result<PutOutcome, BackupError>;
-    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, BackupError>;
+/// A versioned object-store-like backup destination. Adapters never
+/// overwrite: an existing path with different bytes is a conflict. Paths are
+/// `/`-separated and relative to the layout root (`backup/v1/...`) for every
+/// adapter; the S3 adapter maps them under its prefix and strips it again
+/// when listing. An enum rather than a trait object so the S3 adapter can be
+/// async without boxed futures.
+pub enum BackupTargetKind {
+    Directory(DirectoryTarget),
+    S3(S3Target),
+}
+
+impl BackupTargetKind {
+    pub fn id(&self) -> String {
+        match self {
+            Self::Directory(target) => target.id(),
+            Self::S3(target) => target.id(),
+        }
+    }
+
+    pub async fn put_new(&self, path: &str, bytes: &[u8]) -> Result<PutOutcome, BackupError> {
+        match self {
+            Self::Directory(target) => target.put_new(path, bytes),
+            Self::S3(target) => target.put_new(path, bytes).await,
+        }
+    }
+
+    pub async fn get(&self, path: &str) -> Result<Option<Vec<u8>>, BackupError> {
+        match self {
+            Self::Directory(target) => target.get(path),
+            Self::S3(target) => target.get(path).await,
+        }
+    }
+
     /// Paths under `prefix`, sorted, with sizes.
-    fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>, BackupError>;
+    pub async fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>, BackupError> {
+        match self {
+            Self::Directory(target) => target.list(prefix),
+            Self::S3(target) => target.list(prefix).await,
+        }
+    }
+}
+
+/// Reject empty, absolute, and dot-segment paths before they reach a target.
+fn validate_path(path: &str) -> Result<(), BackupError> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(BackupError::InvalidPath(path.to_owned()));
+    }
+    Ok(())
 }
 
 /// Versioned-directory adapter: durable writes under one root. Immutability
@@ -100,24 +174,15 @@ impl DirectoryTarget {
     }
 
     fn resolve(&self, path: &str) -> Result<PathBuf, BackupError> {
-        if path.is_empty()
-            || path.starts_with('/')
-            || path
-                .split('/')
-                .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-        {
-            return Err(BackupError::InvalidPath(path.to_owned()));
-        }
+        validate_path(path)?;
         Ok(self.root.join(path))
     }
-}
 
-impl BackupTarget for DirectoryTarget {
-    fn id(&self) -> String {
+    pub fn id(&self) -> String {
         format!("dir:{}", self.root.display())
     }
 
-    fn put_new(&self, path: &str, bytes: &[u8]) -> Result<PutOutcome, BackupError> {
+    pub fn put_new(&self, path: &str, bytes: &[u8]) -> Result<PutOutcome, BackupError> {
         let final_path = self.resolve(path)?;
         if final_path.exists() {
             let existing = fs::read(&final_path)?;
@@ -164,7 +229,7 @@ impl BackupTarget for DirectoryTarget {
         result
     }
 
-    fn get(&self, path: &str) -> Result<Option<Vec<u8>>, BackupError> {
+    pub fn get(&self, path: &str) -> Result<Option<Vec<u8>>, BackupError> {
         match fs::read(self.resolve(path)?) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -172,7 +237,7 @@ impl BackupTarget for DirectoryTarget {
         }
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>, BackupError> {
+    pub fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>, BackupError> {
         let base = self.resolve(prefix)?;
         let mut out = Vec::new();
         if !base.exists() {
@@ -315,14 +380,14 @@ pub async fn backup(
     spec: &BackupTargetSpec,
     snapshot_path_hint: &Path,
 ) -> Result<BackupReportV1, BackupError> {
-    let target = spec.open()?;
+    let target = spec.open().await?;
     let target_id = spec.id();
     let job_id = database.create_backup_job(&target_id)?;
     let result = run_backup(
         database,
         agents,
         client,
-        target.as_ref(),
+        &target,
         &target_id,
         job_id,
         snapshot_path_hint,
@@ -346,7 +411,7 @@ async fn run_backup(
     database: &mut Database,
     agents: &[AgentTarget],
     client: &reqwest::Client,
-    target: &dyn BackupTarget,
+    target: &BackupTargetKind,
     target_id: &str,
     job_id: Uuid,
     snapshot_path_hint: &Path,
@@ -382,7 +447,7 @@ async fn run_backup(
             continue;
         };
         let path = object_path(object.kind, &object.hash);
-        match target.put_new(&path, &bytes) {
+        match target.put_new(&path, &bytes).await {
             Ok(PutOutcome::Created) => totals.copied_now += 1,
             Ok(PutOutcome::Identical) => totals.identical_on_target += 1,
             Err(error) => {
@@ -392,7 +457,8 @@ async fn run_backup(
             }
         }
         let verified = target
-            .get(&path)?
+            .get(&path)
+            .await?
             .is_some_and(|got| ObjectHash::digest(&got) == object.hash);
         if !verified {
             totals.failed += 1;
@@ -435,9 +501,12 @@ async fn run_backup(
             let _ = fs::remove_file(&temporary);
             let snapshot_hash = blake3::hash(&snapshot_bytes).to_hex().to_string();
             let name = format!("{}-{}.db", utc_stamp(now), &snapshot_hash[..8]);
-            target.put_new(&snapshot_path(&name), &snapshot_bytes)?;
+            target
+                .put_new(&snapshot_path(&name), &snapshot_bytes)
+                .await?;
             let verified = target
-                .get(&snapshot_path(&name))?
+                .get(&snapshot_path(&name))
+                .await?
                 .is_some_and(|got| blake3::hash(&got).to_hex().to_string() == snapshot_hash);
             if !verified {
                 return Err(BackupError::SnapshotVerification(name));
@@ -471,10 +540,12 @@ async fn run_backup(
         snapshot: snapshot.clone(),
     };
     let catalog_name = format!("{}-{job_id}.json", utc_stamp(now));
-    target.put_new(
-        &catalog_path(&catalog_name),
-        serde_json::to_string_pretty(&catalog)?.as_bytes(),
-    )?;
+    target
+        .put_new(
+            &catalog_path(&catalog_name),
+            serde_json::to_string_pretty(&catalog)?.as_bytes(),
+        )
+        .await?;
 
     Ok(BackupReportV1 {
         report_type: "BackupReportV1".to_owned(),
@@ -596,7 +667,7 @@ pub struct RestoreMetadataReport {
 /// Restore the latest (or named) SQLite snapshot from the target into a path
 /// that must not exist. The snapshot's hash is checked against the newest
 /// catalog that names it when one exists.
-pub fn restore_metadata(
+pub async fn restore_metadata(
     spec: &BackupTargetSpec,
     database_path: &Path,
     snapshot_name: Option<&str>,
@@ -604,8 +675,8 @@ pub fn restore_metadata(
     if database_path.exists() {
         return Err(BackupError::DestinationExists(database_path.to_owned()));
     }
-    let target = spec.open()?;
-    let snapshots = target.list(&format!("{LAYOUT_ROOT}/sqlite"))?;
+    let target = spec.open().await?;
+    let snapshots = target.list(&format!("{LAYOUT_ROOT}/sqlite")).await?;
     let chosen = match snapshot_name {
         Some(name) => snapshots
             .iter()
@@ -616,17 +687,19 @@ pub fn restore_metadata(
     .ok_or(BackupError::NoSnapshot)?;
     let name = chosen.0.rsplit('/').next().unwrap_or(&chosen.0).to_owned();
     let bytes = target
-        .get(&chosen.0)?
+        .get(&chosen.0)
+        .await?
         .ok_or_else(|| BackupError::NoSnapshot)?;
     let hash = blake3::hash(&bytes).to_hex().to_string();
 
     let mut catalog_name = None;
     for (path, _) in target
-        .list(&format!("{LAYOUT_ROOT}/catalog"))?
+        .list(&format!("{LAYOUT_ROOT}/catalog"))
+        .await?
         .into_iter()
         .rev()
     {
-        let Some(raw) = target.get(&path)? else {
+        let Some(raw) = target.get(&path).await? else {
             continue;
         };
         let Ok(catalog) = serde_json::from_slice::<CatalogV1>(&raw) else {
@@ -699,12 +772,12 @@ pub async fn restore_objects(
     agents: &[AgentTarget],
     client: &reqwest::Client,
 ) -> Result<RestoreObjectsReport, BackupError> {
-    let target = spec.open()?;
+    let target = spec.open().await?;
     let mut report = RestoreObjectsReport {
         report_type: "RestoreObjectsReportV1".to_owned(),
         ..RestoreObjectsReport::default()
     };
-    for (path, _) in target.list(&format!("{LAYOUT_ROOT}/objects"))? {
+    for (path, _) in target.list(&format!("{LAYOUT_ROOT}/objects")).await? {
         let mut parts = path.rsplit('/');
         let (Some(hash_text), Some(kind_text)) = (parts.next(), parts.next()) else {
             continue;
@@ -720,7 +793,7 @@ pub async fn restore_objects(
             continue;
         };
         report.objects += 1;
-        let Some(bytes) = target.get(&path)? else {
+        let Some(bytes) = target.get(&path).await? else {
             report.failed += 1;
             report
                 .issues
@@ -789,8 +862,17 @@ pub async fn restore_objects(
 
 #[derive(Debug, Error)]
 pub enum BackupError {
-    #[error("backup target must be dir:<path>: {0}")]
+    #[error("backup target must be dir:<path> or s3:<bucket>[/<prefix>]: {0}")]
     InvalidTarget(String),
+    #[error(
+        "S3 bucket {0} does not have versioning enabled; enable versioning (and Object Lock) \
+         before using it as a backup target"
+    )]
+    TargetUnversioned(String),
+    #[error("S3 credentials missing: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")]
+    S3Credentials,
+    #[error("S3 {0}")]
+    S3(String),
     #[error("invalid backup path: {0}")]
     InvalidPath(String),
     #[error("backup target already holds different bytes at {0}; refusing to overwrite")]
@@ -817,45 +899,55 @@ pub enum BackupError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn directory_target_never_overwrites_and_lists_sorted() {
+    #[tokio::test]
+    async fn directory_target_never_overwrites_and_lists_sorted() {
         let directory = tempfile::tempdir().unwrap();
-        let target = DirectoryTarget::open(directory.path()).unwrap();
+        let target = BackupTargetKind::Directory(DirectoryTarget::open(directory.path()).unwrap());
+        assert_eq!(target.id(), format!("dir:{}", directory.path().display()));
         assert_eq!(
             target
                 .put_new("backup/v1/objects/chunk/aa", b"one")
+                .await
                 .unwrap(),
             PutOutcome::Created
         );
         assert_eq!(
             target
                 .put_new("backup/v1/objects/chunk/aa", b"one")
+                .await
                 .unwrap(),
             PutOutcome::Identical
         );
         assert!(matches!(
-            target.put_new("backup/v1/objects/chunk/aa", b"two"),
+            target.put_new("backup/v1/objects/chunk/aa", b"two").await,
             Err(BackupError::Conflict(_))
         ));
         target
             .put_new("backup/v1/objects/chunk/ab", b"three")
+            .await
             .unwrap();
-        target.put_new("backup/v1/sqlite/x.db", b"db").unwrap();
+        target
+            .put_new("backup/v1/sqlite/x.db", b"db")
+            .await
+            .unwrap();
         assert_eq!(
-            target.list("backup/v1/objects").unwrap(),
+            target.list("backup/v1/objects").await.unwrap(),
             vec![
                 ("backup/v1/objects/chunk/aa".to_owned(), 3),
                 ("backup/v1/objects/chunk/ab".to_owned(), 5),
             ]
         );
-        assert_eq!(target.get("backup/v1/sqlite/x.db").unwrap().unwrap(), b"db");
-        assert!(target.get("backup/v1/missing").unwrap().is_none());
+        assert_eq!(
+            target.get("backup/v1/sqlite/x.db").await.unwrap().unwrap(),
+            b"db"
+        );
+        assert!(target.get("backup/v1/missing").await.unwrap().is_none());
         assert!(matches!(
-            target.put_new("../escape", b"x"),
+            target.put_new("../escape", b"x").await,
             Err(BackupError::InvalidPath(_))
         ));
         assert!(matches!(
-            target.put_new("/abs", b"x"),
+            target.put_new("/abs", b"x").await,
             Err(BackupError::InvalidPath(_))
         ));
         assert!(!directory
@@ -882,7 +974,37 @@ mod tests {
             "dir:/mnt/backup".parse::<BackupTargetSpec>().unwrap(),
             BackupTargetSpec::Directory(PathBuf::from("/mnt/backup"))
         );
-        assert!("s3:bucket".parse::<BackupTargetSpec>().is_err());
-        assert!("dir:".parse::<BackupTargetSpec>().is_err());
+        let bare = "s3:bucket".parse::<BackupTargetSpec>().unwrap();
+        assert_eq!(
+            bare,
+            BackupTargetSpec::S3 {
+                bucket: "bucket".to_owned(),
+                prefix: String::new(),
+            }
+        );
+        assert_eq!(bare.id(), "s3:bucket");
+        assert_eq!("s3:bucket/".parse::<BackupTargetSpec>().unwrap(), bare);
+        let nested = "s3:bucket/site/a/".parse::<BackupTargetSpec>().unwrap();
+        assert_eq!(
+            nested,
+            BackupTargetSpec::S3 {
+                bucket: "bucket".to_owned(),
+                prefix: "site/a".to_owned(),
+            }
+        );
+        assert_eq!(nested.id(), "s3:bucket/site/a");
+        for invalid in [
+            "dir:",
+            "s3:",
+            "s3:/x",
+            "s3:bucket/a//b",
+            "s3:bucket/../x",
+            "ftp:x",
+        ] {
+            assert!(
+                invalid.parse::<BackupTargetSpec>().is_err(),
+                "{invalid} should be rejected"
+            );
+        }
     }
 }
