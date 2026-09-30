@@ -38,26 +38,22 @@ backup set v1, directory adapter, `VACUUM INTO` snapshot shipping, catalogs,
 backup status, and `restore metadata` / `restore objects`, proven by a light
 local empty-infrastructure drill.
 
-The next lifecycle pass should:
+The lifecycle contract is fully implemented (pass 4: drain, retire,
+capacity admission, proof-based GC), and the `dm-log-writes` power-loss
+drill passed on btrfs, ext4, and XFS (`scripts/power-loss-drill.sh`). What
+remains for M1:
 
-1. Implement copy-first placement movement and formal node retirement
-   (`m1-lifecycle-contract.md`, order steps 3), proving replacement
-   durability before any obsolete placement is marked orphaned.
-2. Add quota/headroom admission and ENOSPC failure injection (step 4) per
-   decision 3 once ratified.
-3. Add proof-producing GC planning in dry-run mode (step 5); agent DELETE
-   stays unimplemented until stale-node, interrupted-move, retention, and
-   proof-invalidation tests pass (step 6).
-4. Run the `dm-log-writes` power-loss drill from
-   [m1-filesystem-qualification.md](m1-filesystem-qualification.md) on
-   `anthonypc` for btrfs, ext4, and XFS, and add the fsync fault-injection
-   test it recommends.
-5. Run large storage, corruption, and movement matrices on `anthonypc`.
+1. Land the S3-compatible backup target with Object Lock (MinIO test
+   double), then offsite retention/expiry and integrity sampling.
+2. Run the representative empty-infrastructure restore drill on `anthonypc`
+   with the S3 target and record declared vs. actual RPO/RTO as the M1
+   evidence package.
+3. Inject a real `ENOSPC` on a small loop-device filesystem and confirm the
+   507 mapping and admission behavior end to end; extend the power-loss
+   drill to deletion markers and concurrent writers.
+4. Run large storage, corruption, movement, and GC matrices on `anthonypc`.
 
-In parallel, finish lane C: the S3-compatible adapter with governance-mode
-Object Lock against MinIO on `anthonypc`, retention and expiry of deleted
-generations, weekly integrity sampling, and the representative drill with
-recorded RPO/RTO. That drill remains the M1 exit gate.
+The representative drill remains the M1 exit gate.
 
 ## Ops notes
 
