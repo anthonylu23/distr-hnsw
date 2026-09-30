@@ -46,8 +46,9 @@ acknowledgement; GET verifies stored bytes. Acknowledgement follows a
 same-directory temporary write, file sync, atomic rename, and parent-directory
 sync. Linux uses `fsync`. On macOS both the file and directory syncs issue
 `F_FULLFSYNC` (the standard library's `sync_all` does so on Apple targets);
-whether a directory `F_FULLFSYNC` persists a rename on APFS is unverified, and
-no filesystem is yet qualified for power loss. See
+whether a directory `F_FULLFSYNC` persists a rename on APFS is unverified.
+btrfs, ext4, and XFS are qualified with caveats by the `dm-log-writes`
+drill; APFS is not qualified. See
 [m1-filesystem-qualification.md](m1-filesystem-qualification.md).
 
 ## Master-key custody

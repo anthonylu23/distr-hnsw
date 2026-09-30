@@ -99,16 +99,18 @@ DESIGN §15 (`docs/phase-0-validation.md`). Do not retune the holdout or grow th
 prototype into product code. M1 is unblocked and starts with the recovery-first
 blob-plane slice in `docs/roadmap.md`.
 
-**M1 status:** In progress. Passes 1 through 3 implement the RF2 commit spine,
-logical deletion, strict inventories, canonical SQLite v5 migration, explicit
-plan/apply recovery with recovery-only repair, agent incarnations,
-complete-scan observations, durability health, and copy-first scrub/repair
-(`portal scrub`, `portal health`). Lane B adds the bound master-key id and
-recovery bundle (`portal key`); lane C adds backup set v1 with a directory
-target and restore (`portal backup`, `portal restore`), drilled locally.
-Phase-1 decisions are ratified (DESIGN §10, §11.1, §15). Next: S3-compatible
-target with Object Lock, then movement and retirement, quota admission,
-dry-run GC. Do not add agent DELETE until every gate in
-`docs/m1-lifecycle-contract.md` passes. Tests use `TMPDIR=target/` via
-`.cargo/config.toml` so they run on a real filesystem. Large storage/recovery
-matrices remain `anthonypc` work.
+**M1 status:** In progress. Passes 1 through 4 implement the RF2 commit spine,
+logical deletion, strict inventories, canonical SQLite v7 migration, explicit
+plan/apply recovery, agent incarnations, complete-scan observations,
+durability health, copy-first scrub/repair (`portal scrub`, `portal health`),
+copy-first `drain`, floor-proving `retire`, agent capacity policy (HTTP 507,
+portal exit 3), and proof-based `gc` (agent DELETE only through an applied
+proof). Lane B adds the bound master-key id and recovery bundle (`portal
+key`); lane C adds backup set v1 with a directory target and restore
+(`portal backup`, `portal restore`), drilled locally. The power-loss drill
+(`scripts/power-loss-drill.sh`, needs sudo) qualified btrfs/ext4/XFS with
+caveats. Phase-1 decisions are ratified (DESIGN §10, §11.1, §15). Remaining
+for M1: S3-compatible target with Object Lock and the representative restore
+drill on `anthonypc`. Tests use `TMPDIR=target/` via `.cargo/config.toml` so
+they run on a real filesystem. Large storage/recovery matrices remain
+`anthonypc` work.
