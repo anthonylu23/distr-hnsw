@@ -66,7 +66,8 @@ encrypted blobs plus distributed HNSW vector search. Product design lives in
   vectors, distance kernels, exact oracle, then HNSW. No tokio, no network.
 - `crates/distr-hnsw-bench/` — benchmark harness against pinned datasets;
   manifests under `docs/bench/`, data under `~/distr-hnsw-bench/` on
-  `anthonypc`. Plan: `docs/m3-implementation-plan.md`.
+  `anthonypc`. Plan: `docs/m3-implementation-plan.md`; formats and semantics:
+  `docs/m3-engine-contract.md` (read before touching the engine).
 - `prototype/` — **disposable** phase-0 validation CLI (`distr-hnsw-validate`).
   Not product code; do not grow it into the distributed service. See
   `docs/phase-0-validation.md`.

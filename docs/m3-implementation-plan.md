@@ -1,7 +1,8 @@
 # M3 implementation plan
 
-Status: **In progress** (pass 1 started 2026-09-30; public datasets pinned,
-oracle and kernels landed). The milestone scope, acceptance criteria,
+Status: **In progress** (pass 1 public part and pass 2 done 2026-09-30:
+datasets pinned, oracle and kernels landed, engine contract written in
+[m3-engine-contract.md](m3-engine-contract.md)). The milestone scope, acceptance criteria,
 and exit gate remain in [`roadmap.md`](roadmap.md) (M3). This page fixes the
 order of work and, deliberately, puts the benchmark datasets and the
 brute-force oracle before any engine code: every recall threshold is written
