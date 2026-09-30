@@ -6,12 +6,13 @@ next dependency boundary.
 
 ## Current status
 
-Passes 1, 2, the compatibility-hardening pass, pass 3 (lifecycle
-observation and scrub), lane B (master-key custody), and lane C's first
-target (backup set v1 with a versioned directory) are implemented and
-pushed. The product crate provides loopback agents plus portal `init`,
-`put`, `get`, `delete`, `recover`, `scrub`, `health`, `key`, `backup`, and
-`restore` commands. Pass 2 adds deletion-marker v1, paginated
+Passes 1 through 4 (commit spine, deletion and recovery, lifecycle
+observation and scrub, and movement/retirement/admission/GC), lane B
+(master-key custody), and lane C's first target (backup set v1 with a
+versioned directory) are implemented and pushed. The product crate provides
+loopback agents with capacity policy plus portal `init`, `put`, `get`,
+`delete`, `recover`, `scrub`, `health`, `key`, `backup`, `restore`, `drain`,
+`retire`, and `gc` commands. Pass 2 adds deletion-marker v1, paginated
 inventories, plan/apply recovery reports, highest-generation selection,
 recovery-only RF2 repair, per-file convergence, and fail-closed recovery
 issues. The hardening pass integrates the audited commit spine, introduces
@@ -23,10 +24,10 @@ with its `init` ceremony and `key` commands. Lane C adds backup set v1
 (schema v6), the directory target, `VACUUM INTO` snapshot shipping, catalogs,
 backup status in `health`, and `restore metadata` / `restore objects`.
 
-This is not M1 acceptance. Movement, retirement, quotas, GC, the
-S3-compatible target with Object Lock, filesystem power-loss qualification,
-and the representative empty-infrastructure drill on `anthonypc` remain
-open. The light local drill passes through the binary. The three phase-1 design questions
+This is not M1 acceptance. The S3-compatible target with Object Lock,
+offsite retention and integrity sampling, filesystem power-loss
+qualification, and the representative empty-infrastructure drill on
+`anthonypc` remain open. The light local drill passes through the binary. The three phase-1 design questions
 were ratified on 2026-09-29; see
 [`m1-phase-1-decisions.md`](m1-phase-1-decisions.md).
 
@@ -94,6 +95,25 @@ same source tree and every supported historical schema fixture converges on v3.
 Pass 3 exits when every required object's durability is observable from
 persisted state and a lost or corrupt copy is restored without any physical
 deletion. Those gates pass in the light local matrix on btrfs.
+
+## Pass 4 — movement, retirement, admission, and garbage collection
+
+1. Rebuild placements with the `orphaned` state (schema v7) and add GC
+   proof records.
+2. Implement copy-first drain and floor-proving retirement.
+3. Add agent capacity policy (quota, reserve, hard floor), HTTP 507
+   refusals with ENOSPC mapping, and two-domain portal admission (exit 3).
+4. Implement proof-producing GC planning and proof-revalidating apply with
+   agent DELETE; retain deletion markers; defer when any agent is
+   unreachable.
+5. Exercise drain success and blocking, retirement refusal and lockout,
+   capacity refusal with deletes still committing and convergence after
+   growth, and every GC gate.
+
+Pass 4 exits when a node can be drained and retired without any object
+dropping below RF2, an over-budget cluster refuses new chunks without
+touching the floor, and physical deletion happens only through a proof that
+re-derives unchanged. Those gates pass in the light local matrix.
 
 ## Lane B — master-key custody
 
@@ -164,11 +184,9 @@ The safety model for that owner is pinned in
 
 ## Remaining M1 passes
 
-- copy-first placement movement and formal node retirement;
-- quota/headroom admission and ENOSPC failure injection;
-- proof-producing GC planning (dry-run first) and, last, agent DELETE;
 - S3-compatible backup target with Object Lock, offsite retention/expiry,
   and integrity sampling (lane C, `m1-phase-1-decisions.md`);
+- a real `ENOSPC` injection on a small loop-device filesystem on `anthonypc`;
 - filesystem power-loss qualification drill
   (`m1-filesystem-qualification.md`);
 - portal-loss and empty-infrastructure restore drills.

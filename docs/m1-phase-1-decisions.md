@@ -325,7 +325,9 @@ deletion. This makes that concrete for the M1 blob plane.
 - Roadmap criterion closed: ENOSPC and global budget exhaustion produce
   admission-control errors and actionable health without violating the floor.
 
-**Status: Ratified 2026-09-29; not yet implemented (lifecycle order step 4).**
+**Status: Ratified 2026-09-29; implemented (agent capacity policy, HTTP 507,
+portal two-domain admission, CLI exit 3). Real-ENOSPC injection on a small
+filesystem is still owed; quota exhaustion is tested.**
 
 ---
 

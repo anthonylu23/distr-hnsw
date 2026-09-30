@@ -101,11 +101,20 @@ the proof above.
    **Implemented** (pass 3): `portal scrub [--repair] [--interval]`.
    Unreferenced objects (older generations, staging garbage) are counted but
    not verified or persisted; GC planning owns them.
-3. Add copy-first movement and formal retirement.
+3. Add copy-first movement and formal retirement. **Implemented** (pass 4):
+   `portal drain [--dry-run]`, `portal retire`.
 4. Add quota/headroom admission and ENOSPC failure injection.
-5. Add proof-producing GC planning; keep it dry-run.
+   **Implemented** (pass 4): agent capacity policy with HTTP 507 refusals,
+   portal two-domain admission with CLI exit 3. Real `ENOSPC` is mapped by
+   errno; the test matrix exercises quota exhaustion, not a full filesystem.
+5. Add proof-producing GC planning; keep it dry-run. **Implemented**
+   (pass 4): `portal gc` records a proof per object.
 6. Add agent DELETE only after stale-node, interrupted-move, retention, and
-   proof-invalidation tests pass.
+   proof-invalidation tests pass. **Implemented** (pass 4): `portal gc
+   --apply`; the tests in `tests/lifecycle_gc.rs` cover a stale node (no
+   observation after deletion), a wiped node returning, retention not
+   elapsed, content changing before apply, a pending placement, an
+   unreachable agent, and live objects never being candidates.
 
 Large corruption, movement, retirement, and storage-pressure matrices run on
 `anthonypc`. This pass does not provide backup, independent key recovery, or

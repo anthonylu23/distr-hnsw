@@ -1,6 +1,8 @@
 # M1 filesystem qualification for durable writes
 
-Status: **review complete, no filesystem qualified for power loss** (2026-09-29)
+Status: **dm-log-writes drill passed on btrfs, ext4, and XFS (kernel
+7.1.9-200.fc44, loop devices); qualified-with-caveats. APFS not qualified.**
+(2026-09-29)
 
 This document reviews the durable-write path in
 `crates/distr-hnsw/src/durability.rs` against the filesystems distr-hnsw is
@@ -107,8 +109,8 @@ macOS 27.0 (Darwin 27.0.0) on APFS.
   the same journaling mode [12]. The explicit `fsync` calls remove the
   dependence on these heuristics.
 - **Caveats.** `data=writeback` or `nobarrier` would invalidate the claim;
-  deployments must not use them. No ext4 volume exists in the current test
-  fleet.
+  deployments must not use them. No physical ext4 volume exists in the
+  current test fleet; the drill below used a loop-backed ext4 image.
 
 ### XFS
 
@@ -118,7 +120,8 @@ reports are the unsynced-data case the file `fsync` in step 3 avoids. The
 directory `fsync` requirement is the same as on ext4. XFS issues cache flushes
 unless the device reports a persistent cache, and the XFS FAQ is explicit that
 "if nobarrier makes a difference skipping it is not safe" [13]. The sequence is
-sufficient with the same caveats as ext4. Not present in the test fleet.
+sufficient with the same caveats as ext4. No physical XFS volume is present in
+the test fleet; the drill below used a loop-backed XFS image.
 
 ### APFS (macOS)
 
@@ -146,6 +149,7 @@ sufficient with the same caveats as ext4. Not present in the test fleet.
 | --- | --- | --- | --- |
 | `durability.rs` unit tests | In-process, `tempfile::tempdir()` | Idempotent PUT, hash verification on GET, inventory paging and malformed-entry rejection | Any durability property |
 | `commit_spine_process.rs`, `delete_recovery.rs` | Child portal calls `std::process::exit(86)` at each `Failpoint`; agents keep running | Recovery from a lost process at every durable boundary; SQLite and object-store state after the OS has accepted the writes | Power loss. The kernel page cache and device cache survive a process exit, so a missing `fsync` would pass these tests. |
+| `scripts/power-loss-drill.sh` (manual, `anthonypc`) | `dm-log-writes` on loop devices; log replayed to the mark taken after each acknowledged put; fresh agent on the replayed volume re-hashes every object via `GET /v1/objects` | Every object the agent had acknowledged before the mark is present and hash-valid after discarding everything that was not flushed; the filesystem passes its read-only checker after journal recovery; the agent `incarnation` survives; a deliberately un-fsynced 1 MiB control file does not survive | Behaviour of a physical drive's own write cache (loop devices honour flushes by `fsync` on the backing file); concurrency (one sequential writer); kernels other than the one recorded |
 
 Two further limitations apply:
 
@@ -155,30 +159,67 @@ Two further limitations apply:
   now sets `TMPDIR` to `target/` in `.cargo/config.toml`, so tests run on
   btrfs on `anthonypc` and APFS on the MacBook. This still proves only
   process-loss safety, not power-loss safety.
-- No test observes the block-layer flush/FUA stream, so the claim that the
-  device write cache is flushed rests on kernel documentation [1][16], not on
-  observation of the specific NVMe/SATA drives in `anthonypc`.
+- The drill observes the flush stream at the device-mapper layer: `dm-log-writes`
+  only commits queued writes to its log when a `REQ_PREFLUSH` arrives, so a
+  missing or ineffective `fsync` in the agent would have surfaced as a missing
+  object (the negative control shows that un-flushed data is indeed dropped).
+  It does not observe the NVMe/SATA drive in `anthonypc`; whether that drive
+  honours flushes still rests on kernel documentation [1][16].
 
 ## Qualification status
 
-Nothing is qualified for power loss without a drill that discards
-un-flushed writes (real power cut, `dm-log-writes` replay, or a
-CrashMonkey-style harness). Ratings below reflect documentation review plus
-the tests above.
+A filesystem is qualified only by a drill that discards un-flushed writes
+(real power cut, `dm-log-writes` replay, or a CrashMonkey-style harness).
+Ratings below combine the documentation review with the `dm-log-writes` drill
+run on 2026-09-29 (details in the next section).
 
 | Filesystem | Status | Evidence | Caveats |
 | --- | --- | --- | --- |
-| btrfs (`anthonypc`) | not qualified | Code review against btrfs docs [5]; process-exit and scrub tests pass on btrfs (kernel 7.1.9, write-back NVMe cache) | No power-loss drill; tree-log history [6][7][10] makes the result kernel-specific |
-| ext4 | not qualified | Code review against kernel ext4 docs [11] and `fsync(2)` [1]; sequence matches the documented recommendation [2] | No ext4 volume in the test fleet; `data=writeback`/`nobarrier` excluded |
-| XFS | not qualified | Code review against XFS FAQ [13] | No XFS volume in the test fleet |
-| APFS (macOS) | not qualified | Code review; `F_FULLFSYNC` verified in std [3] and Apple docs [15] | Directory `F_FULLFSYNC` semantics for rename persistence unverified; no macOS test host |
+| btrfs | qualified-with-caveats | `dm-log-writes` drill 8/8 marks, 20/20 objects present and hash-valid at the last mark, `btrfs check --readonly` clean at every mark, negative control lost; code review against btrfs docs [5]; process-exit and scrub tests pass | Kernel `7.1.9-200.fc44.x86_64` only (tree-log history [6][7][10] makes this kernel-specific); loop device, so the physical drive's write cache was not tested; default mount options (`ssd,discard=async,space_cache=v2`, `barrier`/`treelog` default on); single sequential writer |
+| ext4 | qualified-with-caveats | `dm-log-writes` drill 8/8 marks, 20/20 objects, `e2fsck -fn` clean at every mark, negative control lost; code review against kernel ext4 docs [11] and `fsync(2)` [1] | Same kernel and loop-device caveats; default `data=ordered`, `barrier` on; `data=writeback`/`nobarrier` remain excluded; not yet run on a physical ext4 volume |
+| XFS | qualified-with-caveats | `dm-log-writes` drill 8/8 marks, 20/20 objects, `xfs_repair -n` clean at every mark, negative control lost; code review against XFS FAQ [13] | Same kernel and loop-device caveats; default options (`inode64,logbufs=8,logbsize=32k`); not yet run on a physical XFS volume |
+| APFS (macOS) | not qualified | Code review; `F_FULLFSYNC` verified in std [3] and Apple docs [15] | Directory `F_FULLFSYNC` semantics for rename persistence unverified; no macOS test host; no drill mechanism equivalent to `dm-log-writes` identified |
 
-Expected outcome after the drill below: btrfs and ext4 move to
-"qualified-with-caveats" (caveats: named kernel version, `barrier` on, drive
-cache mode recorded). XFS and APFS stay "not qualified" until a volume of each
-is added to the drill.
+"Qualified-with-caveats" means: on the named kernel, with default mount
+options, every object acknowledged by the agent before a simulated power cut
+was present and hash-valid after replay, at every one of the tested cut
+points. It does not cover a drive that lies about flushes, other kernels, or
+concurrent writers. A real power cut on the physical drive remains the only
+test of the drive's own cache behaviour.
 
-## Recommended drill: dm-log-writes on `anthonypc`
+### Drill results, 2026-09-29
+
+Host `anthonypc`, kernel `7.1.9-200.fc44.x86_64`, `dm-log-writes` target
+v1.1.0, `replay-log` built from xfstests `3e1ee80`, loop devices over 4 GiB
+sparse images on the btrfs `/home` volume (`/sys/block/loopN/queue/write_cache
+= write back` for data, log, and the dm device). Eight files of 3 KiB to
+6 MiB (`CHUNK_SIZE` is 4 MiB, so four of them produce two chunks) were
+uploaded through the portal at RF2 with the dm-backed agent as one failure
+domain; a mark was inserted after each acknowledged put and the agent's
+inventory snapshotted (2, 4, 6, 9, 12, 14, 17, 20 objects). The agent was
+then `kill -9`ed and the device torn down. Full reports:
+`~/distr-hnsw-drill/report-<fs>-<utc>.json` on `anthonypc` (not committed).
+
+| Filesystem | mkfs | Mount options observed | Log entries | Marks passed | Objects at last mark | `.*.tmp` survivors | Read-only check | Negative control (1 MiB un-fsynced file) | Wall clock |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| btrfs | btrfs-progs v7.1 | `rw,relatime,seclabel,ssd,discard=async,space_cache=v2,subvolid=5,subvol=/` | 1092 | 8/8 | 20/20 present, 0 missing, 0 corrupt | 0 | `btrfs check --readonly` exit 0 at all 8 marks | 0 bytes visible | 7 s |
+| ext4 | mke2fs 1.47.3 | `rw,relatime,seclabel` | 1697 | 8/8 | 20/20 present, 0 missing, 0 corrupt | 0 | `e2fsck -fn` exit 0 at all 8 marks | 0 bytes visible | 7 s |
+| XFS | xfsprogs 7.1.1 | `rw,relatime,seclabel,inode64,logbufs=8,logbsize=32k,noquota` | 394 | 8/8 | 20/20 present, 0 missing, 0 corrupt | 0 | `xfs_repair -n` exit 0 at all 8 marks | 0 bytes visible | 7 s |
+
+At every mark on every filesystem: the replayed volume mounted with default
+options (journal/log recovery ran as it would on a real restart), a fresh
+agent started, its `incarnation` matched the original, every object in the
+inventory snapshot for that mark answered `GET /v1/objects/{kind}/{hash}`
+with 200 (the agent re-hashes on GET, so this is a content check), and no
+object acknowledged only after that mark was visible. The negative control
+(a file written with no `fsync` immediately before its own mark) replayed as
+absent on all three, which confirms the log was dropping cached writes rather
+than passing everything through.
+
+## Drill: dm-log-writes on `anthonypc`
+
+Implemented as `scripts/power-loss-drill.sh <btrfs|ext4|xfs>` (see
+`scripts/README.md`); the outline below is what it does.
 
 `dm-log-writes` records every write and only commits queued writes to the log
 when a `REQ_PREFLUSH` arrives, so replaying the log to a given mark reproduces
@@ -209,20 +250,50 @@ replay-log --log $LOG --replay $DATA --end-mark <upload-id>
 mount $DATA /mnt/replay
 ```
 
-`replay-log` ships with xfstests. `dm-flakey` with `drop_writes` [18] is a
-cheaper alternative for a single crash point but cannot replay to arbitrary
-flush boundaries. Record kernel version, mount options, and
-`/sys/block/<disk>/queue/write_cache` [19] in the drill report; repeat on
-ext4 and XFS on the same loop device. A real power cut on the physical drive
-remains the only test of the drive's own cache behaviour.
+`replay-log` ships with xfstests; the script builds only
+`src/log-writes/replay-log.c` + `log-writes.c` from a shallow clone (its usage
+text advertises `--number-entries`, but the option table spells it
+`--num-entries`). `dm-flakey` with `drop_writes` [18] is a cheaper
+alternative for a single crash point but cannot replay to arbitrary flush
+boundaries; it was not needed. The script records kernel version, mount
+options, and `/sys/block/<disk>/queue/write_cache` [19] in the report and
+runs the same procedure for ext4 and XFS. A real power cut on the physical
+drive remains the only test of the drive's own cache behaviour.
+
+Where the implementation departs from the outline, deliberately:
+
+- The teardown follows xfstests `_log_writes_unmount` / `_log_writes_remove`:
+  after `kill -9` of the agent an `end` mark is inserted, then the volume is
+  unmounted normally and the dm device removed. Everything the unmount
+  flushes lands after `end` and is ignored by replays to `put-<i>`.
+- The data device is `blkdiscard`ed before every replay, so no sector written
+  after the mark can survive from the previous replay state. Plain xfstests
+  replay writes onto whatever the device already holds.
+- The replayed device is mounted read-write with default options rather than
+  read-only, so journal (ext4), log (XFS), or tree-log (btrfs) recovery runs
+  exactly as on a real restart; the agent only reads. The read-only checker
+  (`btrfs check --readonly`, `e2fsck -fn`, `xfs_repair -n`) runs after that
+  mount is released, because both `e2fsck -n` and `xfs_repair -n` refuse or
+  misreport a dirty journal.
+- A negative control (1 MiB written with no `fsync`, then a mark) is replayed
+  last; the run is reported `INCONCLUSIVE` if that file survives intact.
 
 ## Gaps and next actions
 
 - Done 2026-09-29: `TMPDIR` points at `target/` so the suite exercises a real
   filesystem; `anthonypc` kernel, mount options, and write-cache mode are
   recorded above. Document the filesystem each CI run used once CI exists.
-- Run the `dm-log-writes` drill on `anthonypc` for btrfs, ext4, and XFS;
-  attach the report and re-rate the table above.
+- Done 2026-09-29: `dm-log-writes` drill on `anthonypc` for btrfs, ext4, and
+  XFS via `scripts/power-loss-drill.sh`; 8/8 marks on each, table re-rated.
+- Re-run the drill after every kernel update on `anthonypc` and record the
+  kernel in this document; the btrfs rating in particular is kernel-specific.
+- Extend the drill beyond a single sequential writer: several concurrent
+  portal puts between marks, a delete (deletion-marker objects were not
+  exercised, the inventory was empty for that kind), and larger N. Consider
+  `replay-log --fsck ... --check flush` for a checker at every flush boundary.
+- Run the drill on a physical ext4 and XFS partition (or an external drive)
+  rather than a loop device, and, when possible, a real power cut on the
+  physical btrfs volume: only that exercises the drive's own write cache.
 - Add a startup health check that logs the volume filesystem and warns on
   `nobarrier`, `notreelog`, or `data=writeback`.
 - Amend the macOS wording in [m1-storage-contract.md](m1-storage-contract.md)
@@ -232,8 +303,10 @@ remains the only test of the drive's own cache behaviour.
 - Add a fault-injection test that intercepts `sync_regular_file` /
   `sync_directory` failures and asserts the PUT is not acknowledged and the
   temp file is removed.
-- Keep the M1 exit-gate statement unchanged: until the drill passes,
-  distr-hnsw must not hold the only copy of any file.
+- The M1 exit-gate statement ("distr-hnsw must not hold the only copy of any
+  file") is unchanged by this document. The drill now passes on loop devices
+  for three filesystems; whether that, plus the physical-drive caveat above,
+  satisfies the gate is a roadmap decision, not a conclusion of this review.
 
 ## References
 

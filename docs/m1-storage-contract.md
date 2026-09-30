@@ -1,8 +1,9 @@
 # M1 storage contract
 
 This document pins the implemented M1 blob-plane contract through the
-lifecycle observation and scrub pass (pass 3), the master-key custody lane,
-and the backup-set lane. It is subordinate to `DESIGN.md` and
+lifecycle passes (observation and scrub; movement, retirement, admission,
+and garbage collection), the master-key custody lane, and the backup-set
+lane. It is subordinate to `DESIGN.md` and
 `docs/roadmap.md`; later M1 work may extend these rules but must not weaken
 their durability or recovery invariants.
 
@@ -24,10 +25,10 @@ placement verification states, per-object durability health, and a
 copy-first scrub/repair job that never deletes. The custody and backup lanes
 add the bound key identifier, recovery bundle, backup set v1 with a
 versioned-directory target, and the restore path that rebuilt a cluster
-from backup alone in the light local drill. Agents remain loopback-only and
-unauthenticated for M1 development. Physical deletion, movement, node
-retirement, quotas, GC, the S3-compatible target, and the representative
-restore drill on `anthonypc` are not implemented. Until the full M1 exit gate passes, the service must not hold
+from backup alone in the light local drill. Pass 4 adds capacity admission,
+copy-first movement, formal retirement, and proof-based garbage collection
+with agent DELETE. Agents remain loopback-only and unauthenticated for M1
+development. Until the full M1 exit gate passes, the service must not hold
 the only copy of a file or claim recovery readiness.
 
 ## Immutable object namespaces
@@ -193,7 +194,7 @@ backup set, the recovery bundle, and an off-cluster passphrase, and
 downloads the committed file byte for byte while the deleted file stays
 unreadable.
 
-## SQLite schema v6
+## SQLite schema v7
 
 Schema v3 stores `files` as the current projection with generation and
 `committed`, `deleted`, or `recovery_blocked` state. It adds immutable
@@ -210,13 +211,14 @@ incarnation until their agent is observed. Opening a database marks any job
 still `running` from a previous process as `interrupted` and fails its open
 scans; interrupted scans prove nothing. Schema v5 adds `portal_meta`, which
 holds the bound master-key identifier and the content generation. Schema v6
-adds `backup_jobs`, `backup_objects`, and `backup_snapshots`.
+adds `backup_jobs`, `backup_objects`, and `backup_snapshots`. Schema v7
+rebuilds `placements` to admit `orphaned` and adds `gc_proofs`.
 
 The two earlier development lines both used schema version 2 for incompatible
 layouts. Opening a v2 database inspects its table shape and atomically migrates
 either the audited commit-spine layout or the recovery-history layout to
-canonical v3, then v4, then v6 (v5 and v6 are additive). V1 also migrates
-through the same chain. Existing manifest
+canonical v3, then v4, then v7 (v5 and v6 are additive; v7 rebuilds
+`placements`). V1 also migrates through the same chain. Existing manifest
 bytes, ciphertext hashes, and chunk-v1 AAD remain unchanged. Unknown or
 unrecognized schema layouts fail closed.
 
@@ -243,6 +245,67 @@ or corrupt required objects persist a recovery issue and make a live winner
 when its marker cannot regain RF2. Wrong keys, malformed inventories,
 unavailable agents, or another untrustworthy global scan abort without
 mutation.
+
+## Capacity and admission
+
+Each agent tracks the bytes its volume holds and reports capacity in health:
+quota, filesystem free space, reserve (default max(10%, 1 GiB)), hard floor
+(default max(1%, 256 MiB)), chunk-admissible bytes (`min(quota headroom,
+filesystem free) - reserve`), control-admissible bytes (the same minus only
+the hard floor), a state (`ok`, `warning`, `admission_paused`,
+`enospc_observed`), and the last refusal time. A PUT that would breach the
+policy is refused with HTTP 507 and a JSON body naming the limiting factor;
+regular chunks never consume the reserve, manifests and deletion markers may,
+and an `ENOSPC` from the filesystem maps to the same refusal. Agents enforce
+this mechanically from portal-supplied configuration.
+
+The portal admits an upload only when at least `minimum_write_replicas`
+distinct failure domains can each hold every chunk of the file, judged from
+the capacity each agent reported at verification. The persisted plan is kept
+so the same idempotency key converges once space exists. A refusal is
+`InsufficientCapacity` (CLI exit 3); the durability floor is never lowered
+and nothing is deleted to make room.
+
+## Movement and retirement
+
+`portal drain --agent-id X` moves every historical copy held by X so the
+floor and desired placement hold without it: for each object it reads back
+valid copies, PUTs to an eligible agent in another failure domain, reads the
+destination back, confirms the placement, and only then marks X's placement
+`orphaned`. An interrupted drain leaves an extra confirmed copy or an
+unconfirmed destination, never a removed source. `--dry-run` reports the
+plan without changing placements; drain blocks when no other failure domain
+can take a copy.
+
+`portal retire --agent-id X` does not need X reachable. Every other
+configured agent must be reachable, and every historical object must
+already hold read-back-verified copies in two distinct failure domains on
+them; otherwise retirement is refused with the objects at risk. On success
+the incarnation becomes `retired`, its placements `orphaned`, and any agent
+presenting that incarnation again is refused.
+
+## Garbage collection
+
+`portal gc` never deletes without a proof. Candidates are the manifests and
+chunks of generations below a deleted file's current generation, and the
+objects of uncommitted uploads older than the staging grace period.
+Deletion markers are retained. An object required by any live file's current
+generation is never a candidate. For each candidate the planner records the
+facts the contract demands: not required by the highest live generation,
+retention (or grace) elapsed, every active incarnation has a complete
+observation of the object's namespace completed after the deletion or
+expiry, and no placement is pending (movement in flight). A proof row
+persists the content generation, a digest of the active incarnation set, and
+a digest of the latest inventory digests. An earlier proof whose object is
+now blocked is marked stale and never executes.
+
+`portal gc --apply` re-derives every fact and the three digests for each
+planned proof; if anything changed the proof is marked stale and reported.
+Only a fresh proof calls agent DELETE, on every configured agent, and only
+when every agent is reachable; otherwise the deletion is deferred. After all
+deletes succeed the placement rows are removed and the proof is marked
+applied; applied objects are no longer candidates. Retention does not apply
+to the offsite backup set, which keeps its own history.
 
 ## Scrub and durability health
 
@@ -290,5 +353,5 @@ at RF2, before tombstone commit, and after commit. Retrying with the same
 idempotency key must converge without premature visibility changes.
 
 Physical lifecycle behavior is governed by
-[`m1-lifecycle-contract.md`](m1-lifecycle-contract.md). Agent DELETE remains
-unimplemented.
+[`m1-lifecycle-contract.md`](m1-lifecycle-contract.md). Agent DELETE is
+reachable only through an applied garbage-collection proof.
