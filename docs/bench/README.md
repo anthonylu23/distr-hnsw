@@ -50,9 +50,9 @@ two angular sets are the known hard cases and need M = 32: nytimes clears
 0.97 at ef = 400 and glove at roughly ef = 500 (0.966 at 400, 0.985 at 800).
 Every configuration is one to two orders of magnitude faster than the exact
 oracle at the same recall band. Bytes per vector are the f32 originals plus
-graph links; the int8 pass will add the quantized copy and is expected to
-dominate RAM by a factor of about four less than f32 once the graph searches
-int8 (contract §7).
+graph links; the int8 pass adds the quantized copy the graph will search,
+so the RAM the hot path touches per vector drops to about a quarter while the
+originals stay available for exact rescoring (contract §7).
 
 Defaults adopted from these measurements (contract §8): `M = 16` for L2 and
 dot collections, `M = 32` for cosine collections; `ef_search` defaults to 100
