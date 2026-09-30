@@ -1,6 +1,7 @@
 # M3 implementation plan
 
-Status: **Proposed** (2026-09-30). The milestone scope, acceptance criteria,
+Status: **In progress** (pass 1 started 2026-09-30; public datasets pinned,
+oracle and kernels landed). The milestone scope, acceptance criteria,
 and exit gate remain in [`roadmap.md`](roadmap.md) (M3). This page fixes the
 order of work and, deliberately, puts the benchmark datasets and the
 brute-force oracle before any engine code: every recall threshold is written
@@ -66,6 +67,15 @@ parameters M = 16, `ef_construction` = 200, `ef_search` chosen per dataset.
 | RAM per vector at 512 dims, int8 | measured overhead factor published; admission uses it | ≤ 800 bytes total |
 | Snapshot + WAL-tail recovery, 1M × 512 | ≤ 60 s to serving | ≤ 20 s |
 | WAL fsync path | every acknowledged entry survives `kill -9` at every boundary | same, plus host power loss on the qualified filesystems |
+
+Recall is **distance-based**: a returned hit counts when its distance is no
+worse than the k-th true nearest distance (relative tolerance 1e-5). The
+public sets contain exact-duplicate and zero vectors (nytimes: 26,558
+duplicate groups, 239 zero base vectors, 9 zero queries) whose ties make
+id-based recall undercount even exact search; id recall is reported beside
+it for diagnosis. The harness computes the k-th true distance from the
+reference ids with the engine's own kernels so both sides use one
+definition.
 
 If a required threshold is missed, the gate stays open; thresholds change only
 by a documented decision, never by editing after a run.

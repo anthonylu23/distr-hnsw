@@ -62,6 +62,11 @@ encrypted blobs plus distributed HNSW vector search. Product design lives in
   `scripts/README.md`).
 - `crates/distr-hnsw/` — product service and CLI; keep this separate from the
   disposable phase-0 prototype.
+- `crates/distr-hnsw-index/` — single-partition vector engine (M3): flat
+  vectors, distance kernels, exact oracle, then HNSW. No tokio, no network.
+- `crates/distr-hnsw-bench/` — benchmark harness against pinned datasets;
+  manifests under `docs/bench/`, data under `~/distr-hnsw-bench/` on
+  `anthonypc`. Plan: `docs/m3-implementation-plan.md`.
 - `prototype/` — **disposable** phase-0 validation CLI (`distr-hnsw-validate`).
   Not product code; do not grow it into the distributed service. See
   `docs/phase-0-validation.md`.

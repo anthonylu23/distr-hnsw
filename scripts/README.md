@@ -96,3 +96,20 @@ Runs the S3 backup target tests against a throwaway MinIO
 restore drill: start MinIO, create an Object-Lock bucket, run
 `restore-drill.sh --target s3:<bucket>/<prefix>` with the MinIO credentials in
 the environment, then stop.
+
+## bench/convert-annb.py
+
+Converts an ann-benchmarks HDF5 dataset into the flat pinned layout the bench
+harness reads (`base.f32le`, `queries.f32le`, `groundtruth.i32le`,
+`manifest.json` with BLAKE3 digests). Run once per dataset inside the venv at
+`~/distr-hnsw-bench/.venv` (`h5py`, `numpy`, `blake3`); commit only the
+manifest under `docs/bench/`.
+
+```sh
+~/distr-hnsw-bench/.venv/bin/python scripts/bench/convert-annb.py \
+  ~/distr-hnsw-bench/downloads/sift-128-euclidean.hdf5 \
+  ~/distr-hnsw-bench/datasets/sift-128-euclidean \
+  --name sift-128-euclidean --source https://ann-benchmarks.com/sift-128-euclidean.hdf5
+cargo run --release -p distr-hnsw-bench -- verify ~/distr-hnsw-bench/datasets/sift-128-euclidean
+cargo run --release -p distr-hnsw-bench -- oracle ~/distr-hnsw-bench/datasets/sift-128-euclidean --k 10
+```
