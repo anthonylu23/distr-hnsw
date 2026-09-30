@@ -175,10 +175,10 @@ originals make that a rebuild, not a data loss.
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `M` | 16 | max neighbours per node on upper levels |
-| `M0` | 32 | max neighbours on level 0 |
+| `M` | 16 for `l2` and `dot`, 32 for `cosine` | max neighbours per node on upper levels; set from the pass 3 measurements (`docs/bench/README.md`) |
+| `M0` | `2 · M` | max neighbours on level 0 |
 | `ef_construction` | 200 | candidate list during insert |
-| `ef_search` | 100 | per query, at least `k`; per-collection default, per-query override |
+| `ef_search` | 100 for `l2` and `dot`, 400 for `cosine` | per query, at least `k`; per-collection default, per-query override |
 | level multiplier | `1 / ln(M)` | levels drawn from a geometric distribution |
 | level RNG | seeded by `(partition_id, slot)` | deterministic levels, so the same log yields the same graph on every replica and in tests |
 | neighbour selection | heuristic (HNSW Algorithm 4) with pruned-candidate backfill | |
@@ -190,6 +190,13 @@ and are traversed but never scored into results. Concurrency: queries take a
 read guard on the partition state; inserts serialize on the writer; a query
 never observes a partially linked slot because linking completes before the
 high-water mark advances.
+
+**Bulk build.** Bulk loads, compaction rebuilds, and benchmarks may use the
+parallel builder: levels and the entry point are the same deterministic
+function of `(seed, slot)`, but neighbour selection depends on thread
+scheduling, so two parallel builds of one log are not byte-identical (recall
+agreed within 0.001 in pass 3). The WAL apply path inserts sequentially and
+stays deterministic.
 
 ## 9. Filtered search
 
