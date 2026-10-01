@@ -166,10 +166,18 @@ Each slot stores its full-precision `f32` vector and an int8 copy:
 Search runs on the int8 graph with `ef_search`, collects candidates, then
 **rescoring** recomputes the exact `f32` distance for the top
 `max(4·k, 100)` candidates (configurable) and returns the best `k`. The
-returned distance is always the `f32` distance of the returned slot. The
-recall cost of int8 (threshold: within 0.01 of the `f32` graph) is measured
-in pass 4; if the graph itself ever needs re-quantization, the `f32`
+returned distance is always the `f32` distance of the returned slot. Pass 4
+measured the recall cost of int8 at no more than 0.0005 on the public sets
+(threshold 0.01; `docs/bench/README.md`), so int8 traversal with rescoring
+is the default search mode and the `f32` mode remains available for
+diagnosis. If the graph itself ever needs re-quantization, the `f32`
 originals make that a rebuild, not a data loss.
+
+The `f32` originals are **not** part of the RAM hot set: traversal touches
+only int8 codes and graph links, and rescoring reads at most the rescoring
+depth of originals per query. Originals therefore live in the memory-mapped
+snapshot (§5) and are served through the page cache; a partition's RAM
+budget (§11) counts int8 codes, scalars, and graph only.
 
 ## 8. HNSW parameters and construction
 
@@ -237,11 +245,17 @@ tombstones are replayed into the new state too.
 
 ## 11. Memory accounting and admission
 
-Per slot: `dims × 4` (f32) + `dims + 8` (int8, scale, norm) + key bytes +
-payload bytes + graph links (`M0 × 4` at level 0 plus `M × 4` per upper
-level, expected `≈ (M0 + M/(ln M − 1)) × 4`) + slot metadata (32) + key map
-(≈ 48). The overhead factor over `vectors × dims × bytes_per_dim` is
-**measured** in pass 4 and published; admission uses the measured value.
+Hot set per slot (RAM): `dims + 8` (int8, scale, norm) + graph links and
+bookkeeping, **measured** in pass 4 as 182 bytes at M = 16 and 310 bytes at
+M = 32 (`docs/bench/README.md`), + slot metadata (32) + key map (≈ 48) +
+payload bytes when payloads are RAM-resident. Published formula:
+
+    hot_bytes_per_vector = dims + 8 + graph(M) + 80 + payload
+
+with `graph(16) = 182`, `graph(32) = 310`; at 512 dims and M = 32 that is
+about 900 bytes before payload. The `f32` originals (`dims × 4`) and the
+snapshot file count against the **disk** budget and the page cache, not the
+RAM budget. Admission uses these measured values, not the estimate.
 
 A partition has a RAM budget and a disk budget. It reserves compaction
 headroom (default 35% of the budget, revised from measurement) and refuses

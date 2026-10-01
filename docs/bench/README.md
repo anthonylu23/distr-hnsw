@@ -58,3 +58,44 @@ Defaults adopted from these measurements (contract §8): `M = 16` for L2 and
 dot collections, `M = 32` for cosine collections; `ef_search` defaults to 100
 for L2/dot and 400 for cosine, per-query overridable. Full reports:
 `~/distr-hnsw-bench/reports/hnsw-*.json`.
+
+## Int8 traversal with exact rescoring (pass 4, 2026-09-30)
+
+Same graphs as above (parallel build, `ef_construction` = 200), 2,000
+queries, k = 10, rescoring the best `max(4k, 100)` = 100 int8 candidates with
+exact f32 distances. Every returned distance is the exact f32 distance of
+the returned slot (asserted by test).
+
+| Dataset | M | ef | Recall@10 f32 → int8 | p50 ms f32 → int8 | Batch q/s f32 → int8 |
+|---|---:|---:|---|---|---|
+| `sift-128-euclidean` | 16 | 50 / 100 / 200 | 0.9585 → 0.9581 / 0.9873 → 0.9869 / 0.9972 → 0.9971 | 0.20 → 0.17 / 0.34 → 0.29 / 0.63 → 0.49 | 23,700 → 47,400 / 13,500 → 27,200 / 7,800 → 16,200 |
+| `nytimes-256-angular` | 32 | 200 / 400 / 800 | 0.9547 → 0.9547 / 0.9744 → 0.9747 / 0.9893 → 0.9891 | 1.34 → 1.08 / 2.70 → 2.14 / 5.26 → 4.23 | 2,900 → 7,900 / 1,400 → 3,900 / 770 → 2,100 |
+| `glove-100-angular` | 32 | 200 / 400 / 800 | 0.9362 → 0.9363 / 0.9659 → 0.9657 / 0.9849 → 0.9850 | 0.98 → 0.96 / 1.82 → 1.76 / 3.34 → 3.04 | 4,900 → 8,400 / 2,600 → 4,700 / 1,400 → 2,500 |
+
+Int8 traversal costs at most 0.0005 recall against the required 0.01 budget
+and the dataset-level ef defaults are unchanged. Single-thread latency drops
+10% to 25%; parallel throughput roughly doubles because the hot set per
+vector shrinks by about four and more of it stays in cache.
+
+### Measured memory per vector
+
+| Dataset | dims | M | f32 originals | int8 + scalars | graph and bookkeeping | Total accounted | RSS after build |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `sift-128-euclidean` | 128 | 16 | 512 | 136 | 182 | 830 | 1.56 GiB / 1M |
+| `nytimes-256-angular` | 256 | 32 | 1,024 | 264 | 310 | 1,598 | 0.96 GiB / 290k |
+| `glove-100-angular` | 100 | 32 | 400 | 108 | 310 | 818 | 1.97 GiB / 1.18M |
+
+Graph bytes per vector are a function of M alone: about 182 at M = 16 and
+310 at M = 32, close to the contract's `(M0 + M/(ln M − 1)) × 4` estimate
+plus 40 bytes of levels, lengths, and list headers. The int8 copy is
+`dims + 8`. The published hot-set formula adopted for admission (contract
+§11) is therefore
+
+    hot_bytes_per_vector = dims + 8 + graph(M),  graph(16) = 182, graph(32) = 310
+
+which gives 830 bytes at the product's 512 dims with M = 32, against the
+plan's target of 800 (required: a measured, published factor, which this
+is). The f32 originals (`dims × 4`) are not part of the hot set: they are
+read only to rescore 100 candidates per query and are served from the
+memory-mapped snapshot through the page cache (contract §7, §11). Full
+reports: `~/distr-hnsw-bench/reports/hnsw-*-int8.json`.
