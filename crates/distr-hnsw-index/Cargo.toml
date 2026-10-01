@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 parking_lot = "0.12"
 rayon = "1"
+roaring = "0.10"
 thiserror = "2"
 
 [dev-dependencies]

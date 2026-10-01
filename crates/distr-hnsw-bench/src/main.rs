@@ -48,6 +48,29 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Build an HNSW graph, derive synthetic filters at several selectivities,
+    /// and measure the brute-force and masked-traversal routes against exact
+    /// filtered ground truth to set the cutover.
+    Filtered {
+        dataset: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        #[arg(long, default_value_t = 100)]
+        ef: usize,
+        #[arg(long, default_value_t = 16)]
+        m: usize,
+        #[arg(long, default_value_t = 200)]
+        ef_construction: usize,
+        /// Comma-separated selectivities as fractions of the base.
+        #[arg(long, default_value = "0.001,0.01,0.1,0.5")]
+        selectivities: String,
+        #[arg(long, default_value_t = 1000)]
+        queries: usize,
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Build an HNSW graph over a dataset and report recall and latency at
     /// one or more `ef_search` values.
     Hnsw {
@@ -239,6 +262,41 @@ struct EfPoint {
 }
 
 #[derive(Serialize)]
+struct FilteredReportV1 {
+    report_type: &'static str,
+    version: u16,
+    dataset: String,
+    metric: String,
+    dims: usize,
+    base_count: usize,
+    queries_evaluated: usize,
+    k: usize,
+    ef_search: usize,
+    parameters: BTreeMap<String, serde_json::Value>,
+    levels: Vec<SelectivityPoint>,
+    /// Allowed-set size at which brute force and masked traversal cost the
+    /// same, interpolated on log scale; the cutover `c` in `T = c · k`.
+    crossover_allowed: Option<f64>,
+    crossover_c: Option<f64>,
+    host: String,
+    source_revision: String,
+}
+
+#[derive(Serialize)]
+struct SelectivityPoint {
+    selectivity: f64,
+    allowed: u64,
+    brute_force_latency_ms: Percentiles,
+    masked_recall_at_k: f64,
+    masked_recall_min: f64,
+    masked_latency_ms: Percentiles,
+    /// Masked traversal with ef scaled to keep recall up under selective
+    /// filters: ef × 4.
+    masked_ef4_recall_at_k: f64,
+    masked_ef4_latency_ms: Percentiles,
+}
+
+#[derive(Serialize)]
 struct Percentiles {
     samples: usize,
     p50: f64,
@@ -362,6 +420,165 @@ fn main() -> anyhow::Result<()> {
                 latency_single_thread_ms: percentiles(latencies),
                 batch_queries_per_second: count as f64 / batch_seconds,
                 batch_threads: threads,
+                host: hostname(),
+                source_revision: option_env!("DISTR_HNSW_REV")
+                    .unwrap_or("unknown")
+                    .to_owned(),
+            };
+            let json = serde_json::to_string_pretty(&report)?;
+            if let Some(out) = out {
+                fs::write(&out, &json)?;
+            }
+            println!("{json}");
+            Ok(())
+        }
+        Command::Filtered {
+            dataset,
+            k,
+            ef,
+            m,
+            ef_construction,
+            selectivities,
+            queries,
+            threads,
+            out,
+        } => {
+            use roaring::RoaringBitmap;
+            let loaded = load(&dataset)?;
+            let threads = threads.unwrap_or_else(num_threads);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build_global()
+                .ok();
+            let levels: Vec<f64> = selectivities
+                .split(',')
+                .map(|v| v.trim().parse::<f64>())
+                .collect::<Result<_, _>>()
+                .context("parsing --selectivities")?;
+            let count = queries.min(loaded.queries.len());
+            let base_count = loaded.base.len();
+            let params = HnswParams {
+                m,
+                m0: 2 * m,
+                ef_construction,
+                seed: 0x5eed,
+            };
+            eprintln!("building HNSW over {base_count} vectors (m={m})");
+            let mut subset = FlatVectors::with_capacity(loaded.base.dims(), base_count);
+            for slot in 0..base_count {
+                subset.push(loaded.base.get(slot as RecordId).unwrap(), Metric::L2)?;
+            }
+            let index = Hnsw::build_parallel(subset, loaded.metric, params);
+
+            let mut points = Vec::new();
+            for &selectivity in &levels {
+                // Deterministic pseudo-random subset: splitmix over the slot.
+                let threshold = (selectivity * u32::MAX as f64) as u64;
+                let allowed: RoaringBitmap = (0..base_count as u32)
+                    .filter(|&slot| {
+                        let mut x =
+                            (u64::from(slot) + 0x9E37_79B9).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                        x ^= x >> 31;
+                        (x & 0xFFFF_FFFF) < threshold
+                    })
+                    .collect();
+                let n = allowed.len();
+                eprintln!("selectivity {selectivity}: {n} allowed slots");
+                // Exact filtered ground truth from the oracle over the set.
+                let truth: Vec<Vec<Hit>> = (0..count)
+                    .into_par_iter()
+                    .map(|q| {
+                        let query = loaded.queries.get(q as RecordId).unwrap();
+                        search(&loaded.base, loaded.metric, query, k, |id| {
+                            allowed.contains(id as u32)
+                        })
+                    })
+                    .collect();
+                let sample = count.min(200);
+                let time_route =
+                    |route: &(dyn Fn(&[f32]) -> Vec<Hit> + Sync)| -> (Percentiles, f64, f64) {
+                        let mut latencies = Vec::with_capacity(sample);
+                        for q in 0..sample {
+                            let query = loaded.queries.get(q as RecordId).unwrap();
+                            let started = Instant::now();
+                            std::hint::black_box(route(query));
+                            latencies.push(started.elapsed().as_secs_f64() * 1e3);
+                        }
+                        let recalls: Vec<f64> = (0..count)
+                            .into_par_iter()
+                            .map(|q| {
+                                let query = loaded.queries.get(q as RecordId).unwrap();
+                                let hits = route(query);
+                                let kth = truth[q].last().map(|h| h.distance).unwrap_or(0.0);
+                                recall_by_distance(kth, &hits, truth[q].len().min(k))
+                            })
+                            .collect();
+                        let mean = recalls.iter().sum::<f64>() / recalls.len().max(1) as f64;
+                        let min = recalls.iter().cloned().fold(1.0, f64::min);
+                        (percentiles(latencies), mean, min)
+                    };
+                let (brute_latency, brute_recall, _) =
+                    time_route(&|query| index.search_exact_over(query, k, &allowed));
+                anyhow::ensure!(
+                    brute_recall > 0.999,
+                    "brute-force route must be exact ({brute_recall})"
+                );
+                let mode = SearchMode::int8_default(k);
+                let (masked_latency, masked_recall, masked_min) =
+                    time_route(&|query| index.search_filtered(query, k, ef, mode, &allowed, 0));
+                let (ef4_latency, ef4_recall, _) =
+                    time_route(&|query| index.search_filtered(query, k, ef * 4, mode, &allowed, 0));
+                eprintln!(
+                    "  brute p50={:.3}ms | masked ef={ef} recall={masked_recall:.4} p50={:.3}ms | masked ef={} recall={ef4_recall:.4} p50={:.3}ms",
+                    brute_latency.p50, masked_latency.p50, ef * 4, ef4_latency.p50
+                );
+                points.push(SelectivityPoint {
+                    selectivity,
+                    allowed: n,
+                    brute_force_latency_ms: brute_latency,
+                    masked_recall_at_k: masked_recall,
+                    masked_recall_min: masked_min,
+                    masked_latency_ms: masked_latency,
+                    masked_ef4_recall_at_k: ef4_recall,
+                    masked_ef4_latency_ms: ef4_latency,
+                });
+            }
+            // Crossover: first interval where brute force becomes slower
+            // than masked traversal; interpolate on log(allowed).
+            let mut crossover = None;
+            for pair in points.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                let fa = a.brute_force_latency_ms.p50 - a.masked_latency_ms.p50;
+                let fb = b.brute_force_latency_ms.p50 - b.masked_latency_ms.p50;
+                if fa <= 0.0 && fb > 0.0 {
+                    let la = (a.allowed as f64).ln();
+                    let lb = (b.allowed as f64).ln();
+                    let t = fa / (fa - fb);
+                    crossover = Some((la + t * (lb - la)).exp());
+                    break;
+                }
+            }
+            let mut parameters = BTreeMap::new();
+            parameters.insert("m".to_owned(), serde_json::json!(m));
+            parameters.insert(
+                "ef_construction".to_owned(),
+                serde_json::json!(ef_construction),
+            );
+            parameters.insert("rescore".to_owned(), serde_json::json!((4 * k).max(100)));
+            let report = FilteredReportV1 {
+                report_type: "FilteredReportV1",
+                version: 1,
+                dataset: loaded.manifest.name.clone(),
+                metric: loaded.metric.as_str().to_owned(),
+                dims: loaded.base.dims(),
+                base_count,
+                queries_evaluated: count,
+                k,
+                ef_search: ef,
+                parameters,
+                levels: points,
+                crossover_allowed: crossover,
+                crossover_c: crossover.map(|x| x / k as f64),
                 host: hostname(),
                 source_revision: option_env!("DISTR_HNSW_REV")
                     .unwrap_or("unknown")

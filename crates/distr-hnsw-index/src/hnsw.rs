@@ -583,6 +583,52 @@ impl Hnsw {
         top.into_sorted()
     }
 
+    /// Filtered search (contract §9). `allowed` holds the slots a query may
+    /// return; tombstoned slots are excluded regardless. When the allowed set
+    /// is small (at most `cutover` slots) the query is answered exactly over
+    /// that set, which is both cheaper and perfectly accurate in the regime
+    /// where graph traversal degrades; otherwise the graph is traversed with
+    /// the filter as a mask, routing through excluded slots without
+    /// returning them.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        mode: SearchMode,
+        allowed: &roaring::RoaringBitmap,
+        cutover: u64,
+    ) -> Vec<Hit> {
+        if k == 0 || allowed.is_empty() {
+            return Vec::new();
+        }
+        if allowed.len() <= cutover {
+            return self.search_exact_over(query, k, allowed);
+        }
+        let mask = |slot: Slot| allowed.contains(slot);
+        self.search_with(query, k, ef, mode, Some(&mask))
+    }
+
+    /// Exact top-k over an explicit slot set (the selective-filter route).
+    pub fn search_exact_over(
+        &self,
+        query: &[f32],
+        k: usize,
+        allowed: &roaring::RoaringBitmap,
+    ) -> Vec<Hit> {
+        let mut top = TopK::new(k);
+        for slot in allowed.iter() {
+            if slot as usize >= self.len() || self.is_tombstoned(slot) {
+                continue;
+            }
+            top.push(Hit {
+                id: u64::from(slot),
+                distance: self.dist(query, slot),
+            });
+        }
+        top.into_sorted()
+    }
+
     /// Accounted bytes split into `(f32 originals, int8 copies, graph and
     /// bookkeeping)` for the memory model in contract §11.
     pub fn accounted_breakdown(&self) -> (usize, usize, usize) {
@@ -857,11 +903,12 @@ impl Hnsw {
                 params,
                 links: LockedLinks::new(&levels, params.m, params.m0),
             };
-            // Insert in chunks so early nodes have neighbours before the
-            // graph fans out; within a chunk, insertion is parallel.
+            // Insert in chunks that double in size, so the first few hundred
+            // nodes link under little contention and later nodes find a
+            // well-formed graph; within a chunk, insertion is parallel.
             let order: Vec<Slot> = (0..slots as Slot).filter(|&s| s != entry).collect();
             let mut start = 0_usize;
-            let mut chunk = 64_usize;
+            let mut chunk = 1_usize;
             while start < order.len() {
                 let end = (start + chunk).min(order.len());
                 order[start..end]
@@ -1052,6 +1099,68 @@ mod tests {
         }
         assert!(total.1 / 50.0 >= 0.9, "parallel recall {}", total.1 / 50.0);
         assert!((total.0 - total.1).abs() / 50.0 <= 0.05, "{total:?}");
+    }
+
+    #[test]
+    fn filtered_search_matches_the_oracle_on_both_routes() {
+        use roaring::RoaringBitmap;
+        let rows: Vec<Vec<f32>> = (0..2000)
+            .map(|i| {
+                (0..12)
+                    .map(|d| ((i * (d + 2)) as f32 * 0.017).sin())
+                    .collect()
+            })
+            .collect();
+        let mut store = FlatVectors::new(12);
+        for row in &rows {
+            store.push(row, Metric::L2).unwrap();
+        }
+        let mut index = Hnsw::build_parallel(
+            store.clone(),
+            Metric::L2,
+            HnswParams {
+                m: 8,
+                m0: 16,
+                ef_construction: 64,
+                seed: 5,
+            },
+        );
+        for slot in [3_u32, 400, 1999] {
+            index.tombstone(slot);
+        }
+        let selective: RoaringBitmap = (0..2000_u32).filter(|s| s % 97 == 0).collect();
+        let broad: RoaringBitmap = (0..2000_u32).filter(|s| s % 3 != 0).collect();
+        let query: Vec<f32> = (0..12).map(|d| (d as f32 * 0.21).cos()).collect();
+        for allowed in [&selective, &broad] {
+            let exact = oracle::search(&store, Metric::L2, &query, 7, |id| {
+                allowed.contains(id as Slot) && !index.is_tombstoned(id as Slot)
+            });
+            // Brute-force route (cutover above the set size) is exact.
+            let brute = index.search_filtered(&query, 7, 64, SearchMode::F32, allowed, 10_000);
+            assert_eq!(brute, exact);
+            // Masked traversal with exhaustive ef also reproduces the oracle.
+            let masked = index.search_filtered(&query, 7, 2000, SearchMode::F32, allowed, 0);
+            assert_eq!(masked, exact);
+            // Int8 masked traversal returns exact distances and only allowed slots.
+            let int8 =
+                index.search_filtered(&query, 7, 128, SearchMode::int8_default(7), allowed, 0);
+            assert!(int8
+                .iter()
+                .all(|h| allowed.contains(h.id as Slot) && !index.is_tombstoned(h.id as Slot)));
+            for hit in &int8 {
+                assert_eq!(
+                    hit.distance,
+                    distance(Metric::L2, &query, store.get(hit.id).unwrap())
+                );
+            }
+        }
+        assert!(index
+            .search_filtered(&query, 7, 64, SearchMode::F32, &RoaringBitmap::new(), 100)
+            .is_empty());
+        let only_tombstoned: RoaringBitmap = [3_u32, 400].into_iter().collect();
+        assert!(index
+            .search_filtered(&query, 7, 64, SearchMode::F32, &only_tombstoned, 100)
+            .is_empty());
     }
 
     #[test]
