@@ -43,6 +43,23 @@ pub struct PartitionConfig {
     pub ef_construction: usize,
     pub seed: u64,
     pub idempotency_window: usize,
+    /// RAM budget for the hot set (contract §11); `None` = unlimited.
+    #[serde(default)]
+    pub ram_budget_bytes: Option<u64>,
+    /// Fraction of the budget reserved for compaction and recovery headroom.
+    #[serde(default = "default_headroom")]
+    pub headroom_fraction: f64,
+    /// Tombstone ratio at which compaction is recommended (contract §10).
+    #[serde(default = "default_compaction_ratio")]
+    pub compaction_tombstone_ratio: f64,
+}
+
+fn default_headroom() -> f64 {
+    0.35
+}
+
+fn default_compaction_ratio() -> f64 {
+    0.2
 }
 
 impl PartitionConfig {
@@ -56,7 +73,18 @@ impl PartitionConfig {
             ef_construction: params.ef_construction,
             seed: params.seed,
             idempotency_window: DEFAULT_IDEMPOTENCY_WINDOW,
+            ram_budget_bytes: None,
+            headroom_fraction: default_headroom(),
+            compaction_tombstone_ratio: default_compaction_ratio(),
         }
+    }
+
+    /// Bytes an upsert of one vector with `payload_len` bytes adds to the
+    /// hot set under the measured model (`docs/bench/README.md`): int8 copy
+    /// and scalars, graph links for this M, slot and key bookkeeping.
+    pub fn hot_bytes_per_insert(&self, payload_len: usize) -> usize {
+        let graph = if self.m <= 16 { 182 } else { 310 };
+        self.dims + 8 + graph + 80 + payload_len
     }
 
     fn params(&self) -> HnswParams {
@@ -83,6 +111,35 @@ pub enum Failpoint {
     AfterApply,
     SnapshotBeforeRename,
     SnapshotAfterRename,
+    /// Compaction: the rebuilt state's snapshot is durable but the served
+    /// state has not been swapped.
+    CompactionBeforeSwap,
+}
+
+/// The frozen rebuild produced by [`Partition::begin_compaction`].
+pub struct CompactionPlan {
+    rebuild_point: u64,
+    index: Hnsw,
+    key_table: Vec<Vec<u8>>,
+    keys: HashMap<Vec<u8>, (u32, Option<Slot>)>,
+    slots: Vec<SlotRecord>,
+    idempotency: Vec<([u8; 16], u64)>,
+}
+
+impl CompactionPlan {
+    pub fn rebuild_point(&self) -> u64 {
+        self.rebuild_point
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionReport {
+    pub rebuild_point: u64,
+    pub caught_up_entries: u64,
+    pub slots_before: usize,
+    pub tombstones_before: usize,
+    pub slots_after: usize,
+    pub snapshot: PathBuf,
 }
 
 /// Outcome of a mutation.
@@ -469,6 +526,7 @@ impl Partition {
         if self.metric.normalizes() && !normalize(&mut stored) {
             return Err(PartitionError::ZeroVector);
         }
+        self.admit(payload.len())?;
         self.mutate(
             op_id,
             Operation::Upsert {
@@ -488,6 +546,169 @@ impl Partition {
             });
         }
         self.mutate(op_id, Operation::Delete { key: key.to_vec() })
+    }
+
+    /// Admission against the RAM budget (contract §11): refuse an upsert
+    /// that would push the hot set past `budget − headroom`. Deletes are
+    /// always admitted; nothing is ever dropped to make room.
+    fn admit(&self, payload_len: usize) -> Result<(), PartitionError> {
+        let Some(budget) = self.config.ram_budget_bytes else {
+            return Ok(());
+        };
+        let headroom = (budget as f64 * self.config.headroom_fraction.clamp(0.0, 0.9)) as u64;
+        let limit = budget.saturating_sub(headroom);
+        let projected =
+            self.resident_bytes() as u64 + self.config.hot_bytes_per_insert(payload_len) as u64;
+        if projected > limit {
+            return Err(PartitionError::OverBudget {
+                resident_bytes: self.resident_bytes() as u64,
+                projected_bytes: projected,
+                admissible_bytes: limit,
+                budget_bytes: budget,
+                headroom_bytes: headroom,
+            });
+        }
+        Ok(())
+    }
+
+    /// Change the RAM budget at runtime (the manifest keeps the configured
+    /// default; the balancer owns live budgets in M4).
+    pub fn set_ram_budget(&mut self, budget_bytes: Option<u64>) {
+        self.config.ram_budget_bytes = budget_bytes;
+    }
+
+    pub fn tombstone_ratio(&self) -> f64 {
+        if self.slots.is_empty() {
+            0.0
+        } else {
+            self.index.tombstone_count() as f64 / self.slots.len() as f64
+        }
+    }
+
+    pub fn compaction_recommended(&self) -> bool {
+        self.tombstone_ratio() >= self.config.compaction_tombstone_ratio
+    }
+
+    /// Phase 1 of compaction (contract §10): freeze the rebuild point and
+    /// build a new state from the live slots in slot order, preserving
+    /// relative order so ties resolve as before. Takes `&self`, so reads and
+    /// (behind an outer lock) writes may proceed while this runs.
+    pub fn begin_compaction(&self) -> Result<CompactionPlan, PartitionError> {
+        let rebuild_point = self.high_water;
+        let mut live_vectors =
+            crate::vector::FlatVectors::with_capacity(self.config.dims, self.index.live_len());
+        let mut slot_records = Vec::with_capacity(self.index.live_len());
+        let mut old_to_new: HashMap<Slot, Slot> = HashMap::with_capacity(self.index.live_len());
+        for (old_slot, record) in self.slots.iter().enumerate() {
+            if record.tombstone {
+                continue;
+            }
+            let row = self
+                .index
+                .vectors()
+                .get(old_slot as u64)
+                .ok_or(PartitionError::Manifest("slot without vector"))?;
+            // Rows are already normalized; store as given.
+            let new_slot = live_vectors.push(row, Metric::L2)? as Slot;
+            old_to_new.insert(old_slot as Slot, new_slot);
+            slot_records.push(record.clone());
+        }
+        let index = Hnsw::build_parallel(live_vectors, self.metric, self.config.params());
+        let mut keys = HashMap::with_capacity(self.keys.len());
+        for (key, (index_in_table, live)) in &self.keys {
+            let live = live.and_then(|old| old_to_new.get(&old).copied());
+            keys.insert(key.clone(), (*index_in_table, live));
+        }
+        Ok(CompactionPlan {
+            rebuild_point,
+            index,
+            key_table: self.key_table.clone(),
+            keys,
+            slots: slot_records,
+            idempotency: self.idempotency.entries(),
+        })
+    }
+
+    /// Phase 2 of compaction: apply every entry acknowledged after the
+    /// rebuild point to the new state from the WAL, write its snapshot at
+    /// the current high-water mark, and swap. A crash before the swap leaves
+    /// the old state authoritative on disk until the new snapshot is the
+    /// newest verifiable one, which represents the same logical state.
+    pub fn finish_compaction(
+        &mut self,
+        plan: CompactionPlan,
+    ) -> Result<CompactionReport, PartitionError> {
+        let CompactionPlan {
+            rebuild_point,
+            index,
+            key_table,
+            keys,
+            slots,
+            idempotency,
+        } = plan;
+        let mut staged = Partition {
+            directory: self.directory.clone(),
+            config: self.config.clone(),
+            metric: self.metric,
+            index,
+            key_table,
+            keys,
+            slots,
+            idempotency: IdempotencyWindow::new(self.config.idempotency_window),
+            wal: None,
+            high_water: rebuild_point,
+            snapshot_high_water: self.snapshot_high_water,
+            failpoint: None,
+        };
+        for (op_id, seq) in idempotency {
+            staged.idempotency.record(op_id, seq);
+        }
+        // Catch up from the durable log: every entry after the rebuild point.
+        let mut replayed = 0_u64;
+        for (first_seq, path) in wal::list_segments(&self.directory.join(WAL_DIR))? {
+            if first_seq > self.high_water {
+                continue;
+            }
+            let read = wal::read_segment(&path, self.config.id, false)?;
+            for entry in read.entries {
+                if entry.seq <= rebuild_point || entry.seq > self.high_water {
+                    continue;
+                }
+                if entry.seq != staged.high_water + 1 {
+                    return Err(PartitionError::Wal(WalError::SequenceGap {
+                        path: path.clone(),
+                        expected: staged.high_water + 1,
+                        found: entry.seq,
+                    }));
+                }
+                staged.apply(&entry)?;
+                replayed += 1;
+            }
+        }
+        if staged.high_water != self.high_water {
+            return Err(PartitionError::MissingHistory {
+                snapshot_high_water: staged.high_water,
+                first_wal_seq: Some(self.high_water),
+            });
+        }
+        let before = (self.slots.len(), self.index.tombstone_count());
+        let path = staged.snapshot()?;
+        self.hit(Failpoint::CompactionBeforeSwap)?;
+        // Swap: the staged state becomes the served state; the writer stays.
+        self.index = staged.index;
+        self.key_table = staged.key_table;
+        self.keys = staged.keys;
+        self.slots = staged.slots;
+        self.idempotency = staged.idempotency;
+        self.snapshot_high_water = self.high_water;
+        Ok(CompactionReport {
+            rebuild_point,
+            caught_up_entries: replayed,
+            slots_before: before.0,
+            tombstones_before: before.1,
+            slots_after: self.slots.len(),
+            snapshot: path,
+        })
     }
 
     fn mutate(&mut self, op_id: [u8; 16], operation: Operation) -> Result<Applied, PartitionError> {
@@ -684,6 +905,14 @@ pub enum PartitionError {
     ZeroVector,
     #[error("injected failure at {0:?}")]
     Injected(Failpoint),
+    #[error("over RAM budget: resident {resident_bytes} + insert would reach {projected_bytes} bytes, admissible {admissible_bytes} of {budget_bytes} (headroom {headroom_bytes}); refusing without dropping data")]
+    OverBudget {
+        resident_bytes: u64,
+        projected_bytes: u64,
+        admissible_bytes: u64,
+        budget_bytes: u64,
+        headroom_bytes: u64,
+    },
     #[error("no WAL history covers sequence {snapshot_high_water}+1 (first WAL sequence {first_wal_seq:?}); refusing to serve an incomplete partition")]
     MissingHistory {
         snapshot_high_water: u64,
@@ -1107,6 +1336,160 @@ mod tests {
         assert_eq!(after_f32, before_f32, "f32 traversal after recovery");
         let after = recovered.search(&query, 10, 100, None).unwrap();
         assert_eq!(after, before, "int8 traversal after recovery");
+    }
+
+    #[test]
+    fn compaction_preserves_live_records_hides_deleted_ones_and_survives_crash_before_swap() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let mut partition = Partition::create(directory.path(), config(id)).unwrap();
+        fill(&mut partition, 0..400);
+        for i in (0..400).step_by(3) {
+            partition
+                .delete(op(50_000 + i as u64), format!("key-{i}").as_bytes())
+                .unwrap();
+        }
+        assert!(partition.compaction_recommended());
+        let plan = partition.begin_compaction().unwrap();
+        // Writes continue after the rebuild point: delete a live record,
+        // re-upsert a deleted one, add new ones.
+        partition.delete(op(60_000), b"key-1").unwrap();
+        partition
+            .upsert(op(60_001), b"key-3", &vector(3), b"back")
+            .unwrap();
+        fill(&mut partition, 400..430);
+        let expected = state(&partition);
+        let live_keys: Vec<Vec<u8>> = (0..430)
+            .map(|i| format!("key-{i}").into_bytes())
+            .filter(|k| partition.slot_for_key(k).is_some())
+            .collect();
+
+        // Crash before swap: the new snapshot exists; the live state is old.
+        let mut crashing = partition.with_failpoint(Failpoint::CompactionBeforeSwap);
+        assert!(matches!(
+            crashing.finish_compaction(plan),
+            Err(PartitionError::Injected(Failpoint::CompactionBeforeSwap))
+        ));
+        drop(crashing);
+        let (reopened, report) = Partition::open(directory.path()).unwrap();
+        assert_eq!(
+            report.snapshot_high_water, expected.0,
+            "compacted snapshot is the newest"
+        );
+        assert_eq!(report.wal_entries_replayed, 0);
+        assert_eq!(reopened.live_count(), expected.1);
+        // The rebuild had no tombstones; the one delete caught up after the
+        // rebuild point (key-1) is the only tombstone in the new state.
+        assert_eq!(reopened.index().tombstone_count(), 1);
+        assert!(reopened.slot_for_key(b"key-1").is_none());
+        assert_eq!(
+            reopened.search(&vector(3), 1, 32, None).unwrap()[0].payload,
+            b"back"
+        );
+        for key in &live_keys {
+            assert!(reopened.slot_for_key(key).is_some(), "{key:?}");
+        }
+        assert_eq!(reopened.search(&vector(3), 5, 32, None).unwrap().len(), 5);
+
+        // Normal compaction swaps in place and keeps serving the same keys.
+        let mut partition = reopened;
+        fill(&mut partition, 430..440);
+        for i in 430..436 {
+            partition
+                .delete(op(70_000 + i as u64), format!("key-{i}").as_bytes())
+                .unwrap();
+        }
+        let plan = partition.begin_compaction().unwrap();
+        partition
+            .upsert(op(80_000), b"key-999", &vector(999), b"n")
+            .unwrap();
+        let report = partition.finish_compaction(plan).unwrap();
+        assert_eq!(report.caught_up_entries, 1);
+        // Six new deletes plus the one tombstone carried from the previous
+        // compaction's catch-up.
+        assert_eq!(report.tombstones_before, 7);
+        assert_eq!(report.slots_after, partition.live_count());
+        assert_eq!(partition.index().tombstone_count(), 0);
+        assert!(partition.slot_for_key(b"key-999").is_some());
+        assert!(partition.slot_for_key(b"key-430").is_none());
+        // Idempotency survives compaction.
+        assert!(
+            partition
+                .upsert(op(80_000), b"key-999", &vector(1), b"x")
+                .unwrap()
+                .deduplicated
+        );
+        // Order is preserved: the oracle agrees on the top results.
+        let q: Vec<f32> = (0..8).map(|d| (d as f32 * 0.5).sin()).collect();
+        let mut nq = q.clone();
+        normalize(&mut nq);
+        let hits = partition.search(&q, 5, 400, None).unwrap();
+        let exact =
+            crate::oracle::search(partition.index().vectors(), Metric::Cosine, &nq, 5, |id| {
+                !partition.index().is_tombstoned(id as Slot)
+            });
+        assert_eq!(
+            hits.iter().map(|h| h.slot as u64).collect::<Vec<_>>(),
+            exact.iter().map(|h| h.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ram_budget_refuses_upserts_but_admits_deletes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut budgeted = config(Uuid::new_v4());
+        budgeted.ram_budget_bytes = Some(64 * 1024);
+        budgeted.headroom_fraction = 0.25;
+        let mut partition = Partition::create(directory.path(), budgeted).unwrap();
+        let mut admitted = 0;
+        let refusal = loop {
+            match partition.upsert(
+                op(admitted),
+                format!("k{admitted}").as_bytes(),
+                &vector(admitted as usize),
+                b"",
+            ) {
+                Ok(_) => admitted += 1,
+                Err(error) => break error,
+            }
+            assert!(admitted < 10_000, "budget never bit");
+        };
+        assert!(
+            matches!(refusal, PartitionError::OverBudget { .. }),
+            "{refusal}"
+        );
+        assert!(admitted > 10);
+        assert_eq!(
+            partition.high_water(),
+            admitted,
+            "a refused upsert consumes no sequence"
+        );
+        for i in 0..admitted / 2 {
+            partition
+                .delete(op(99_000 + i), format!("k{i}").as_bytes())
+                .unwrap();
+        }
+        assert!(partition.slot_for_key(b"k0").is_none());
+        // Deletes do not free hot-set bytes until compaction; compaction does.
+        assert!(matches!(
+            partition.upsert(op(100_000), b"again", &vector(5), b""),
+            Err(PartitionError::OverBudget { .. })
+        ));
+        let plan = partition.begin_compaction().unwrap();
+        partition.finish_compaction(plan).unwrap();
+        assert!(partition
+            .upsert(op(100_000), b"again", &vector(5), b"")
+            .is_ok());
+        // Operators may change the budget at runtime.
+        partition.set_ram_budget(Some(1));
+        assert!(matches!(
+            partition.upsert(op(100_001), b"tiny", &vector(6), b""),
+            Err(PartitionError::OverBudget { .. })
+        ));
+        partition.set_ram_budget(None);
+        assert!(partition
+            .upsert(op(100_001), b"tiny", &vector(6), b"")
+            .is_ok());
     }
 
     #[test]

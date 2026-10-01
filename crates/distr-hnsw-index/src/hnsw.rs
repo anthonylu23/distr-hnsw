@@ -1220,8 +1220,12 @@ mod tests {
         for row in &rows {
             store.push(row, Metric::L2).unwrap();
         }
-        let mut index = Hnsw::build_parallel(
-            store.clone(),
+        // Sequential insertion: the exhaustive-ef equality with the oracle
+        // below requires every slot to be reachable, which the deterministic
+        // path guarantees for this data; parallel-build quality is asserted
+        // statistically in its own test.
+        let mut index = Hnsw::new(
+            12,
             Metric::L2,
             HnswParams {
                 m: 8,
@@ -1230,6 +1234,9 @@ mod tests {
                 seed: 5,
             },
         );
+        for row in &rows {
+            index.insert(row).unwrap();
+        }
         for slot in [3_u32, 400, 1999] {
             index.tombstone(slot);
         }
