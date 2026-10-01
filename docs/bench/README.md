@@ -99,3 +99,42 @@ is). The f32 originals (`dims × 4`) are not part of the hot set: they are
 read only to rescore 100 candidates per query and are served from the
 memory-mapped snapshot through the page cache (contract §7, §11). Full
 reports: `~/distr-hnsw-bench/reports/hnsw-*-int8.json`.
+
+## Filtered search (pass 5, 2026-09-30)
+
+Same graphs, k = 10, 1,000 queries, int8 traversal with rescoring. Filters
+are deterministic pseudo-random subsets of the base at four selectivities;
+ground truth is exact search over the allowed set. Two routes are timed per
+level: exact brute force over the allowed slots, and masked traversal at
+the dataset's default ef (recall is for the masked route; brute force is
+exact by construction).
+
+| Dataset (M, ef) | Selectivity | Allowed | Brute p50 (ms) | Masked recall@10 (min) | Masked p50 (ms) |
+|---|---:|---:|---:|---|---:|
+| sift (16, 100) | 0.1% / 1% / 10% / 50% | 1,000 / 9,988 / 100,015 / 500,046 | 0.03 / 0.34 / 13.2 / 38.6 | 1.000 (1.0) / 0.9997 (0.9) / 0.9996 (0.9) / 0.996 (0.8) | 61.4 / 10.4 / 1.79 / 0.52 |
+| nytimes (32, 400) | 0.1% / 1% / 10% / 50% | 285 / 2,900 / 28,979 / 144,996 | 0.01 / 0.14 / 4.2 / 17.8 | 0.999 (0.0) / 0.9987 (0.0) / 0.9958 (0.7) / 0.9829 (0.6) | 118 / 51.0 / 15.9 / 4.02 |
+| glove (32, 800) | 0.1% / 1% / 10% / 50% | 1,182 / 11,838 / 118,344 / 591,790 | 0.03 / 0.32 / 13.2 / 32.7 | 1.000 (1.0) / 1.000 (1.0) / 0.9994 (0.9) / 0.9929 (0.7) | 447 / 117 / 21.4 / 5.41 |
+
+Reading:
+
+- Masked traversal collapses under selective filters: at 0.1% it is slower
+  than an unfiltered brute-force scan of the whole base, because the graph
+  routes through thousands of excluded nodes to find a few allowed ones, and
+  on nytimes some queries find none at all (per-query minimum 0.0). This is
+  the regime the contract reserves for the exact route, which costs
+  microseconds there.
+- Above the crossover the masked route is 7 to 75 times faster than brute
+  force and its mean recall stays at or above 0.983, clearing the 0.95
+  threshold at every level; raising ef four times lifts the 50% level to
+  0.997 or better.
+- The latency crossover is 29k allowed slots on sift (ef 100), 61k on
+  nytimes (ef 400), and 172k on glove (ef 800): 294, 152, and 215 times ef.
+  Expressed per k it would be 2,900 to 17,000 times k, so the plan's
+  `c ≈ 50 · k` hypothesis was wrong by two orders of magnitude; the cost of
+  masked traversal scales with ef, not k.
+
+Cutover adopted (contract §9): `T = 200 · ef_search`. At every measured
+level this picks the faster route, and near the boundary it prefers the
+exact one. A future refinement is an int8 brute-force route with rescoring,
+which would move the crossover higher. Full reports:
+`~/distr-hnsw-bench/reports/filtered-*.json`.

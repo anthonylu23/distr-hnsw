@@ -1,11 +1,11 @@
 # M3 implementation plan
 
-Status: **In progress** (passes 1 public part, 2, 3, and 4 done
+Status: **In progress** (passes 1 public part, 2, 3, 4, and 5 done
 2026-09-30: datasets pinned, oracle and kernels landed, engine contract
 written in [m3-engine-contract.md](m3-engine-contract.md), HNSW core meets
 the f32 recall thresholds, int8 traversal with exact rescoring costs at most
-0.0005 recall and the memory formula is measured; results in
-[bench/README.md](bench/README.md)). The milestone scope, acceptance criteria,
+0.0005 recall, the memory formula is measured, and filtered search has a
+measured cutover of 200 · ef; results in [bench/README.md](bench/README.md)). The milestone scope, acceptance criteria,
 and exit gate remain in [`roadmap.md`](roadmap.md) (M3). This page fixes the
 order of work and, deliberately, puts the benchmark datasets and the
 brute-force oracle before any engine code: every recall threshold is written
@@ -135,10 +135,13 @@ updated contract documentation. Estimates are solo-effort scale markers.
    doubled; graph 182 B/vector at M = 16 and 310 at M = 32; hot-set formula
    adopted in the contract with f32 originals moved to the snapshot/page
    cache.
-5. **Filtered search** (~1 week). Roaring bitmap masks shared with the
-   tombstone path; masked traversal; brute-force cutover with the threshold
-   set from the 0.1%–50% measurements, not guessed. Exit: filtered recall
-   thresholds met at every selectivity.
+5. **Filtered search** (~1 week; done in one day). Roaring bitmap masks
+   shared with the tombstone path; masked traversal; brute-force cutover
+   with the threshold set from the 0.1%–50% measurements, not guessed. Exit:
+   filtered recall thresholds met at every selectivity. **Result:** masked
+   recall 0.983 to 1.000 at every level; the crossover is 150 to 300 times
+   ef, so the cutover is `200 · ef_search` and the `50 · k` hypothesis is
+   rejected.
 6. **WAL, snapshot, recovery** (~2 weeks). Checksummed WAL segments with
    sequence numbers and idempotency ids; versioned mmap snapshots; recovery
    from snapshot plus tail; a failpoint harness in the M1 style that kills

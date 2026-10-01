@@ -212,14 +212,19 @@ The portal supplies the allowed set as a roaring bitmap of external keys,
 translated to live slots by the partition. Two modes, chosen per query:
 
 - **Selective**: if `|allowed| ≤ T`, exact distances over the allowed slots
-  only (the oracle path) with the same tie rule. `T = c · k`, with `c` set
-  from the pass 5 measurements at 0.1%, 1%, 10%, and 50% selectivity;
-  hypothesis `c ≈ 50`.
+  only (the oracle path) with the same tie rule. **`T = 200 · ef_search`**,
+  set from the pass 5 measurements (`docs/bench/README.md`): the latency
+  crossover between the two routes was 294, 152, and 215 times `ef_search`
+  on the three public sets, and masked traversal cost scales with `ef`, not
+  `k` (the plan's `50 · k` hypothesis was two orders of magnitude low).
+  `Hnsw::filter_cutover(ef)` implements the rule.
 - **Broad**: masked traversal; excluded and tombstoned slots are routed
   through but never scored or returned. One mask type serves both purposes.
 
 Filtered recall is measured against the oracle over the same allowed set at
-every selectivity level (threshold ≥ 0.95).
+every selectivity level (threshold ≥ 0.95). Pass 5 measured masked-route
+mean recall between 0.983 and 1.000 at 0.1% to 50% selectivity; below the
+cutover the exact route has recall 1.0 by construction.
 
 ## 10. Compaction
 

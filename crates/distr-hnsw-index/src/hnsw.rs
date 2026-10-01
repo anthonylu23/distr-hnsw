@@ -583,6 +583,18 @@ impl Hnsw {
         top.into_sorted()
     }
 
+    /// Cutover between the exact route and masked traversal for filtered
+    /// search (contract §9): allowed sets of at most this many slots are
+    /// answered exactly. The constant is the measured crossover divided by
+    /// `ef_search` on the public sets (294, 152, 215), rounded down to a
+    /// value that favours the exact route near the boundary, since it is the
+    /// one with perfect recall.
+    pub const FILTER_CUTOVER_PER_EF: u64 = 200;
+
+    pub fn filter_cutover(ef: usize) -> u64 {
+        Self::FILTER_CUTOVER_PER_EF * ef.max(1) as u64
+    }
+
     /// Filtered search (contract §9). `allowed` holds the slots a query may
     /// return; tombstoned slots are excluded regardless. When the allowed set
     /// is small (at most `cutover` slots) the query is answered exactly over
