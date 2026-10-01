@@ -98,8 +98,10 @@ by a documented decision, never by editing after a run.
   dataset digests, hardware, parameters, recall, latency percentiles, build
   time, RSS and accounted memory, snapshot bytes, and recovery time. Sanitized
   summaries go under `docs/bench/`, following the phase-0 discipline.
-- `crates/distr-hnsw` gains the `snapshot` and `wal-segment` object classes
-  in pass 7 so the blob plane archives engine state.
+- `crates/distr-hnsw` gains `index archive` and `index restore` (pass 7):
+  a partition's manifest, newest snapshot, and WAL segments are committed as
+  ordinary blob-plane files and recorded in `index_archives` (schema v8);
+  restore downloads them into an empty directory and recovers.
 
 ## Passes
 
@@ -155,13 +157,21 @@ updated contract documentation. Estimates are solo-effort scale markers.
    close and reopened); recovery 1.8 s on sift 1M and 5.4 s on glove with
    byte-identical search results; snapshot 821 bytes/vector at 128 dims.
    The 1M × 512 measurement waits on the project dataset.
-7. **Compaction, budget, blob-plane archive** (~2 weeks). Background rebuild
-   with crash points at the swap; concurrent reads and writes during
-   compaction; memory accounting from the measured overhead factor with
-   recovery and compaction headroom reserved; snapshots and WAL segments
-   archived as blob-plane objects and a partition restored from them
-   through the M1 restore path. Exit: the M3 acceptance checklist has
+7. **Compaction, budget, blob-plane archive** (~2 weeks; done in one day).
+   Background rebuild with crash points at the swap; concurrent reads and
+   writes during compaction; memory accounting from the measured overhead
+   factor with recovery and compaction headroom reserved; snapshots and WAL
+   segments archived as blob-plane objects and a partition restored from
+   them through the M1 restore path. Exit: the M3 acceptance checklist has
    evidence for every line and the benchmark report is published.
+   **Result:** two-phase compaction (`begin` beside readers and writers,
+   `finish` as a bounded exclusive section that replays the WAL delta and
+   swaps) with a crash point before the swap; writes landing between the
+   phases are caught up and verified; RAM budget admission refuses upserts
+   over `budget − headroom` with a typed error and always admits deletes;
+   `distr-hnsw index archive|restore` round-trips a partition through
+   loopback RF2 agents with byte-identical search results. Compaction
+   measurements are in `docs/bench/README.md`.
 
 Total: roughly 9 to 10 weeks, consistent with the roadmap's 1 to 2 months
 plus a data-preparation week.

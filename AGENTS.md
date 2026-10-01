@@ -120,3 +120,19 @@ evidence: `scripts/` and `docs/m1-*-drill.md`, `docs/m1-lifecycle-matrix.md`,
 Tests use `TMPDIR=target/` via `.cargo/config.toml` so they run on a real
 filesystem; `aws-lc-sys` needs a C compiler. Large matrices and drills run on
 `anthonypc`.
+
+**M3 status:** Exit review passed 2026-10-01; acceptance proposed with one
+limitation (`project-nomic-512` measurements wait on the shared GPU). The
+engine (`crates/distr-hnsw-index`) provides flat and int8 vectors, HNSW with
+measured per-metric defaults, filtered search with a measured cutover, WAL and
+snapshots with fail-closed recovery, two-phase compaction, and RAM budget
+admission; `distr-hnsw index archive|restore` moves partition state through
+the blob plane. Evidence: `docs/bench/README.md`, `docs/m3-engine-contract.md`.
+
+**M3 status:** Exit review passed 2026-10-01; acceptance proposed with one
+limitation (`project-nomic-512` measurements wait on the shared GPU). The
+engine (`crates/distr-hnsw-index`) provides flat and int8 vectors, HNSW with
+measured per-metric defaults, filtered search with a measured cutover, WAL and
+snapshots with fail-closed recovery, two-phase compaction, and RAM budget
+admission; `distr-hnsw index archive|restore` moves partition state through
+the blob plane. Evidence: `docs/bench/README.md`, `docs/m3-engine-contract.md`.

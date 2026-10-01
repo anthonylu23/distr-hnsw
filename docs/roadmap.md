@@ -13,7 +13,7 @@ design first and then bring this document back into alignment.
 | M0 — Semantic validation | **Accepted** | Larger representative bake-off produces a documented go decision and locks the default local model and dimensions |
 | M1 — Blob plane and recovery foundation | **Accepted** (2026-09-30, with recorded limitations) | Blob durability and an empty-infrastructure restore drill pass |
 | M2 — Tailscale identity and authorization | Ready to start | Network identity, sessions, grants, and API-key boundaries pass adversarial tests |
-| M3 — Single-partition vector engine | Ready to start | Persistence, recovery, recall, filtering, and compaction gates pass against brute force |
+| M3 — Single-partition vector engine | **Exit review passed** (2026-10-01; acceptance proposed with one limitation) | Persistence, recovery, recall, filtering, and compaction gates pass against brute force |
 | M4 — Distributed vector plane | Not started | Quorum, fencing, promotion, movement, and balancing survive failure injection |
 | M5 — File extraction and semantic retrieval | Not started | Files flow safely from extraction through reproducible hybrid search |
 | M6 — Dashboard and operations | Not started | User and operator workflows are complete, truthful, and accessible |
@@ -52,6 +52,19 @@ drill against its own offsite bucket before it may be called recovery
 ready. See [m1-implementation-plan.md](m1-implementation-plan.md),
 [m1-filesystem-qualification.md](m1-filesystem-qualification.md), and the
 proposed decisions in [m1-phase-1-decisions.md](m1-phase-1-decisions.md).
+
+M3's exit review was completed on 2026-10-01 after seven passes
+([m3-implementation-plan.md](m3-implementation-plan.md)). Every acceptance
+criterion below carries evidence from the engine test suite
+(`crates/distr-hnsw-index`), the blob-plane archive test
+(`crates/distr-hnsw/tests/index_archive.rs`), and the published benchmark
+reports ([bench/README.md](bench/README.md)) on the three pinned public
+datasets. One limitation is proposed for acceptance rather than treated as a
+blocker: the "representative project data" half of the recall criterion and
+the 1M × 512 recovery and memory measurements wait on the
+`project-nomic-512` dataset, whose embedding run needs the shared GPU. The
+thresholds and the measurement commands are fixed, so that run adds evidence
+without changing code. Formal acceptance is the owner's call.
 
 ## How milestones are governed
 
@@ -397,22 +410,30 @@ quality, and resource model before adding replication and distributed routing.
 
 ### Acceptance criteria
 
-- [ ] Exact and ANN query results obey the configured distance metric,
+- [x] Exact and ANN query results obey the configured distance metric,
   deterministic tie rules, upsert semantics, and tombstones.
-- [ ] Unfiltered and filtered recall meet documented thresholds against brute
+  Evidence: oracle tie-rule and kernel property tests; HNSW model-based tests against the oracle with interleaved insert, upsert, delete, and query ([m3-engine-contract.md](m3-engine-contract.md) §1–§3); oracle recall 1.0 on every pinned set.
+- [x] Unfiltered and filtered recall meet documented thresholds against brute
   force on fixed public datasets and representative project data.
-- [ ] Int8 retrieval plus exact rescoring meets its documented recall/latency
+  Evidence: sift 0.987 at M = 16 / ef = 100, nytimes 0.975 and glove 0.985 at M = 32 ([bench/README.md](bench/README.md)); filtered recall 0.983 to 1.000 from 0.1% to 50% selectivity on both routes. Proposed limitation: the project dataset (`project-nomic-512`) is pending the shared GPU; thresholds are fixed in the plan.
+- [x] Int8 retrieval plus exact rescoring meets its documented recall/latency
   budget and never returns a score computed from the wrong vector/version.
-- [ ] Acknowledged WAL entries survive process/host restart and replay exactly
+  Evidence: int8 recall within 0.0005 of f32 on every set at about twice the throughput; rescoring reads the f32 original of the current slot only, and upsert tombstones the old slot before the new one is searchable (contract §3, §7).
+- [x] Acknowledged WAL entries survive process/host restart and replay exactly
   once in sequence.
-- [ ] Snapshot plus WAL-tail restore reproduces logical records, tombstones,
+  Evidence: failpoint tests at every append, sync, and apply boundary; torn-tail truncation; idempotency replay (`partition.rs` tests); 1,000-entry tail replayed on sift and glove with byte-identical results.
+- [x] Snapshot plus WAL-tail restore reproduces logical records, tombstones,
   idempotency state, and the committed high-water mark.
-- [ ] Truncated, reordered, or checksum-invalid WAL/snapshot data fails closed
+  Evidence: section-by-section round-trip tests; recovery 1.8 s on sift 1M and 5.4 s on glove 1.18M with identical search results; `index restore` through RF2 loopback agents reproduces the state and high-water mark.
+- [x] Truncated, reordered, or checksum-invalid WAL/snapshot data fails closed
   with a recoverable diagnosis.
-- [ ] Compaction under concurrent reads/writes neither loses acknowledged
+  Evidence: corrupt header, mid-segment entry, sequence gap, snapshot header CRC, section BLAKE3, footer, wrong partition id, and missing-history tests; the newest verifiable snapshot is used and a damaged one is reported in the recovery report.
+- [x] Compaction under concurrent reads/writes neither loses acknowledged
   operations nor makes deleted records visible.
-- [ ] Hard RAM/disk limits reject or defer work before recovery/compaction
+  Evidence: two-phase compaction test with writes between `begin` and `finish`, deletes before compaction, and the `CompactionBeforeSwap` crash point; compaction benchmark on sift 1M with 20% deleted and 1,000 concurrent upserts returns zero deleted keys ([bench/README.md](bench/README.md)).
+- [x] Hard RAM/disk limits reject or defer work before recovery/compaction
   headroom would be consumed.
+  Evidence: RAM budget admission test (upserts refused with `OverBudget` at `budget − headroom`, deletes admitted); the hot-set formula is measured, not estimated (contract §11). Disk admission for archive copies is the M1 portal's (507 / exit 3).
 
 ### Verification and evidence
 

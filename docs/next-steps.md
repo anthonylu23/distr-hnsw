@@ -12,23 +12,29 @@ M0 was accepted on 2026-07-19 (`nomic-embed-text @ 512`, see
 [roadmap.md](roadmap.md) and the accepted limitations are listed there.
 Keep `prototype/` disposable.
 
-## Choosing the next milestone
+## M3 exit review passed
 
-Both M2 (Tailscale identity and authorization) and M3 (single-partition
-vector engine) depend only on M1 and can start. The design's build order
-puts M2 first because it is small (2 to 4 weeks) and every later tailnet
-deployment needs it; M3 is the larger engineering risk and can proceed in
-parallel as isolated engine work.
+The single-partition engine completed its seven passes on 2026-10-01
+([m3-implementation-plan.md](m3-implementation-plan.md)); the roadmap holds
+the per-criterion evidence and proposes acceptance with one limitation.
 
-Immediate tasks regardless of order:
+Immediate tasks:
 
-1. Write the deployment guide that carries the M1 accepted limitations and
+1. **Owner decision:** accept M3 with the recorded limitation, or hold
+   acceptance until the project dataset is measured.
+2. Build `project-nomic-512` when the GPU is free (`scripts/bench/` plus the
+   M0 prototype embedder), then run `oracle`, `hnsw`, `filtered`,
+   `persist`, and `compact` against it and append the rows to
+   [bench/README.md](bench/README.md). No code change is expected.
+3. Start M2 (Tailscale identity and authorization): decide the test tailnet
+   (a second machine or VM as the unauthorized node) and the portal
+   certificate approach.
+4. Write the deployment guide that carries the M1 accepted limitations and
    requires `scripts/restore-drill.sh --target s3:...` against the real
    offsite bucket before a deployment is called recovery ready.
-2. Decide the M2 test tailnet (a second machine or VM as the unauthorized
-   node) and the certificate approach for the portal.
-3. Pin the M3 public benchmark datasets and recall thresholds before writing
-   engine code.
+5. Engine follow-ups that M4 will want: WAL group commit (contract §4 rule
+   1), and a scheduler that calls `begin_compaction` when
+   `compaction_recommended()` is true.
 
 ## Ops notes
 

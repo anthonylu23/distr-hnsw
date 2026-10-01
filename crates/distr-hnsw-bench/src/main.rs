@@ -77,6 +77,37 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Bulk-load a dataset, delete a fraction of it, then measure two-phase
+    /// compaction: rebuild time, swap time, snapshot shrinkage, and recall
+    /// before and after.
+    Compact {
+        dataset: PathBuf,
+        #[arg(long)]
+        partition_dir: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        #[arg(long, default_value_t = 100)]
+        ef: usize,
+        #[arg(long, default_value_t = 16)]
+        m: usize,
+        #[arg(long, default_value_t = 200)]
+        ef_construction: usize,
+        #[arg(long, default_value_t = 1000)]
+        queries: usize,
+        /// Fraction of the base to delete before compacting.
+        #[arg(long, default_value_t = 0.2)]
+        delete_fraction: f64,
+        /// Upserts appended between `begin_compaction` and `finish_compaction`
+        /// so the catch-up replay is exercised.
+        #[arg(long, default_value_t = 1000)]
+        concurrent: usize,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Build an HNSW graph, derive synthetic filters at several selectivities,
     /// and measure the brute-force and masked-traversal routes against exact
     /// filtered ground truth to set the cutover.
@@ -316,6 +347,39 @@ struct PersistReportV1 {
     recall_before: f64,
     recall_after: f64,
     results_identical: bool,
+    host: String,
+    source_revision: String,
+}
+
+#[derive(Serialize)]
+struct CompactReportV1 {
+    report_type: &'static str,
+    version: u16,
+    dataset: String,
+    metric: String,
+    dims: usize,
+    base_count: usize,
+    deleted: usize,
+    concurrent_upserts: usize,
+    k: usize,
+    ef_search: usize,
+    parameters: BTreeMap<String, serde_json::Value>,
+    tombstone_ratio_before: f64,
+    slots_before: usize,
+    slots_after: usize,
+    delete_seconds: f64,
+    begin_seconds: f64,
+    finish_seconds: f64,
+    caught_up_entries: u64,
+    snapshot_bytes_before: u64,
+    snapshot_bytes_after: u64,
+    resident_bytes_before: usize,
+    resident_bytes_after: usize,
+    query_p50_us_before: f64,
+    query_p50_us_after: f64,
+    recall_before: f64,
+    recall_after: f64,
+    deleted_keys_returned_after: usize,
     host: String,
     source_revision: String,
 }
@@ -654,6 +718,211 @@ fn main() -> anyhow::Result<()> {
                 recall_before,
                 recall_after,
                 results_identical: before == after,
+                host: hostname(),
+                source_revision: option_env!("DISTR_HNSW_REV")
+                    .unwrap_or("unknown")
+                    .to_owned(),
+            };
+            let json = serde_json::to_string_pretty(&out_report)?;
+            if let Some(out) = out {
+                fs::write(&out, &json)?;
+            }
+            println!("{json}");
+            Ok(())
+        }
+        Command::Compact {
+            dataset,
+            partition_dir,
+            k,
+            ef,
+            m,
+            ef_construction,
+            queries,
+            delete_fraction,
+            concurrent,
+            limit,
+            threads,
+            out,
+        } => {
+            use distr_hnsw_index::partition::{Partition, PartitionConfig};
+            let loaded = load(&dataset)?;
+            let threads = threads.unwrap_or_else(num_threads);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build_global()
+                .ok();
+            let count = queries.min(loaded.queries.len());
+            let base_count = limit.unwrap_or(loaded.base.len()).min(loaded.base.len());
+            let params = HnswParams {
+                m,
+                m0: 2 * m,
+                ef_construction,
+                seed: 0x5eed,
+            };
+            let config = PartitionConfig::new(
+                uuid::Uuid::new_v4(),
+                loaded.base.dims(),
+                loaded.metric,
+                params,
+            );
+            let mut subset = FlatVectors::with_capacity(loaded.base.dims(), base_count);
+            for slot in 0..base_count {
+                subset.push(loaded.base.get(slot as RecordId).unwrap(), Metric::L2)?;
+            }
+            eprintln!("bulk loading {base_count} vectors");
+            let (mut partition, snapshot_before) = Partition::bulk_load(
+                &partition_dir,
+                config,
+                subset,
+                (0..base_count as u64).map(|i| i.to_le_bytes().to_vec()),
+            )?;
+            let snapshot_bytes_before = fs::metadata(&snapshot_before)?.len();
+
+            // Delete every `stride`-th key until the fraction is reached.
+            let deleted_count = ((base_count as f64) * delete_fraction).round() as usize;
+            let stride = (base_count / deleted_count.max(1)).max(1);
+            let deleted: Vec<u64> = (0..base_count as u64)
+                .step_by(stride)
+                .take(deleted_count)
+                .collect();
+            let started = Instant::now();
+            for (n, key) in deleted.iter().enumerate() {
+                let mut op = [0_u8; 16];
+                op[..8].copy_from_slice(&(n as u64).to_le_bytes());
+                op[8] = 2;
+                partition.delete(op, &key.to_le_bytes())?;
+            }
+            let delete_seconds = started.elapsed().as_secs_f64();
+            let deleted_set: std::collections::HashSet<Vec<u8>> =
+                deleted.iter().map(|k| k.to_le_bytes().to_vec()).collect();
+
+            type Results = Vec<Vec<(Vec<u8>, f32)>>;
+            let timed_search = |p: &Partition| -> (Results, f64) {
+                let mut latencies: Vec<f64> = Vec::with_capacity(count);
+                let mut results = Vec::with_capacity(count);
+                for q in 0..count {
+                    let query = loaded.queries.get(q as RecordId).unwrap();
+                    let started = Instant::now();
+                    let hits = p.search(query, k, ef, None).unwrap();
+                    latencies.push(started.elapsed().as_secs_f64() * 1e6);
+                    results.push(
+                        hits.into_iter()
+                            .map(|h| (h.key, h.distance))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                latencies.sort_by(|a, b| a.total_cmp(b));
+                let p50 = latencies.get(count / 2).copied().unwrap_or(0.0);
+                (results, p50)
+            };
+            // Ground truth against the surviving base only.
+            let recall_of = |results: &Results| -> f64 {
+                let total: f64 = (0..count)
+                    .into_par_iter()
+                    .map(|q| {
+                        let query = loaded.queries.get(q as RecordId).unwrap();
+                        let mut truth: Vec<f32> = (0..base_count)
+                            .filter(|slot| !(slot % stride == 0 && slot / stride < deleted_count))
+                            .map(|slot| {
+                                distance(
+                                    loaded.metric,
+                                    query,
+                                    loaded.base.get(slot as RecordId).unwrap(),
+                                )
+                            })
+                            .collect();
+                        truth.sort_by(|a, b| a.total_cmp(b));
+                        let kth = truth[k.min(truth.len()) - 1];
+                        let hits: Vec<Hit> = results[q]
+                            .iter()
+                            .map(|(_, d)| Hit {
+                                id: 0,
+                                distance: *d,
+                            })
+                            .collect();
+                        recall_by_distance(kth, &hits, k)
+                    })
+                    .sum();
+                total / count.max(1) as f64
+            };
+            let (before, p50_before) = timed_search(&partition);
+            let recall_before = recall_of(&before);
+            let tombstone_ratio_before = partition.tombstone_ratio();
+            let slots_before = partition.slot_count();
+            let resident_bytes_before = partition.resident_bytes();
+            eprintln!(
+                "deleted {} ({tombstone_ratio_before:.3} tombstones); recall before {recall_before:.4}, p50 {p50_before:.0}us",
+                deleted.len()
+            );
+
+            let started = Instant::now();
+            let plan = partition.begin_compaction()?;
+            let begin_seconds = started.elapsed().as_secs_f64();
+            // Writes that land while the rebuild is "in flight".
+            for i in 0..concurrent.min(base_count) {
+                let mut op = [0_u8; 16];
+                op[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                op[8] = 3;
+                partition.upsert(
+                    op,
+                    format!("concurrent-{i}").as_bytes(),
+                    loaded.base.get(i as RecordId).unwrap(),
+                    b"{}",
+                )?;
+            }
+            let started = Instant::now();
+            let report = partition.finish_compaction(plan)?;
+            let finish_seconds = started.elapsed().as_secs_f64();
+            let snapshot_bytes_after = fs::metadata(&report.snapshot)?.len();
+            eprintln!(
+                "compacted {} -> {} slots: begin {begin_seconds:.1}s, finish {finish_seconds:.2}s (caught up {})",
+                report.slots_before, report.slots_after, report.caught_up_entries
+            );
+
+            let (after, p50_after) = timed_search(&partition);
+            // Recall after includes the concurrent upserts as duplicates of
+            // live base rows; recall_by_distance tolerates that.
+            let recall_after = recall_of(&after);
+            let deleted_keys_returned_after = after
+                .iter()
+                .flatten()
+                .filter(|(key, _)| deleted_set.contains(key))
+                .count();
+
+            let mut parameters = BTreeMap::new();
+            parameters.insert("m".to_owned(), serde_json::json!(m));
+            parameters.insert(
+                "ef_construction".to_owned(),
+                serde_json::json!(ef_construction),
+            );
+            let out_report = CompactReportV1 {
+                report_type: "CompactReportV1",
+                version: 1,
+                dataset: loaded.manifest.name.clone(),
+                metric: loaded.metric.as_str().to_owned(),
+                dims: loaded.base.dims(),
+                base_count,
+                deleted: deleted.len(),
+                concurrent_upserts: concurrent.min(base_count),
+                k,
+                ef_search: ef,
+                parameters,
+                tombstone_ratio_before,
+                slots_before,
+                slots_after: report.slots_after,
+                delete_seconds,
+                begin_seconds,
+                finish_seconds,
+                caught_up_entries: report.caught_up_entries,
+                snapshot_bytes_before,
+                snapshot_bytes_after,
+                resident_bytes_before,
+                resident_bytes_after: partition.resident_bytes(),
+                query_p50_us_before: p50_before,
+                query_p50_us_after: p50_after,
+                recall_before,
+                recall_after,
+                deleted_keys_returned_after,
                 host: hostname(),
                 source_revision: option_env!("DISTR_HNSW_REV")
                     .unwrap_or("unknown")

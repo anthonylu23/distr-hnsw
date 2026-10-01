@@ -248,25 +248,50 @@ cutover the exact route has recall 1.0 by construction.
 
 ## 10. Compaction
 
-Triggered when `tombstones / slots ≥ 0.2` (configurable) or by an operator.
+Recommended when `tombstones / slots ≥ 0.2` (`compaction_tombstone_ratio`,
+exposed as `Partition::compaction_recommended`) or on operator request. The
+engine never compacts on its own: the caller owns the trigger so it can be
+scheduled against load (pass 7).
 
-1. Freeze a rebuild point `S` (current high-water mark) and write a
-   snapshot at `S` if none exists.
-2. Build a new state from the live slots at `S` in slot order, assigning new
-   dense slots in the same relative order so tie order is preserved;
-   external keys are unchanged. Writes continue to the old state and the WAL.
-3. Pause writes briefly; apply entries `(S, now]` to the new state; write
-   the new state's snapshot at the current high-water mark; sync; rename.
-4. Swap the served state atomically (readers holding the old guard finish
-   on the old state). Resume writes.
-5. Older snapshots and covered WAL segments become collectible per §4 rule 5.
+Compaction is two-phase (`begin_compaction` / `finish_compaction`):
 
-A crash before step 4 leaves the old state authoritative and the new
-snapshot file is ignored unless its high-water mark is the newest verifiable
-one, in which case it is simply the recovery point. No acknowledged write is
-lost because every acknowledged entry is in the WAL regardless of which
-state it was applied to; no deleted record becomes visible because
-tombstones are replayed into the new state too.
+1. **Begin** (`&self`, runs beside readers and writers). Freeze the rebuild
+   point `S` = current high-water mark. Build a new graph from the live slots
+   at `S` in slot order, assigning new dense slots in the same relative order
+   so tie order is preserved; external keys are unchanged. Writes continue
+   to the old state and the WAL. The plan carries the rebuilt index, the key
+   table, and a copy of the idempotency window.
+2. **Finish** (`&mut self`, an exclusive section). Replay WAL entries
+   `(S, now]` into the staged state from the segments on disk; the replay
+   must reach exactly the current high-water mark or the finish fails with
+   `MissingHistory` and the old state stays authoritative. Write the staged
+   state's snapshot at the current high-water mark (sync, rename). Then swap
+   the served state atomically. The exclusive section is bounded by the
+   catch-up replay plus one snapshot write, not by the rebuild.
+3. Older snapshots and covered WAL segments become collectible per §4 rule 5.
+
+Because the snapshot name is the high-water mark, a compaction that finishes
+with no concurrent writes rewrites the snapshot the previous state already
+had at that mark. The two files describe the same logical state (contract
+§5), so the rename is a same-name atomic replace, never a loss of history.
+
+A crash before the swap (`CompactionBeforeSwap`) leaves the old state
+authoritative; on recovery the compacted snapshot is simply the newest
+verifiable snapshot and recovers the same logical state. No acknowledged
+write is lost because every acknowledged entry is in the WAL regardless of
+which state it was applied to; no deleted record becomes visible because
+tombstones are replayed into the staged state too.
+
+**Archival.** `distr-hnsw index archive` commits a partition's manifest,
+newest snapshot, and WAL segments as ordinary blob-plane files (M1 contract:
+4 MiB encrypted chunks, RF2, immutable manifests) under the idempotency key
+`index:<partition>:<part>:<name>:<blake3>`; the portal records the part-to-
+file mapping in `index_archives` (schema v8). An unchanged part is not
+re-uploaded; a grown WAL segment becomes a new file version. With
+`--truncate-wal`, segments wholly below the archived snapshot are removed
+locally only after their archive copy is committed (§4 rule 5). `index
+restore` downloads every recorded part into an empty directory, verifies
+each BLAKE3, and opens the partition through the normal recovery path (§6).
 
 ## 11. Memory accounting and admission
 
@@ -282,11 +307,19 @@ about 900 bytes before payload. The `f32` originals (`dims × 4`) and the
 snapshot file count against the **disk** budget and the page cache, not the
 RAM budget. Admission uses these measured values, not the estimate.
 
-A partition has a RAM budget and a disk budget. It reserves compaction
-headroom (default 35% of the budget, revised from measurement) and refuses
-new upserts with a distinct capacity error when the accounted size plus the
-next insert would exceed `budget − headroom`. Deletes are always admitted.
-Refusals never lower durability or drop data, mirroring the M1 rule.
+A partition has an optional RAM budget (`ram_budget_bytes`; none means
+unlimited) and reserves compaction headroom (`headroom_fraction`, default
+35%). An upsert is refused with `PartitionError::OverBudget` (which reports
+resident, projected, admissible, and budget bytes) when
+`resident_bytes + hot_bytes_per_insert(payload) > budget × (1 − headroom)`,
+where `resident_bytes` is the accounted int8, graph, key, slot, and payload
+footprint and `hot_bytes_per_insert` is the published formula. Deletes are
+always admitted because they only add a tombstone bit and must stay possible
+when the partition is full; compaction then reclaims the space. Refusals
+never lower durability or drop data, mirroring the M1 rule. The budget can
+be changed at run time (`set_ram_budget`) without restarting the partition.
+Disk budgeting is the host's job: the engine reports snapshot and WAL bytes
+and the portal's capacity admission (M1) governs the archive copies.
 
 ## 12. Named crash points
 

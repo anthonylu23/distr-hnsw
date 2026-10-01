@@ -170,3 +170,46 @@ Reading:
   dataset itself.
 
 Full reports: `~/distr-hnsw-bench/reports/persist-*.json`.
+
+## Compaction (pass 7, 2026-10-01)
+
+Bulk-load sift 1M (M = 16), delete every fifth key (200,000, tombstone ratio
+0.200, the contract's trigger), search, then run two-phase compaction with
+1,000 upserts landing between `begin_compaction` and `finish_compaction`.
+Recall is measured against exact search over the surviving base; 1,000
+queries, k = 10, ef = 100, int8 traversal with rescoring.
+
+| Phase | Time | Notes |
+|---|---:|---|
+| 200,000 deletes | 97.0 s | one `fdatasync` per delete (2,060/s); group commit is the known follow-up |
+| `begin_compaction` | 92.8 s | rebuilds 800,000 live slots beside readers and writers (8,600 vectors/s) |
+| `finish_compaction` | 5.21 s | the exclusive section: replay 1,000 caught-up entries, write the 0.62 GiB snapshot, swap |
+
+| Measure | Before | After |
+|---|---:|---:|
+| Slots (including tombstones) | 1,000,000 | 801,000 |
+| Snapshot bytes | 821 MB | 666 MB |
+| Accounted resident bytes | 926 MB | 755 MB |
+| Query p50 | 451 µs | 306 µs |
+| Recall@10 vs. surviving base | 0.9929 | 0.9905 |
+| Deleted keys returned | 0 | 0 |
+
+Reading:
+
+- The blocking window is the finish phase only. At 1M × 128 it is 5.2 s and
+  is dominated by writing the snapshot; the rebuild runs for 93 s without
+  blocking. A scheduler can therefore compact at the 0.2 ratio without a
+  maintenance window.
+- Compaction removes the tombstoned slots from the graph, the int8 store,
+  and the snapshot: resident bytes fall by the live fraction (19%) and p50
+  latency drops by a third because traversal no longer walks dead nodes.
+- Recall after compaction (0.9905) is marginally below the masked search of
+  the uncompacted graph (0.9929): the old graph was built over 1M points and
+  masking makes the search visit more candidates, which is also why it is
+  slower. Both are above the 0.98 threshold for sift.
+- No deleted key appears in any result after compaction, and every
+  concurrent upsert is present (`caught_up_entries` = 1,000, high-water
+  marks equal), which is the contract's "never loses, never resurrects"
+  line.
+
+Full report: `~/distr-hnsw-bench/reports/compact-sift-128-euclidean.json`.
