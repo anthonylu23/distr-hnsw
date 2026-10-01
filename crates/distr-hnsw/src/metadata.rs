@@ -10,7 +10,7 @@ use crate::{
     object::{ObjectHash, ObjectKind},
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const MASTER_KEY_ID_META: &str = "master_key_id";
 const CONTENT_GENERATION_META: &str = "content_generation";
 
@@ -571,6 +571,7 @@ impl Database {
             }
             3 => migrate_v3_to_v4(&mut connection)?,
             4..=6 => migrate_to_v7(&mut connection)?,
+            7 => apply_schema(&connection)?,
             SCHEMA_VERSION => apply_schema(&connection)?,
             _ => return Err(MetadataError::UnsupportedSchemaVersion(version)),
         }
@@ -638,6 +639,90 @@ impl Database {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn index_archive_lookup(
+        &self,
+        partition_id: Uuid,
+        part: &str,
+        name: &str,
+    ) -> Result<Option<(Uuid, String)>, MetadataError> {
+        self.connection
+            .query_row(
+                "SELECT file_id, blake3 FROM index_archives
+                 WHERE partition_id = ?1 AND part = ?2 AND name = ?3",
+                params![partition_id.to_string(), part, name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(file_id, hash)| {
+                Ok((
+                    Uuid::parse_str(&file_id)
+                        .map_err(|_| MetadataError::InvalidBinaryField("file id".to_owned()))?,
+                    hash,
+                ))
+            })
+            .transpose()
+    }
+
+    pub fn index_archive_record(
+        &mut self,
+        partition_id: Uuid,
+        part: &str,
+        name: &str,
+        blake3: &str,
+        bytes: u64,
+        file_id: Uuid,
+    ) -> Result<(), MetadataError> {
+        self.connection.execute(
+            "INSERT INTO index_archives (partition_id, part, name, blake3, bytes, file_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(partition_id, part, name) DO UPDATE SET
+                 blake3 = excluded.blake3, bytes = excluded.bytes,
+                 file_id = excluded.file_id, archived_at = unixepoch()",
+            params![
+                partition_id.to_string(),
+                part,
+                name,
+                blake3,
+                to_i64(bytes)?,
+                file_id.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn index_archive_list(
+        &self,
+        partition_id: Uuid,
+    ) -> Result<Vec<IndexArchiveRow>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT part, name, blake3, bytes, file_id FROM index_archives
+             WHERE partition_id = ?1 ORDER BY part, name",
+        )?;
+        let rows = statement
+            .query_map([partition_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(part, name, blake3, bytes, file_id)| {
+                Ok(IndexArchiveRow {
+                    part,
+                    name,
+                    blake3,
+                    bytes: u64::try_from(bytes).map_err(|_| MetadataError::NumericOverflow)?,
+                    file_id: Uuid::parse_str(&file_id)
+                        .map_err(|_| MetadataError::InvalidBinaryField("file id".to_owned()))?,
+                })
+            })
+            .collect()
     }
 
     pub fn create_upload(&mut self, upload: &NewUpload) -> Result<(), MetadataError> {
@@ -2968,9 +3053,35 @@ fn apply_schema(connection: &Connection) -> Result<(), MetadataError> {
     connection.execute_batch(META_SCHEMA)?;
     connection.execute_batch(BACKUP_SCHEMA)?;
     connection.execute_batch(GC_SCHEMA)?;
-    connection.execute_batch("PRAGMA user_version = 7;")?;
+    connection.execute_batch(INDEX_ARCHIVE_SCHEMA)?;
+    connection.execute_batch("PRAGMA user_version = 8;")?;
     Ok(())
 }
+
+/// One archived part of a vector partition (schema v8).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexArchiveRow {
+    pub part: String,
+    pub name: String,
+    pub blake3: String,
+    pub bytes: u64,
+    pub file_id: Uuid,
+}
+
+/// Schema v8 (additive): which blob-plane file holds each archived part of a
+/// vector partition (M3 pass 7).
+const INDEX_ARCHIVE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS index_archives (
+    partition_id TEXT NOT NULL,
+    part TEXT NOT NULL CHECK(part IN ('manifest', 'snapshot', 'wal_segment')),
+    name TEXT NOT NULL,
+    blake3 TEXT NOT NULL,
+    bytes INTEGER NOT NULL CHECK(bytes >= 0),
+    file_id TEXT NOT NULL,
+    archived_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY(partition_id, part, name)
+);
+"#;
 
 /// Schema v7 admits the `orphaned` placement state (a table rebuild, since
 /// SQLite cannot alter a CHECK constraint) and adds `gc_proofs`. Versions 4

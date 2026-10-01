@@ -988,6 +988,7 @@ dependencies = [
  "blake3",
  "chacha20poly1305",
  "clap",
+ "distr-hnsw-index",
  "hex",
  "libc",
  "rand 0.8.7",

@@ -206,7 +206,7 @@ backup set, the recovery bundle, and an off-cluster passphrase, and
 downloads the committed file byte for byte while the deleted file stays
 unreadable.
 
-## SQLite schema v7
+## SQLite schema v8
 
 Schema v3 stores `files` as the current projection with generation and
 `committed`, `deleted`, or `recovery_blocked` state. It adds immutable
@@ -224,13 +224,19 @@ still `running` from a previous process as `interrupted` and fails its open
 scans; interrupted scans prove nothing. Schema v5 adds `portal_meta`, which
 holds the bound master-key identifier and the content generation. Schema v6
 adds `backup_jobs`, `backup_objects`, and `backup_snapshots`. Schema v7
-rebuilds `placements` to admit `orphaned` and adds `gc_proofs`.
+rebuilds `placements` to admit `orphaned` and adds `gc_proofs`. Schema v8
+(M3 pass 7) is additive: `index_archives` records which committed file holds
+each archived part (`manifest`, `snapshot`, `wal_segment`) of a vector
+partition, keyed by partition id, part, and name, with the part's BLAKE3 and
+size. Archived parts are ordinary files in the commit spine; the table is a
+projection for `distr-hnsw index restore`, and losing it loses only the
+convenience of restoring by partition id, not any data.
 
 The two earlier development lines both used schema version 2 for incompatible
 layouts. Opening a v2 database inspects its table shape and atomically migrates
 either the audited commit-spine layout or the recovery-history layout to
-canonical v3, then v4, then v7 (v5 and v6 are additive; v7 rebuilds
-`placements`). V1 also migrates through the same chain. Existing manifest
+canonical v3, then v4, then v7, then v8 (v5, v6, and v8 are additive; v7
+rebuilds `placements`). V1 also migrates through the same chain. Existing manifest
 bytes, ciphertext hashes, and chunk-v1 AAD remain unchanged. Unknown or
 unrecognized schema layouts fail closed.
 

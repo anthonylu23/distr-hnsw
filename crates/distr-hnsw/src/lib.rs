@@ -3,6 +3,7 @@ pub mod backup;
 pub mod crypto;
 pub mod durability;
 pub mod format;
+pub mod index_archive;
 pub mod lifecycle;
 pub mod metadata;
 pub mod object;

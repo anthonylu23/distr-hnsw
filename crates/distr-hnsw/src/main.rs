@@ -55,6 +55,44 @@ enum Command {
         #[command(subcommand)]
         command: PortalCommand,
     },
+    /// Archive and restore vector-partition state through the blob plane.
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum IndexCommand {
+    /// Commit a partition's manifest, newest snapshot, and WAL segments as
+    /// blob-plane files; `--truncate-wal` removes covered segments after
+    /// their archive copy is committed.
+    Archive {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
+        #[arg(long = "agent", required = true)]
+        agents: Vec<AgentTarget>,
+        #[arg(long)]
+        partition_dir: PathBuf,
+        #[arg(long)]
+        truncate_wal: bool,
+    },
+    /// Download every archived part of a partition into an empty directory
+    /// and recover it.
+    Restore {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
+        #[arg(long = "agent", required = true)]
+        agents: Vec<AgentTarget>,
+        #[arg(long)]
+        partition_id: Uuid,
+        #[arg(long)]
+        destination: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -369,6 +407,40 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Index { command } => match command {
+            IndexCommand::Archive {
+                database,
+                master_key,
+                agents,
+                partition_dir,
+                truncate_wal,
+            } => {
+                let key = MasterKey::load(&master_key)?;
+                let mut portal = Portal::open(&database, key, agents)?;
+                let report =
+                    distr_hnsw::index_archive::archive(&mut portal, &partition_dir, truncate_wal)
+                        .await?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            IndexCommand::Restore {
+                database,
+                master_key,
+                agents,
+                partition_id,
+                destination,
+            } => {
+                let key = MasterKey::load(&master_key)?;
+                let portal = Portal::open(&database, key, agents)?;
+                let report =
+                    distr_hnsw::index_archive::restore(&portal, partition_id, &destination).await?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.snapshots_rejected > 0 {
+                    std::process::exit(2);
+                }
+                Ok(())
+            }
+        },
         Command::Portal { command } => match command {
             PortalCommand::Init {
                 database,

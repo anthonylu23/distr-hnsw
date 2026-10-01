@@ -36,6 +36,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal"] }
 zeroize = "1"
 uuid = { version = "1", features = ["serde", "v4"] }
+distr-hnsw-index = { version = "0.1.0", path = "../distr-hnsw-index" }
 
 [dev-dependencies]
 tempfile = "3"
