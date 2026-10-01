@@ -8,8 +8,11 @@
 pub mod distance;
 pub mod hnsw;
 pub mod oracle;
+pub mod partition;
 pub mod quant;
+pub mod snapshot;
 pub mod vector;
+pub mod wal;
 
 /// Record identifier inside a partition. External keys map to these in the
 /// partition's metadata; the engine only ever orders and compares by `u64`.

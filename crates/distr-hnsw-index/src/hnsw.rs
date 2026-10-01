@@ -583,6 +583,73 @@ impl Hnsw {
         top.into_sorted()
     }
 
+    /// Borrowed view of the graph for serialization (contract §5, section 6).
+    pub fn graph_parts(&self) -> GraphParts<'_> {
+        GraphParts {
+            levels: &self.levels,
+            level0: &self.level0,
+            level0_len: &self.level0_len,
+            upper: &self.upper,
+            upper_len: &self.upper_len,
+            tombstones: &self.tombstones,
+            tombstone_count: self.tombstone_count,
+            entry: self.entry,
+            max_level: self.max_level,
+        }
+    }
+
+    /// Rebuild a graph from serialized parts. The caller guarantees the
+    /// parts came from one consistent snapshot; shape mismatches are
+    /// rejected, semantic ones are not detectable here.
+    pub fn from_parts(
+        params: HnswParams,
+        metric: Metric,
+        vectors: FlatVectors,
+        quantized: QuantizedVectors,
+        parts: OwnedGraphParts,
+    ) -> Option<Self> {
+        let slots = vectors.len();
+        if quantized.len() != slots
+            || parts.levels.len() != slots
+            || parts.level0_len.len() != slots
+            || parts.level0.len() != slots * params.m0
+            || parts.upper.len() != slots
+            || parts.upper_len.len() != slots
+            || parts.tombstones.len() != slots.div_ceil(64)
+        {
+            return None;
+        }
+        for (slot, level) in parts.levels.iter().enumerate() {
+            if parts.upper[slot].len() != *level as usize * params.m
+                || parts.upper_len[slot].len() != *level as usize
+            {
+                return None;
+            }
+        }
+        if let Some(entry) = parts.entry {
+            if entry as usize >= slots {
+                return None;
+            }
+        } else if slots != 0 {
+            return None;
+        }
+        Some(Self {
+            params,
+            metric,
+            vectors,
+            quantized,
+            levels: parts.levels,
+            level0: parts.level0,
+            level0_len: parts.level0_len,
+            upper: parts.upper,
+            upper_len: parts.upper_len,
+            tombstones: parts.tombstones,
+            tombstone_count: parts.tombstone_count,
+            entry: parts.entry,
+            max_level: parts.max_level,
+        })
+    }
+
     /// Cutover between the exact route and masked traversal for filtered
     /// search (contract §9): allowed sets of at most this many slots are
     /// answered exactly. The constant is the measured crossover divided by
@@ -644,7 +711,7 @@ impl Hnsw {
     /// Accounted bytes split into `(f32 originals, int8 copies, graph and
     /// bookkeeping)` for the memory model in contract §11.
     pub fn accounted_breakdown(&self) -> (usize, usize, usize) {
-        let f32_bytes = self.vectors.as_slice().len() * 4;
+        let f32_bytes = self.vectors.resident_bytes();
         let int8_bytes = self.quantized.accounted_bytes();
         (
             f32_bytes,
@@ -655,7 +722,7 @@ impl Hnsw {
 
     /// Accounted bytes of the structure, for the memory model in contract §11.
     pub fn accounted_bytes(&self) -> usize {
-        let vectors = self.vectors.as_slice().len() * 4 + self.quantized.accounted_bytes();
+        let vectors = self.vectors.resident_bytes() + self.quantized.accounted_bytes();
         let level0 = self.level0.len() * 4 + self.level0_len.len();
         let upper: usize = self
             .upper
@@ -669,6 +736,32 @@ impl Hnsw {
                 .sum::<usize>();
         vectors + level0 + upper + self.levels.len() + self.tombstones.len() * 8
     }
+}
+
+/// Borrowed graph structure (see [`Hnsw::graph_parts`]).
+pub struct GraphParts<'a> {
+    pub levels: &'a [u8],
+    pub level0: &'a [Slot],
+    pub level0_len: &'a [u8],
+    pub upper: &'a [Vec<Slot>],
+    pub upper_len: &'a [Vec<u8>],
+    pub tombstones: &'a [u64],
+    pub tombstone_count: usize,
+    pub entry: Option<Slot>,
+    pub max_level: u8,
+}
+
+/// Owned graph structure for [`Hnsw::from_parts`].
+pub struct OwnedGraphParts {
+    pub levels: Vec<u8>,
+    pub level0: Vec<Slot>,
+    pub level0_len: Vec<u8>,
+    pub upper: Vec<Vec<Slot>>,
+    pub upper_len: Vec<Vec<u8>>,
+    pub tombstones: Vec<u64>,
+    pub tombstone_count: usize,
+    pub entry: Option<Slot>,
+    pub max_level: u8,
 }
 
 /// Neighbour lists guarded per slot for concurrent bulk construction.
@@ -1223,7 +1316,7 @@ mod tests {
             int8_recall >= f32_recall - 0.02,
             "f32 {f32_recall} vs int8 {int8_recall}"
         );
-        assert!(index.accounted_bytes() > index.vectors().as_slice().len() * 4);
+        assert!(index.accounted_bytes() > index.vectors().resident_bytes());
     }
 
     proptest! {

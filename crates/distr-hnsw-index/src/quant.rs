@@ -144,6 +144,29 @@ impl QuantizedVectors {
         )
     }
 
+    /// Raw parts for serialization: `(codes, scales, squared norms)`.
+    pub fn parts(&self) -> (&[i8], &[f32], &[f32]) {
+        (&self.data, &self.scales, &self.norms_sq)
+    }
+
+    /// Rebuild from serialized parts.
+    pub fn from_parts(
+        dims: usize,
+        data: Vec<i8>,
+        scales: Vec<f32>,
+        norms_sq: Vec<f32>,
+    ) -> Option<Self> {
+        if dims == 0 || data.len() != scales.len() * dims || scales.len() != norms_sq.len() {
+            return None;
+        }
+        Some(Self {
+            dims,
+            data,
+            scales,
+            norms_sq,
+        })
+    }
+
     /// Bytes held per vector: codes plus the two scalars.
     pub fn bytes_per_vector(&self) -> usize {
         self.dims + 8
