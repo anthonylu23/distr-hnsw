@@ -124,12 +124,24 @@ sections (kinds)
   2 slots       slot_count × (version u64 | tombstone u8 | key_index u32 | payload_offset u64 | payload_len u32)
   3 payloads    concatenated payload bytes
   4 vectors_f32 slot_count × dims × f32
-  5 vectors_i8  slot_count × (scale f32 | norm_sq f32 | int8 × dims)
-  6 graph       entry_slot u32 | max_level u8 | per slot: level u8, then per level: count u16 | neighbours u32 × count
+  5 vectors_i8  scales f32 × slot_count | norms_sq f32 × slot_count | int8 × dims × slot_count
+  6 graph       m u32 | m0 u32 | ef_construction u32 | seed u64 | entry_slot u32 (u32::MAX = none)
+                | max_level u8 | tombstone_count u64 | levels u8 × slot_count | level0_len u8 × slot_count
+                | level0 u32 × (slot_count × m0) | tombstone words u64 × ceil(slot_count / 64)
+                | per slot with level > 0: upper_len u8 × level | upper u32 × (level × m)
   7 idempotency window × (op_id [16] | seq u64)
 footer
   file_blake3 [32] over everything before the footer
 ```
+
+The keys section lists every key ever seen (live slot `u32::MAX` when none
+is live) so slot records can reference keys by index. Beside the snapshot
+and WAL directories, `partition.json` records the static configuration
+(partition id, dims, metric, graph parameters, idempotency window) and is
+written durably at creation; a snapshot that disagrees with it is refused.
+Two snapshots at the same high-water mark share a name and the later
+atomically replaces the earlier (their content is identical). An aborted
+write leaves its temporary file, which loading ignores.
 
 Loading verifies the header CRC, every section's BLAKE3, and the footer; a
 mismatch fails closed with the section named. The newest snapshot whose
@@ -141,12 +153,20 @@ operator is told. A snapshot is content-addressed by its BLAKE3 when archived
 
 `open(partition_dir)`:
 
-1. Load the newest verifiable snapshot (or start empty at `seq` 0).
+1. Load the newest verifiable snapshot (or start empty at `seq` 0). Every
+   rejected snapshot is reported with the check that failed.
 2. Replay WAL entries with `seq` greater than the snapshot high-water mark,
    in order, exactly once, rebuilding slots, vectors, graph insertions,
    tombstones, and the idempotency window. Stop at a torn tail.
 3. The committed high-water mark becomes the last replayed `seq`. Serving
    begins only after replay completes.
+
+A snapshot with a positive high-water mark and no WAL segment reaching it
+fails closed (`MissingHistory`): the partition cannot prove that nothing
+followed the snapshot. Only an empty partition may have no history at all.
+The recovery report (snapshot used, snapshots rejected, segments read,
+entries replayed and skipped, torn tails truncated, final high-water mark)
+is returned to the caller for logging.
 
 Recovery time at the 1M × 512 scale is a published benchmark number
 (threshold in the plan). Snapshot cadence follows DESIGN §6.3: when the WAL

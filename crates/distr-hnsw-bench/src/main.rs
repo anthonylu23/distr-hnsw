@@ -48,6 +48,35 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Bulk-load a dataset into an on-disk partition, then measure snapshot
+    /// size, recovery time, and recall after recovery.
+    Persist {
+        dataset: PathBuf,
+        /// Directory for the partition (created; must not hold one already).
+        #[arg(long)]
+        partition_dir: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        #[arg(long, default_value_t = 100)]
+        ef: usize,
+        #[arg(long, default_value_t = 16)]
+        m: usize,
+        #[arg(long, default_value_t = 200)]
+        ef_construction: usize,
+        #[arg(long, default_value_t = 1000)]
+        queries: usize,
+        /// Append this many upserts after the snapshot so recovery also
+        /// replays a WAL tail.
+        #[arg(long, default_value_t = 1000)]
+        tail: usize,
+        /// Use only the first N base vectors (default: all).
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        threads: Option<usize>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Build an HNSW graph, derive synthetic filters at several selectivities,
     /// and measure the brute-force and masked-traversal routes against exact
     /// filtered ground truth to set the cutover.
@@ -262,6 +291,36 @@ struct EfPoint {
 }
 
 #[derive(Serialize)]
+struct PersistReportV1 {
+    report_type: &'static str,
+    version: u16,
+    dataset: String,
+    metric: String,
+    dims: usize,
+    base_count: usize,
+    k: usize,
+    ef_search: usize,
+    parameters: BTreeMap<String, serde_json::Value>,
+    build_seconds: f64,
+    snapshot_write_seconds: f64,
+    snapshot_bytes: u64,
+    snapshot_bytes_per_vector: f64,
+    wal_tail_entries: usize,
+    wal_tail_seconds: f64,
+    wal_tail_bytes: u64,
+    recovery_seconds: f64,
+    recovery_replayed: u64,
+    resident_bytes_after_recovery: usize,
+    mapped_bytes_after_recovery: usize,
+    rss_bytes_after_recovery: u64,
+    recall_before: f64,
+    recall_after: f64,
+    results_identical: bool,
+    host: String,
+    source_revision: String,
+}
+
+#[derive(Serialize)]
 struct FilteredReportV1 {
     report_type: &'static str,
     version: u16,
@@ -426,6 +485,181 @@ fn main() -> anyhow::Result<()> {
                     .to_owned(),
             };
             let json = serde_json::to_string_pretty(&report)?;
+            if let Some(out) = out {
+                fs::write(&out, &json)?;
+            }
+            println!("{json}");
+            Ok(())
+        }
+        Command::Persist {
+            dataset,
+            partition_dir,
+            k,
+            ef,
+            m,
+            ef_construction,
+            queries,
+            tail,
+            limit,
+            threads,
+            out,
+        } => {
+            use distr_hnsw_index::partition::{Partition, PartitionConfig};
+            let loaded = load(&dataset)?;
+            let threads = threads.unwrap_or_else(num_threads);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build_global()
+                .ok();
+            let count = queries.min(loaded.queries.len());
+            let base_count = limit.unwrap_or(loaded.base.len()).min(loaded.base.len());
+            let params = HnswParams {
+                m,
+                m0: 2 * m,
+                ef_construction,
+                seed: 0x5eed,
+            };
+            let config = PartitionConfig::new(
+                uuid::Uuid::new_v4(),
+                loaded.base.dims(),
+                loaded.metric,
+                params,
+            );
+            let mut subset = FlatVectors::with_capacity(loaded.base.dims(), base_count);
+            for slot in 0..base_count {
+                subset.push(loaded.base.get(slot as RecordId).unwrap(), Metric::L2)?;
+            }
+            eprintln!(
+                "bulk loading {base_count} vectors into {}",
+                partition_dir.display()
+            );
+            let started = Instant::now();
+            let (mut partition, snapshot_path) = Partition::bulk_load(
+                &partition_dir,
+                config,
+                subset,
+                (0..base_count as u64).map(|i| i.to_le_bytes().to_vec()),
+            )?;
+            let build_and_snapshot = started.elapsed().as_secs_f64();
+            // Split build time from snapshot time by writing one more snapshot.
+            let started = Instant::now();
+            let second = partition.snapshot()?;
+            let snapshot_write_seconds = started.elapsed().as_secs_f64();
+            // Both snapshots sit at high-water mark 0 and share one name; the
+            // second atomically replaced the first with identical content.
+            debug_assert_eq!(second, snapshot_path);
+            let snapshot_bytes = fs::metadata(&second)?.len();
+            let build_seconds = (build_and_snapshot - snapshot_write_seconds).max(0.0);
+            eprintln!(
+                "built in {build_seconds:.1}s, snapshot {:.2} GiB written in {snapshot_write_seconds:.1}s",
+                snapshot_bytes as f64 / 1073741824.0
+            );
+
+            // WAL tail: re-upsert the first `tail` rows under new keys.
+            let started = Instant::now();
+            for i in 0..tail.min(base_count) {
+                let mut op = [0_u8; 16];
+                op[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                op[8] = 1;
+                partition.upsert(
+                    op,
+                    format!("tail-{i}").as_bytes(),
+                    loaded.base.get(i as RecordId).unwrap(),
+                    b"{}",
+                )?;
+            }
+            let wal_tail_seconds = started.elapsed().as_secs_f64();
+            let wal_tail_bytes: u64 = fs::read_dir(partition_dir.join("wal"))?
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum();
+            let search_all = |p: &Partition| -> Vec<Vec<(Vec<u8>, f32)>> {
+                (0..count)
+                    .into_par_iter()
+                    .map(|q| {
+                        let query = loaded.queries.get(q as RecordId).unwrap();
+                        p.search(query, k, ef, None)
+                            .unwrap()
+                            .into_iter()
+                            .map(|h| (h.key, h.distance))
+                            .collect()
+                    })
+                    .collect()
+            };
+            let recall_of = |results: &[Vec<(Vec<u8>, f32)>]| -> f64 {
+                let total: f64 = (0..count)
+                    .map(|q| {
+                        let query = loaded.queries.get(q as RecordId).unwrap();
+                        let truth = &loaded.groundtruth[q][..k];
+                        let kth = truth
+                            .iter()
+                            .map(|id| distance(loaded.metric, query, loaded.base.get(*id).unwrap()))
+                            .fold(f32::MIN, f32::max);
+                        let hits: Vec<Hit> = results[q]
+                            .iter()
+                            .map(|(_, d)| Hit {
+                                id: 0,
+                                distance: *d,
+                            })
+                            .collect();
+                        recall_by_distance(kth, &hits, k)
+                    })
+                    .sum();
+                total / count.max(1) as f64
+            };
+            let before = search_all(&partition);
+            let recall_before = recall_of(&before);
+            drop(partition);
+
+            let started = Instant::now();
+            let (recovered, report) = Partition::open(&partition_dir)?;
+            let recovery_seconds = started.elapsed().as_secs_f64();
+            let rss = rss_bytes();
+            let after = search_all(&recovered);
+            let recall_after = recall_of(&after);
+            eprintln!(
+                "recovered in {recovery_seconds:.2}s (replayed {}), recall before {recall_before:.4} after {recall_after:.4}",
+                report.wal_entries_replayed
+            );
+
+            let mut parameters = BTreeMap::new();
+            parameters.insert("m".to_owned(), serde_json::json!(m));
+            parameters.insert(
+                "ef_construction".to_owned(),
+                serde_json::json!(ef_construction),
+            );
+            let out_report = PersistReportV1 {
+                report_type: "PersistReportV1",
+                version: 1,
+                dataset: loaded.manifest.name.clone(),
+                metric: loaded.metric.as_str().to_owned(),
+                dims: loaded.base.dims(),
+                base_count,
+                k,
+                ef_search: ef,
+                parameters,
+                build_seconds,
+                snapshot_write_seconds,
+                snapshot_bytes,
+                snapshot_bytes_per_vector: snapshot_bytes as f64 / base_count.max(1) as f64,
+                wal_tail_entries: tail.min(base_count),
+                wal_tail_seconds,
+                wal_tail_bytes,
+                recovery_seconds,
+                recovery_replayed: report.wal_entries_replayed,
+                resident_bytes_after_recovery: recovered.resident_bytes(),
+                mapped_bytes_after_recovery: recovered.mapped_bytes(),
+                rss_bytes_after_recovery: rss,
+                recall_before,
+                recall_after,
+                results_identical: before == after,
+                host: hostname(),
+                source_revision: option_env!("DISTR_HNSW_REV")
+                    .unwrap_or("unknown")
+                    .to_owned(),
+            };
+            let json = serde_json::to_string_pretty(&out_report)?;
             if let Some(out) = out {
                 fs::write(&out, &json)?;
             }

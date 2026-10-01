@@ -1,11 +1,13 @@
 # M3 implementation plan
 
-Status: **In progress** (passes 1 public part, 2, 3, 4, and 5 done
-2026-09-30: datasets pinned, oracle and kernels landed, engine contract
+Status: **In progress** (passes 1 public part and 2 through 6 done by
+2026-10-01: datasets pinned, oracle and kernels landed, engine contract
 written in [m3-engine-contract.md](m3-engine-contract.md), HNSW core meets
 the f32 recall thresholds, int8 traversal with exact rescoring costs at most
-0.0005 recall, the memory formula is measured, and filtered search has a
-measured cutover of 200 · ef; results in [bench/README.md](bench/README.md)). The milestone scope, acceptance criteria,
+0.0005 recall, the memory formula is measured, filtered search has a
+measured cutover of 200 · ef, and WAL, snapshots, and recovery pass every
+crash and corruption test with 1.8 s recovery at 1M; results in
+[bench/README.md](bench/README.md)). The milestone scope, acceptance criteria,
 and exit gate remain in [`roadmap.md`](roadmap.md) (M3). This page fixes the
 order of work and, deliberately, puts the benchmark datasets and the
 brute-force oracle before any engine code: every recall threshold is written
@@ -142,12 +144,17 @@ updated contract documentation. Estimates are solo-effort scale markers.
    recall 0.983 to 1.000 at every level; the crossover is 150 to 300 times
    ef, so the cutover is `200 · ef_search` and the `50 · k` hypothesis is
    rejected.
-6. **WAL, snapshot, recovery** (~2 weeks). Checksummed WAL segments with
-   sequence numbers and idempotency ids; versioned mmap snapshots; recovery
-   from snapshot plus tail; a failpoint harness in the M1 style that kills
-   the process at every append, sync, apply, and publication boundary;
-   truncated, reordered, and checksum-invalid inputs fail closed. Exit:
-   exactly-once replay proven; recovery time measured at 1M × 512.
+6. **WAL, snapshot, recovery** (~2 weeks; done in one day). Checksummed WAL
+   segments with sequence numbers and idempotency ids; versioned mmap
+   snapshots; recovery from snapshot plus tail; a failpoint harness in the
+   M1 style that kills the process at every append, sync, apply, and
+   publication boundary; truncated, reordered, and checksum-invalid inputs
+   fail closed. Exit: exactly-once replay proven; recovery time measured at
+   1M × 512. **Result:** every crash point and corruption case covered by
+   tests (in-process crash model: the partition is dropped without a clean
+   close and reopened); recovery 1.8 s on sift 1M and 5.4 s on glove with
+   byte-identical search results; snapshot 821 bytes/vector at 128 dims.
+   The 1M × 512 measurement waits on the project dataset.
 7. **Compaction, budget, blob-plane archive** (~2 weeks). Background rebuild
    with crash points at the swap; concurrent reads and writes during
    compaction; memory accounting from the measured overhead factor with

@@ -138,3 +138,35 @@ level this picks the faster route, and near the boundary it prefers the
 exact one. A future refinement is an int8 brute-force route with rescoring,
 which would move the crossover higher. Full reports:
 `~/distr-hnsw-bench/reports/filtered-*.json`.
+
+## Persistence and recovery (pass 6, 2026-10-01)
+
+Bulk-load a dataset into an on-disk partition, write the snapshot, append a
+1,000-entry WAL tail with per-entry `fdatasync`, drop the partition, and
+recover it. Search results before and after recovery are compared bit for
+bit (int8 traversal with rescoring, 1,000 queries).
+
+| Dataset (M) | Snapshot | Bytes/vector | Snapshot write | WAL tail (1,000 upserts) | Recovery | Replayed | Results identical | RAM resident / mapped after recovery |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| sift 1M (16) | 0.77 GiB | 821 | 3.5 s | 1.44 s, 565 KB | 1.80 s | 1,000 | yes (recall 0.9892 both) | 389 MiB / 488 MiB |
+| glove 1.18M (32) | 0.89 GiB | 809 | 3.8 s | 2.73 s, 453 KB | 5.40 s | 1,000 | yes (recall 0.9872 both) | 572 MiB / 451 MiB |
+
+Reading:
+
+- Recovery is dominated by hashing the file (BLAKE3 over 0.8 to 0.9 GiB),
+  copying the int8 and graph sections into RAM, and replaying the tail;
+  the f32 originals are mapped, not read. Against the plan's 60 s required
+  and 20 s target at 1M × 512, 1.8 to 5.4 s at 100 to 128 dims leaves
+  ample room: the 512-dim file is about 3 GiB, of which only the int8 copy
+  (0.5 GiB) is copied.
+- Recovered search is byte-identical to pre-recovery search, which is what
+  the snapshot and WAL formats are for.
+- The WAL tail runs at about 700 synced entries per second with one
+  `fdatasync` per entry. Group commit (contract §4 rule 1) will batch these;
+  the per-entry number is the floor, not the throughput target.
+- Resident RAM after recovery is the int8 copy plus graph plus keys and
+  payload bookkeeping; the f32 originals (488 MiB on sift) sit in the page
+  cache behind the map. The bench process RSS (~2 GiB) also holds the
+  dataset itself.
+
+Full reports: `~/distr-hnsw-bench/reports/persist-*.json`.
