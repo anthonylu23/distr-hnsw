@@ -14,7 +14,7 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use distr_hnsw_index::{
     distance::{distance, normalize},
-    hnsw::{Hnsw, HnswParams},
+    hnsw::{Hnsw, HnswParams, SearchMode},
     oracle::{recall, recall_by_distance, search},
     vector::FlatVectors,
     Hit, Metric, RecordId,
@@ -73,6 +73,13 @@ enum Command {
         /// bulk build.
         #[arg(long)]
         sequential: bool,
+        /// Traversal modes to measure on the same graph: `f32`, `int8`, or
+        /// `both`.
+        #[arg(long, default_value = "both")]
+        modes: String,
+        /// Int8 rescoring depth (default max(4k, 100) per the contract).
+        #[arg(long)]
+        rescore: Option<usize>,
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -208,6 +215,9 @@ struct HnswReportV1 {
     build_vectors_per_second: f64,
     accounted_bytes: usize,
     accounted_bytes_per_vector: f64,
+    accounted_f32_bytes: usize,
+    accounted_int8_bytes: usize,
+    accounted_graph_bytes: usize,
     rss_bytes_after_build: u64,
     max_level: u8,
     points: Vec<EfPoint>,
@@ -217,6 +227,8 @@ struct HnswReportV1 {
 
 #[derive(Serialize)]
 struct EfPoint {
+    mode: String,
+    rescore: Option<usize>,
     ef_search: usize,
     recall_at_k: f64,
     recall_min: f64,
@@ -372,6 +384,8 @@ fn main() -> anyhow::Result<()> {
             queries,
             threads,
             sequential,
+            modes,
+            rescore,
             out,
         } => {
             let loaded = load(&dataset)?;
@@ -440,44 +454,66 @@ fn main() -> anyhow::Result<()> {
                 index.max_level()
             );
 
+            let mode_list: Vec<SearchMode> = match modes.as_str() {
+                "f32" => vec![SearchMode::F32],
+                "int8" => vec![SearchMode::Int8 {
+                    rescore: rescore.unwrap_or((4 * k).max(100)),
+                }],
+                "both" => vec![
+                    SearchMode::F32,
+                    SearchMode::Int8 {
+                        rescore: rescore.unwrap_or((4 * k).max(100)),
+                    },
+                ],
+                other => bail!("unknown --modes {other}"),
+            };
             let mut points = Vec::new();
-            for &ef_search in &efs {
-                let sample = count.min(200);
-                let mut latencies = Vec::with_capacity(sample);
-                for index_q in 0..sample {
-                    let query = loaded.queries.get(index_q as RecordId).unwrap();
-                    let started = Instant::now();
-                    let hits = index.search(query, k, ef_search, None);
-                    latencies.push(started.elapsed().as_secs_f64() * 1e3);
-                    std::hint::black_box(hits);
-                }
-                let started = Instant::now();
-                let per_query: Vec<(f64, f64)> = (0..count)
-                    .into_par_iter()
-                    .map(|index_q| {
+            for mode in mode_list {
+                for &ef_search in &efs {
+                    let sample = count.min(200);
+                    let mut latencies = Vec::with_capacity(sample);
+                    for index_q in 0..sample {
                         let query = loaded.queries.get(index_q as RecordId).unwrap();
-                        let hits = index.search(query, k, ef_search, None);
-                        recalls(&loaded, index_q, query, &hits, k)
-                    })
-                    .collect();
-                let batch_seconds = started.elapsed().as_secs_f64();
-                let n = per_query.len().max(1) as f64;
-                points.push(EfPoint {
-                    ef_search,
-                    recall_at_k: per_query.iter().map(|r| r.0).sum::<f64>() / n,
-                    recall_min: per_query.iter().map(|r| r.0).fold(1.0, f64::min),
-                    id_recall_at_k: per_query.iter().map(|r| r.1).sum::<f64>() / n,
-                    latency_single_thread_ms: percentiles(latencies),
-                    batch_queries_per_second: count as f64 / batch_seconds,
-                    batch_threads: threads,
-                });
-                eprintln!(
-                    "  ef={ef_search}: recall@{k}={:.4} p50={:.3}ms qps={:.0}",
-                    points.last().unwrap().recall_at_k,
-                    points.last().unwrap().latency_single_thread_ms.p50,
-                    points.last().unwrap().batch_queries_per_second
-                );
+                        let started = Instant::now();
+                        let hits = index.search_with(query, k, ef_search, mode, None);
+                        latencies.push(started.elapsed().as_secs_f64() * 1e3);
+                        std::hint::black_box(hits);
+                    }
+                    let started = Instant::now();
+                    let per_query: Vec<(f64, f64)> = (0..count)
+                        .into_par_iter()
+                        .map(|index_q| {
+                            let query = loaded.queries.get(index_q as RecordId).unwrap();
+                            let hits = index.search_with(query, k, ef_search, mode, None);
+                            recalls(&loaded, index_q, query, &hits, k)
+                        })
+                        .collect();
+                    let batch_seconds = started.elapsed().as_secs_f64();
+                    let n = per_query.len().max(1) as f64;
+                    let (mode_name, rescore_depth) = match mode {
+                        SearchMode::F32 => ("f32".to_owned(), None),
+                        SearchMode::Int8 { rescore } => ("int8".to_owned(), Some(rescore)),
+                    };
+                    points.push(EfPoint {
+                        mode: mode_name.clone(),
+                        rescore: rescore_depth,
+                        ef_search,
+                        recall_at_k: per_query.iter().map(|r| r.0).sum::<f64>() / n,
+                        recall_min: per_query.iter().map(|r| r.0).fold(1.0, f64::min),
+                        id_recall_at_k: per_query.iter().map(|r| r.1).sum::<f64>() / n,
+                        latency_single_thread_ms: percentiles(latencies),
+                        batch_queries_per_second: count as f64 / batch_seconds,
+                        batch_threads: threads,
+                    });
+                    eprintln!(
+                        "  {mode_name} ef={ef_search}: recall@{k}={:.4} p50={:.3}ms qps={:.0}",
+                        points.last().unwrap().recall_at_k,
+                        points.last().unwrap().latency_single_thread_ms.p50,
+                        points.last().unwrap().batch_queries_per_second
+                    );
+                }
             }
+            let (f32_bytes, int8_bytes, graph_bytes) = index.accounted_breakdown();
 
             let mut parameters = BTreeMap::new();
             parameters.insert("m".to_owned(), serde_json::json!(m));
@@ -506,6 +542,9 @@ fn main() -> anyhow::Result<()> {
                 accounted_bytes: index.accounted_bytes(),
                 accounted_bytes_per_vector: index.accounted_bytes() as f64
                     / base_count.max(1) as f64,
+                accounted_f32_bytes: f32_bytes,
+                accounted_int8_bytes: int8_bytes,
+                accounted_graph_bytes: graph_bytes,
                 rss_bytes_after_build: rss,
                 max_level: index.max_level(),
                 points,

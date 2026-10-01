@@ -8,6 +8,7 @@
 pub mod distance;
 pub mod hnsw;
 pub mod oracle;
+pub mod quant;
 pub mod vector;
 
 /// Record identifier inside a partition. External keys map to these in the

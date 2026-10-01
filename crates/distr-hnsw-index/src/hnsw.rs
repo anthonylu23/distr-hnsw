@@ -5,7 +5,13 @@
 
 use std::{cell::RefCell, cmp::Ordering, collections::BinaryHeap};
 
-use crate::{distance::distance, oracle::TopK, vector::FlatVectors, Hit, Metric};
+use crate::{
+    distance::distance,
+    oracle::TopK,
+    quant::{quantize, QuantizedVectors},
+    vector::FlatVectors,
+    Hit, Metric,
+};
 
 /// Internal slot index (contract §1).
 pub type Slot = u32;
@@ -120,10 +126,30 @@ thread_local! {
     static SCRATCH: RefCell<Visited> = RefCell::new(Visited::new());
 }
 
+/// How a search computes distances during traversal (contract §7).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SearchMode {
+    /// Exact `f32` distances throughout.
+    F32,
+    /// Int8 distances during traversal, then exact `f32` rescoring of the
+    /// best `rescore` candidates. The returned distance is always exact.
+    Int8 { rescore: usize },
+}
+
+impl SearchMode {
+    /// Contract default: rescore `max(4k, 100)` candidates.
+    pub fn int8_default(k: usize) -> Self {
+        Self::Int8 {
+            rescore: (4 * k).max(100),
+        }
+    }
+}
+
 pub struct Hnsw {
     params: HnswParams,
     metric: Metric,
     vectors: FlatVectors,
+    quantized: QuantizedVectors,
     /// Level of each slot.
     levels: Vec<u8>,
     /// Level-0 neighbour lists: `m0` entries per slot, `level0_len` used.
@@ -144,6 +170,7 @@ impl Hnsw {
             params,
             metric,
             vectors: FlatVectors::new(dims),
+            quantized: QuantizedVectors::new(dims),
             levels: Vec::new(),
             level0: Vec::new(),
             level0_len: Vec::new(),
@@ -154,6 +181,10 @@ impl Hnsw {
             entry: None,
             max_level: 0,
         }
+    }
+
+    pub fn quantized(&self) -> &QuantizedVectors {
+        &self.quantized
     }
 
     pub fn params(&self) -> HnswParams {
@@ -283,6 +314,8 @@ impl Hnsw {
     pub fn insert(&mut self, vector: &[f32]) -> Result<Slot, crate::vector::VectorError> {
         let slot_u64 = self.vectors.push(vector, self.metric)?;
         let slot = Slot::try_from(slot_u64).expect("partition slot space exhausted");
+        self.quantized
+            .push(self.vectors.get(slot_u64).expect("just pushed"));
         let level = self.level_for(slot);
         self.levels.push(level);
         self.level0.resize(self.level0.len() + self.params.m0, 0);
@@ -303,7 +336,8 @@ impl Hnsw {
         // Greedy descent through levels above the new node's level.
         let mut current_level = self.max_level;
         while current_level > level {
-            entry = self.greedy_closest(&query, entry, current_level);
+            let exact = |s: Slot| self.dist(&query, s);
+            entry = self.greedy_closest(&exact, entry, current_level);
             current_level -= 1;
         }
 
@@ -311,8 +345,10 @@ impl Hnsw {
         let mut entries = vec![entry];
         let top = level.min(self.max_level);
         for lc in (0..=top).rev() {
-            let candidates =
-                self.search_layer(&query, &entries, self.params.ef_construction, lc, None);
+            let candidates = {
+                let exact = |s: Slot| self.dist(&query, s);
+                self.search_layer(&exact, &entries, self.params.ef_construction, lc, None)
+            };
             let selected = self.select_heuristic(&query, &candidates, self.capacity(lc));
             self.set_neighbours(slot, lc, &selected);
             for &neighbour in &selected {
@@ -395,12 +431,12 @@ impl Hnsw {
         selected
     }
 
-    fn greedy_closest(&self, query: &[f32], mut current: Slot, level: u8) -> Slot {
-        let mut best = self.dist(query, current);
+    fn greedy_closest(&self, dist: &dyn Fn(Slot) -> f32, mut current: Slot, level: u8) -> Slot {
+        let mut best = dist(current);
         loop {
             let mut improved = false;
             for &neighbour in self.neighbours(current, level) {
-                let d = self.dist(query, neighbour);
+                let d = dist(neighbour);
                 if d < best || (d == best && neighbour < current) {
                     best = d;
                     current = neighbour;
@@ -417,7 +453,7 @@ impl Hnsw {
     /// `allow` (tombstoned slots never pass). All visited slots route.
     fn search_layer(
         &self,
-        query: &[f32],
+        dist: &dyn Fn(Slot) -> f32,
         entries: &[Slot],
         ef: usize,
         level: u8,
@@ -433,7 +469,7 @@ impl Hnsw {
                 if !visited.insert(entry) {
                     continue;
                 }
-                let d = self.dist(query, entry);
+                let d = dist(entry);
                 candidates.push(Near(d, entry));
                 if accepts(entry) {
                     results.push(Far(d, entry));
@@ -451,7 +487,7 @@ impl Hnsw {
                     if !visited.insert(neighbour) {
                         continue;
                     }
-                    let d = self.dist(query, neighbour);
+                    let d = dist(neighbour);
                     let admit = results.len() < ef
                         || results
                             .peek()
@@ -481,6 +517,21 @@ impl Hnsw {
         ef: usize,
         allow: Option<&dyn Fn(Slot) -> bool>,
     ) -> Vec<Hit> {
+        self.search_with(query, k, ef, SearchMode::F32, allow)
+    }
+
+    /// Approximate top-k with the traversal mode chosen explicitly. In
+    /// `Int8` mode the graph is traversed with int8 distances and the best
+    /// `rescore` candidates are re-scored exactly from the `f32` originals;
+    /// every returned distance is the exact distance of the returned slot.
+    pub fn search_with(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        mode: SearchMode,
+        allow: Option<&dyn Fn(Slot) -> bool>,
+    ) -> Vec<Hit> {
         let Some(mut entry) = self.entry else {
             return Vec::new();
         };
@@ -488,25 +539,65 @@ impl Hnsw {
             return Vec::new();
         }
         let ef = ef.max(k);
+        let exact = |s: Slot| self.dist(query, s);
+        let quantized_query;
+        let approximate;
+        let dist: &dyn Fn(Slot) -> f32 = match mode {
+            SearchMode::F32 => &exact,
+            SearchMode::Int8 { .. } => {
+                quantized_query = quantize(query);
+                approximate = |s: Slot| {
+                    self.quantized
+                        .distance(self.metric, &quantized_query, s as usize)
+                };
+                &approximate
+            }
+        };
         let mut level = self.max_level;
         while level > 0 {
-            entry = self.greedy_closest(query, entry, level);
+            entry = self.greedy_closest(dist, entry, level);
             level -= 1;
         }
-        let candidates = self.search_layer(query, &[entry], ef, 0, allow);
+        let candidates = self.search_layer(dist, &[entry], ef, 0, allow);
         let mut top = TopK::new(k);
-        for Far(d, slot) in candidates {
-            top.push(Hit {
-                id: u64::from(slot),
-                distance: d,
-            });
+        match mode {
+            SearchMode::F32 => {
+                for Far(d, slot) in candidates {
+                    top.push(Hit {
+                        id: u64::from(slot),
+                        distance: d,
+                    });
+                }
+            }
+            SearchMode::Int8 { rescore } => {
+                let mut ranked = candidates;
+                ranked.sort();
+                for Far(_, slot) in ranked.into_iter().take(rescore.max(k)) {
+                    top.push(Hit {
+                        id: u64::from(slot),
+                        distance: exact(slot),
+                    });
+                }
+            }
         }
         top.into_sorted()
     }
 
+    /// Accounted bytes split into `(f32 originals, int8 copies, graph and
+    /// bookkeeping)` for the memory model in contract §11.
+    pub fn accounted_breakdown(&self) -> (usize, usize, usize) {
+        let f32_bytes = self.vectors.as_slice().len() * 4;
+        let int8_bytes = self.quantized.accounted_bytes();
+        (
+            f32_bytes,
+            int8_bytes,
+            self.accounted_bytes() - f32_bytes - int8_bytes,
+        )
+    }
+
     /// Accounted bytes of the structure, for the memory model in contract §11.
     pub fn accounted_bytes(&self) -> usize {
-        let vectors = self.vectors.as_slice().len() * 4;
+        let vectors = self.vectors.as_slice().len() * 4 + self.quantized.accounted_bytes();
         let level0 = self.level0.len() * 4 + self.level0_len.len();
         let upper: usize = self
             .upper
@@ -738,6 +829,7 @@ impl Hnsw {
             params,
             metric,
             vectors: FlatVectors::new(probe.dims()),
+            quantized: QuantizedVectors::new(probe.dims()),
             levels: Vec::new(),
             level0: Vec::new(),
             level0_len: Vec::new(),
@@ -781,7 +873,16 @@ impl Hnsw {
             core.links
         };
 
-        // Compact.
+        // Compact; quantize every row in parallel.
+        let mut quantized = QuantizedVectors::with_capacity(vectors.dims(), slots);
+        let rows: Vec<crate::quant::QuantizedQuery> = (0..slots)
+            .into_par_iter()
+            .map(|slot| quantize(vectors.get(slot as u64).expect("slot")))
+            .collect();
+        for row in rows {
+            quantized.push_quantized(row);
+        }
+        index.quantized = quantized;
         index.vectors = vectors;
         index.levels = levels;
         index.level0 = vec![0; slots * params.m0];
@@ -951,6 +1052,57 @@ mod tests {
         }
         assert!(total.1 / 50.0 >= 0.9, "parallel recall {}", total.1 / 50.0);
         assert!((total.0 - total.1).abs() / 50.0 <= 0.05, "{total:?}");
+    }
+
+    #[test]
+    fn int8_search_returns_exact_distances_and_near_f32_recall() {
+        let rows: Vec<Vec<f32>> = (0..4000)
+            .map(|i| {
+                (0..32)
+                    .map(|d| ((i * (d + 5)) as f32 * 0.011).sin() * (1.0 + d as f32 * 0.05))
+                    .collect()
+            })
+            .collect();
+        let mut store = FlatVectors::new(32);
+        for row in &rows {
+            store.push(row, Metric::Cosine).unwrap();
+        }
+        let params = HnswParams {
+            m: 16,
+            m0: 32,
+            ef_construction: 100,
+            seed: 3,
+        };
+        let index = Hnsw::build_parallel(store.clone(), Metric::Cosine, params);
+        let mut f32_total = 0.0;
+        let mut int8_total = 0.0;
+        for q in 0..100 {
+            let mut query: Vec<f32> = (0..32).map(|d| ((q * d + 7) as f32 * 0.03).cos()).collect();
+            crate::distance::normalize(&mut query);
+            let exact = oracle::search(&store, Metric::Cosine, &query, 10, |_| true);
+            let kth = exact.last().unwrap().distance;
+            let f32_hits = index.search(&query, 10, 100, None);
+            let int8_hits = index.search_with(&query, 10, 100, SearchMode::int8_default(10), None);
+            for hit in &int8_hits {
+                let recomputed = distance(Metric::Cosine, &query, store.get(hit.id).unwrap());
+                assert_eq!(
+                    hit.distance, recomputed,
+                    "returned score must be the exact f32 distance"
+                );
+            }
+            for pair in int8_hits.windows(2) {
+                assert!(pair[0].cmp_rank(&pair[1]) != std::cmp::Ordering::Greater);
+            }
+            f32_total += oracle::recall_by_distance(kth, &f32_hits, 10);
+            int8_total += oracle::recall_by_distance(kth, &int8_hits, 10);
+        }
+        let (f32_recall, int8_recall) = (f32_total / 100.0, int8_total / 100.0);
+        assert!(f32_recall >= 0.95, "{f32_recall}");
+        assert!(
+            int8_recall >= f32_recall - 0.02,
+            "f32 {f32_recall} vs int8 {int8_recall}"
+        );
+        assert!(index.accounted_bytes() > index.vectors().as_slice().len() * 4);
     }
 
     proptest! {
