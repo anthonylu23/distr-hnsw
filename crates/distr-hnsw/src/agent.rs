@@ -213,6 +213,10 @@ pub async fn serve_agent_with_capacity(
     capacity: CapacityConfig,
 ) -> anyhow::Result<()> {
     let store = DurableStore::open(volume)?;
+    let swept = store.sweep_stale_temporaries(std::time::Duration::from_secs(3600))?;
+    if swept > 0 {
+        eprintln!("removed {swept} stale temporary file(s) left by interrupted writes");
+    }
     let router = router(store, identity, capacity)?;
     axum::serve(listener, router).await?;
     Ok(())
@@ -255,7 +259,7 @@ pub fn router(
             "/v1/objects/{kind}/{hash}",
             get(get_object).put(put_object).delete(delete_object),
         )
-        .layer(DefaultBodyLimit::max(CHUNK_SIZE + 1024 * 1024))
+        .layer(DefaultBodyLimit::max(crate::MAX_OBJECT_BYTES))
         .with_state(state))
 }
 

@@ -6,12 +6,16 @@ extends the recovery contract in
 [`m1-storage-contract.md`](m1-storage-contract.md) without weakening the
 invariants in `DESIGN.md`.
 
+**Last reviewed:** 2026-10-25 (hardening pass; see
+[hardening-2026-10.md](hardening-2026-10.md)).
+
 ## Safety boundary
 
-The current implementation may create, verify, inventory, and repair immutable
-objects. It may not physically delete them. A placement row, an absent object
-in one scan, an expired upload, or a SQLite reference count is not sufficient
-deletion evidence.
+Physical deletion happens only through `portal gc --apply` and an applied
+proof (below). A placement row, an absent object in one scan, an expired
+upload, or a SQLite reference count is not sufficient deletion evidence.
+Until M2 adds authorization, agents accept DELETE from any local client; the
+proof gate is enforced by the portal, not by agents.
 
 Durability and placement policy are separate:
 
@@ -37,7 +41,9 @@ an older live generation authoritative. Long-absent nodes block collection
 until they return and are reconciled or are formally retired.
 
 Retirement is an explicit durable portal transition. A retired incarnation
-cannot rejoin. Its storage must be wiped or fully reconciled before the machine
+cannot rejoin. Retirement checks only objects that still exist: objects GC
+has collected under an applied proof are excluded from history checks, so
+retirement stays possible after any collection. Its storage must be wiped or fully reconciled before the machine
 joins under a new incarnation.
 
 ## Repair and movement
@@ -73,7 +79,16 @@ proof containing all applicable facts:
   movement;
 - the node is active, or its retirement procedure explicitly owns cleanup;
 - offsite retention is treated separately and is not represented as
-  live-cluster deletion.
+  live-cluster deletion, but a deleted generation is collected only after
+  every backup target that has run a job holds a verified copy, so offsite
+  retention can start;
+- no agent holds a manifest or deletion marker unknown to the metadata (an
+  unknown control object means the metadata is behind the agents, for
+  example after a snapshot restore, and could make another generation
+  authoritative);
+- for staging garbage, the upload's file is not known to the projection
+  (recovery owns it once it is);
+- the metadata is not pending recovery after a snapshot restore.
 
 Proof inputs are immutable or versioned. If policy, node membership, generation,
 or inventory state changes before execution, the proof is stale and DELETE must
@@ -117,6 +132,12 @@ the proof above.
    elapsed, content changing before apply, a pending placement, an
    unreachable agent, and live objects never being candidates.
 
+7. Hardening pass (2026-10-25): GC facts for unknown control objects, backup
+   coverage, and pending recovery; collected objects excluded from
+   retirement and backup history; drain, retire, and GC refuse while a
+   restored database is pending recovery (`tests/hardening.rs`).
+
 Large corruption, movement, retirement, and storage-pressure matrices run on
-`anthonypc`. This pass does not provide backup, independent key recovery, or
-the empty-infrastructure restore required for M1 acceptance.
+`anthonypc`. Backup, key recovery, and the empty-infrastructure restore are
+specified in [m1-storage-contract.md](m1-storage-contract.md) and
+[m1-phase-1-decisions.md](m1-phase-1-decisions.md).

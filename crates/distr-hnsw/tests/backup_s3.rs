@@ -23,11 +23,12 @@ use tokio::{net::TcpListener, task::JoinHandle};
 
 const TEST_ENDPOINT_ENV: &str = "DISTR_HNSW_S3_TEST_ENDPOINT";
 
-/// The live client, or `None` after printing why the test is skipped.
+/// The live client. These tests are `#[ignore]`d so a plain `cargo test`
+/// never counts them as passing; when run explicitly they fail loudly if no
+/// endpoint is configured instead of skipping.
 fn live_client() -> Option<Client> {
     let Ok(endpoint) = std::env::var(TEST_ENDPOINT_ENV) else {
-        eprintln!("skipping: {TEST_ENDPOINT_ENV} is not set (see scripts/minio-test.sh)");
-        return None;
+        panic!("{TEST_ENDPOINT_ENV} is not set; run these tests through scripts/minio-test.sh");
     };
     // The product code reads its endpoint from this variable; every test in
     // this binary sets the same value, so the race between test threads is
@@ -98,6 +99,7 @@ async fn start_agent(id: &str, domain: &str) -> TestAgent {
 }
 
 #[tokio::test]
+#[ignore = "needs a live S3 endpoint; run scripts/minio-test.sh"]
 async fn s3_target_never_overwrites_and_lists_under_its_prefix() {
     let Some(client) = live_client() else {
         return;
@@ -198,6 +200,7 @@ async fn s3_target_never_overwrites_and_lists_under_its_prefix() {
 }
 
 #[tokio::test]
+#[ignore = "needs a live S3 endpoint; run scripts/minio-test.sh"]
 async fn unversioned_bucket_is_refused_and_missing_object_lock_only_warns() {
     let Some(client) = live_client() else {
         return;
@@ -239,6 +242,7 @@ async fn unversioned_bucket_is_refused_and_missing_object_lock_only_warns() {
 /// back up twice, then rebuild metadata and objects into fresh agents and let
 /// recovery converge.
 #[tokio::test]
+#[ignore = "needs a live S3 endpoint; run scripts/minio-test.sh"]
 async fn backup_and_restore_round_trip_through_s3() {
     let Some(client) = live_client() else {
         return;

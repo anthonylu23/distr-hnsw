@@ -430,7 +430,7 @@ jq -n \
     --argjson block "$BLOCK" --argjson fs_total "$FS_TOTAL" --argjson fs_avail_start "$FS_AVAIL_START" \
     --argjson reserve "$RESERVE_BYTES" --argjson floor "$HARD_FLOOR_BYTES" --argjson file_size "$FILE_SIZE" \
     --arg incarnation "$INCARNATION_ORIG" --arg bin_sha "$(sha256sum "$BIN" | cut -d' ' -f1)" \
-    --arg source_rev "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+    --arg source_rev "$(git -C "$REPO" describe --always --dirty 2>/dev/null || echo unknown)" \
     --argjson admitted "$ADMITTED" --argjson first_warning "$FIRST_WARNING" --argjson first_paused "$FIRST_PAUSED" \
     --argjson cap_initial "$CAP_INITIAL" --argjson cap_after_refusal "$CAP_AFTER_REFUSAL" --argjson cap_after_delete "$CAP_AFTER_DELETE" \
     --arg refused_key "$REFUSED_KEY" --argjson refused_rc "$REFUSED_RC" --arg refused_err "$REFUSED_ERR" \

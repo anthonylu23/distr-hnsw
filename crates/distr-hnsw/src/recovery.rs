@@ -48,6 +48,8 @@ pub struct FileRecoveryDecision {
     pub decision: String,
     pub repairs: Vec<RecoveryRepair>,
     pub issues: Vec<String>,
+    /// Non-blocking observations, such as a redundant deletion marker.
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -82,9 +84,13 @@ impl RecoveryReportV1 {
     }
 }
 
+/// Agents holding a hash-verified copy of one object. Control objects keep
+/// their bytes for decoding; chunk bytes are verified and dropped, and a
+/// repair re-reads them from a valid source, so recovery memory is bounded by
+/// the control-object set rather than the stored data.
 #[derive(Clone)]
 struct ReplicaSet {
-    bytes: Vec<u8>,
+    bytes: Option<Vec<u8>>,
     valid_agents: BTreeSet<String>,
 }
 
@@ -130,7 +136,15 @@ pub async fn recover(
     let mut incarnations: BTreeMap<String, String> = BTreeMap::new();
     for agent in agents {
         let incarnation_id = verify_agent(client, agent).await?;
-        database.observe_agent_incarnation(&agent.id, &agent.failure_domain, &incarnation_id)?;
+        if mode == RecoveryMode::Apply {
+            database.observe_agent_incarnation(
+                &agent.id,
+                &agent.failure_domain,
+                &incarnation_id,
+            )?;
+        } else {
+            database.check_agent_incarnation(&agent.id, &incarnation_id)?;
+        }
         incarnations.insert(agent.id.clone(), incarnation_id);
         let mut object_count = 0_usize;
         for kind in ObjectKind::ALL {
@@ -209,6 +223,7 @@ pub async fn recover(
         let hash = ObjectHash::parse(hash_name.clone())?;
         let mut valid_agents = BTreeSet::new();
         let mut valid_bytes = None;
+        let mut any_valid = false;
         for (agent_id, expected_size) in listed {
             let agent = agent_map
                 .get(agent_id)
@@ -225,9 +240,10 @@ pub async fn recover(
             let valid = if response.status().is_success() {
                 let bytes = response.bytes().await?;
                 ObjectHash::digest(&bytes) == hash && bytes.len() as u64 == *expected_size && {
-                    if valid_bytes.is_none() {
+                    if valid_bytes.is_none() && kind != ObjectKind::Chunk {
                         valid_bytes = Some(bytes.to_vec());
                     }
+                    any_valid = true;
                     true
                 }
             } else {
@@ -244,11 +260,11 @@ pub async fn recover(
                 summary.corrupt_objects += 1;
             }
         }
-        if let Some(bytes) = valid_bytes {
+        if any_valid {
             replicas.insert(
                 (kind_name.clone(), hash_name.clone()),
                 ReplicaSet {
-                    bytes,
+                    bytes: valid_bytes,
                     valid_agents,
                 },
             );
@@ -264,9 +280,12 @@ pub async fn recover(
     let mut candidates: BTreeMap<String, BTreeMap<u64, Vec<Evidence>>> = BTreeMap::new();
     for ((kind_name, hash_name), replica) in &replicas {
         let hash = ObjectHash::parse(hash_name.clone())?;
+        let Some(bytes) = &replica.bytes else {
+            continue;
+        };
         match kind_name.as_str() {
             "manifest" => {
-                let manifest = decode_manifest(master_key, &replica.bytes)
+                let manifest = decode_manifest(master_key, bytes)
                     .map_err(|error| RecoveryError::Trust(error.to_string()))?;
                 candidates
                     .entry(manifest.file_id.to_string())
@@ -279,7 +298,7 @@ pub async fn recover(
                     });
             }
             "deletion_marker" => {
-                let marker = decode_deletion_marker(master_key, &replica.bytes)
+                let marker = decode_deletion_marker(master_key, bytes)
                     .map_err(|error| RecoveryError::Trust(error.to_string()))?;
                 candidates
                     .entry(marker.file_id.to_string())
@@ -337,6 +356,17 @@ pub async fn recover(
         replicas: &mut replicas,
         mode,
     };
+    let committed_deletions: BTreeMap<String, ObjectHash> = repairer
+        .database
+        .all_file_projections()?
+        .into_iter()
+        .filter(|projection| projection.state == FileState::Deleted)
+        .filter_map(|projection| {
+            projection
+                .deletion_hash
+                .map(|hash| (projection.file_id.to_string(), hash))
+        })
+        .collect();
     for (file_id_text, generations) in candidates {
         let file_id = Uuid::parse_str(&file_id_text)
             .map_err(|_| RecoveryError::Trust("invalid file id in recovery evidence".to_owned()))?;
@@ -344,20 +374,65 @@ pub async fn recover(
             .last_key_value()
             .expect("candidate generation map is nonempty");
         let mut issues = Vec::new();
+        let mut notes = Vec::new();
         let mut repairs = Vec::new();
         let unique: BTreeSet<_> = evidence
             .iter()
             .map(|item| (item.kind().as_str(), item.hash().as_str()))
             .collect();
         let kinds: BTreeSet<_> = evidence.iter().map(Evidence::kind).collect();
-        let conflicted = unique.len() > 1 || kinds.len() > 1;
+        // Several distinct deletion markers at one generation all say the
+        // same thing (the file is deleted); earlier releases could mint a
+        // second one when an abandoned delete was retried under a new key.
+        // Pick one deterministically instead of blocking: the marker the
+        // projection committed, otherwise the earliest deletion, then hash.
+        let redundant_markers =
+            unique.len() > 1 && kinds.len() == 1 && kinds.contains(&ObjectKind::DeletionMarker);
+        let conflicted = unique.len() > 1 && !redundant_markers;
         if conflicted {
             let issue = format!("conflicting immutable evidence at generation {generation}");
             conflicts.push(format!("{file_id_text}: {issue}"));
             issues.push(issue);
         }
 
-        let winner = evidence.first().expect("winning evidence exists").clone();
+        let winner = if redundant_markers {
+            let committed = committed_deletions.get(&file_id_text);
+            let chosen = evidence
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item,
+                        Evidence::Deletion {
+                            decoded: Some(_),
+                            ..
+                        }
+                    )
+                })
+                .min_by_key(|item| {
+                    let deleted_at = match item {
+                        Evidence::Deletion {
+                            decoded: Some(marker),
+                            ..
+                        } => marker.deleted_at,
+                        _ => i64::MAX,
+                    };
+                    (
+                        Some(item.hash()) != committed,
+                        deleted_at,
+                        item.hash().to_string(),
+                    )
+                })
+                .unwrap_or_else(|| evidence.first().expect("winning evidence exists"))
+                .clone();
+            notes.push(format!(
+                "{} deletion markers at generation {generation}; kept {}",
+                unique.len(),
+                chosen.hash()
+            ));
+            chosen
+        } else {
+            evidence.first().expect("winning evidence exists").clone()
+        };
         if !conflicted {
             match &winner {
                 Evidence::Manifest { hash, decoded } => {
@@ -411,7 +486,16 @@ pub async fn recover(
                     Evidence::Manifest {
                         hash,
                         decoded: Some(manifest),
-                    } => repairer.database.apply_recovered_manifest(manifest, hash)?,
+                    } => {
+                        let bytes = repairer
+                            .replicas
+                            .get(&(ObjectKind::Manifest.as_str().to_owned(), hash.to_string()))
+                            .and_then(|replica| replica.bytes.clone())
+                            .expect("a decoded manifest keeps its verified bytes");
+                        repairer
+                            .database
+                            .apply_recovered_manifest(manifest, hash, &bytes)?
+                    }
                     Evidence::Deletion {
                         hash,
                         decoded: Some(marker),
@@ -443,7 +527,13 @@ pub async fn recover(
             },
             repairs,
             issues,
+            notes,
         });
+    }
+    // Every control object on the agents is now reflected in the projection
+    // (applied or recorded as blocked), so a restored database is reconciled.
+    if mode == RecoveryMode::Apply {
+        repairer.database.clear_recovery_pending()?;
     }
 
     Ok(RecoveryReportV1 {
@@ -517,6 +607,20 @@ impl RepairContext<'_> {
                 status: "planned".to_owned(),
             };
             if self.mode == RecoveryMode::Apply {
+                let bytes = match &replica.bytes {
+                    Some(bytes) => Some(bytes.clone()),
+                    None => {
+                        fetch_from(self.client, self.agents, &replica.valid_agents, kind, hash)
+                            .await
+                    }
+                };
+                let Some(bytes) = bytes else {
+                    issues.push(format!(
+                        "no valid source could be read for {kind} {hash} during repair"
+                    ));
+                    repairs.push(repair);
+                    continue;
+                };
                 let response = match self
                     .client
                     .put(format!(
@@ -525,7 +629,7 @@ impl RepairContext<'_> {
                         kind.as_str(),
                         hash
                     ))
-                    .body(replica.bytes.clone())
+                    .body(bytes)
                     .send()
                     .await
                 {
@@ -594,6 +698,29 @@ impl RepairContext<'_> {
         }
         Ok(())
     }
+}
+
+/// Read a hash-verified copy of an object from any of `holders`.
+async fn fetch_from(
+    client: &reqwest::Client,
+    agents: &[AgentTarget],
+    holders: &BTreeSet<String>,
+    kind: ObjectKind,
+    hash: &ObjectHash,
+) -> Option<Vec<u8>> {
+    for agent in agents.iter().filter(|agent| holders.contains(&agent.id)) {
+        let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
+        if let Ok(response) = client.get(url).send().await {
+            if response.status().is_success() {
+                if let Ok(bytes) = response.bytes().await {
+                    if ObjectHash::digest(&bytes) == *hash {
+                        return Some(bytes.to_vec());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 async fn read_back_matches(

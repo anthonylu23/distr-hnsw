@@ -207,6 +207,11 @@ enum PortalCommand {
         #[command(subcommand)]
         command: RestoreCommand,
     },
+    /// Record restore-drill evidence that `recovery_ready` is derived from.
+    Drill {
+        #[command(subcommand)]
+        command: DrillCommand,
+    },
     /// Move an agent's copies elsewhere copy-first, then orphan its placements.
     Drain {
         #[arg(long)]
@@ -243,6 +248,20 @@ enum PortalCommand {
         /// collectible (default 7 days).
         #[arg(long, default_value_t = 7 * 24 * 3600)]
         staging_grace_seconds: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum DrillCommand {
+    /// Store a `RestoreDrillReportV1` (from scripts/restore-drill.sh) for
+    /// this deployment. Only a passing drill within the quarterly window that
+    /// ran against a configured backup target makes the deployment
+    /// recovery ready.
+    Record {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        report: PathBuf,
     },
 }
 
@@ -342,6 +361,24 @@ fn read_passphrase_stdin() -> anyhow::Result<Zeroizing<String>> {
 
 /// Emit the recovery bundle for `key`, verifying that it round-trips before
 /// anything is printed. Returns the armored text.
+/// Process-level crash injection for the commit-spine tests. Only debug
+/// builds and builds with the `failpoints` feature honor
+/// `DISTR_HNSW_FAILPOINT`; a release build refuses to run with it set rather
+/// than silently ignoring a test's request.
+fn with_env_failpoint(portal: Portal) -> anyhow::Result<Portal> {
+    let Ok(value) = std::env::var("DISTR_HNSW_FAILPOINT") else {
+        return Ok(portal);
+    };
+    if cfg!(any(debug_assertions, feature = "failpoints")) {
+        Ok(portal.with_failpoint(Failpoint::from_str(&value)?, FailpointAction::ExitProcess))
+    } else {
+        anyhow::bail!(
+            "DISTR_HNSW_FAILPOINT is set, but this build has no failpoints \
+             (build with --features failpoints)"
+        )
+    }
+}
+
 fn emit_recovery_bundle(
     key: &MasterKey,
     passphrase: &PassphraseArgs,
@@ -361,7 +398,15 @@ fn emit_recovery_bundle(
     );
     match out {
         Some(path) => {
-            std::fs::write(path, &armored)
+            // Never replace an existing bundle: it may be the only copy that
+            // opens the key it wraps.
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path)
+                .with_context(|| format!("creating recovery bundle {}", path.display()))?;
+            std::io::Write::write_all(&mut file, armored.as_bytes())
+                .and_then(|()| file.sync_all())
                 .with_context(|| format!("writing recovery bundle {}", path.display()))?;
             println!("recovery bundle written to {}", path.display());
         }
@@ -476,13 +521,22 @@ async fn main() -> anyhow::Result<()> {
                         KeyBinding::Matched => "matches database",
                     }
                 );
-                if created && !no_recovery_bundle {
-                    emit_recovery_bundle(&key, &passphrase, &kdf, None)?;
-                } else if created {
-                    println!(
-                        "no recovery bundle emitted; run `portal key export-recovery` before this \
-                         key protects any data you cannot lose"
-                    );
+                // The bundle is owed from key creation (or first binding) until
+                // it is emitted, so an init that failed in between still emits
+                // it on the next run instead of silently skipping it.
+                if created || binding == KeyBinding::Bound {
+                    db.set_recovery_bundle_owed(true)?;
+                }
+                if db.recovery_bundle_owed()? {
+                    if no_recovery_bundle {
+                        println!(
+                            "no recovery bundle emitted; run `portal key export-recovery` before this \
+                             key protects any data you cannot lose"
+                        );
+                    } else {
+                        emit_recovery_bundle(&key, &passphrase, &kdf, None)?;
+                    }
+                    db.set_recovery_bundle_owed(false)?;
                 }
                 Ok(())
             }
@@ -552,11 +606,7 @@ async fn main() -> anyhow::Result<()> {
                 source,
             } => {
                 let key = MasterKey::load(&master_key)?;
-                let mut portal = Portal::open(&database, key, agents)?;
-                if let Ok(value) = std::env::var("DISTR_HNSW_FAILPOINT") {
-                    portal = portal
-                        .with_failpoint(Failpoint::from_str(&value)?, FailpointAction::ExitProcess);
-                }
+                let mut portal = with_env_failpoint(Portal::open(&database, key, agents)?)?;
                 match portal.upload(&source, &idempotency_key).await {
                     Ok(file_id) => {
                         println!("{file_id}");
@@ -590,11 +640,7 @@ async fn main() -> anyhow::Result<()> {
                 file_id,
             } => {
                 let key = MasterKey::load(&master_key)?;
-                let mut portal = Portal::open(&database, key, agents)?;
-                if let Ok(value) = std::env::var("DISTR_HNSW_FAILPOINT") {
-                    portal = portal
-                        .with_failpoint(Failpoint::from_str(&value)?, FailpointAction::ExitProcess);
-                }
+                let mut portal = with_env_failpoint(Portal::open(&database, key, agents)?)?;
                 let operation = portal.delete(file_id, &idempotency_key).await?;
                 println!("{}", operation.marker_hash);
                 Ok(())
@@ -643,6 +689,24 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+            }
+            PortalCommand::Drill {
+                command: DrillCommand::Record { database, report },
+            } => {
+                let json = std::fs::read_to_string(&report)
+                    .with_context(|| format!("reading drill report {}", report.display()))?;
+                let mut database = Database::open(&database)?;
+                let record = distr_hnsw::backup::record_restore_drill(&mut database, &json)?;
+                let status = distr_hnsw::backup::backup_status(&database)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "recorded": record,
+                        "recovery_ready": status.recovery_ready,
+                        "recovery_ready_reason": status.recovery_ready_reason,
+                    }))?
+                );
+                Ok(())
             }
             PortalCommand::Health { database } => {
                 let database = Database::open(&database)?;

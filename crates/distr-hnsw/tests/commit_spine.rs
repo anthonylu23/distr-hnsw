@@ -462,6 +462,20 @@ async fn commit_refuses_when_confirmed_replicas_are_gone() {
     }
     fs::remove_file(store_a.object_path(ObjectKind::Manifest, &manifest_hash)).unwrap();
     fs::remove_file(store_b.object_path(ObjectKind::Manifest, &manifest_hash)).unwrap();
+    // A retry re-PUTs confirmed placements, which would heal agent B; make B
+    // refuse the writes so only its stale `confirmed` rows remain. Those rows
+    // must not satisfy the commit's live replica check.
+    use std::os::unix::fs::PermissionsExt;
+    let mut locked = Vec::new();
+    for path in chunk_hashes
+        .iter()
+        .map(|hash| store_b.object_path(ObjectKind::Chunk, hash))
+        .chain([store_b.object_path(ObjectKind::Manifest, &manifest_hash)])
+    {
+        let parent = path.parent().unwrap().to_owned();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        locked.push(parent);
+    }
 
     let mut portal = Portal::open(
         &database_path,
@@ -469,9 +483,20 @@ async fn commit_refuses_when_confirmed_replicas_are_gone() {
         vec![agent_a.target.clone(), agent_b.target.clone()],
     )
     .unwrap();
-    assert!(matches!(
-        portal.upload(&source, "missing-replicas").await,
-        Err(PortalError::NoValidReplica { .. })
-    ));
+    let result = portal.upload(&source, "missing-replicas").await;
+    for parent in &locked {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert!(
+        matches!(result, Err(PortalError::NoValidReplica { .. })),
+        "{result:?}"
+    );
     assert!(!portal.is_visible(upload.file_id).unwrap());
+
+    // With agent B writable again the same-key retry heals both replicas.
+    let file_id = portal.upload(&source, "missing-replicas").await.unwrap();
+    assert_eq!(file_id, upload.file_id);
+    for hash in &chunk_hashes {
+        assert!(store_b.get(ObjectKind::Chunk, hash).is_ok());
+    }
 }

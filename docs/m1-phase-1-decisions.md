@@ -64,6 +64,12 @@ passphrase-wrapped **recovery bundle** as the independent custody artifact.
    word-list passphrase is a later option.
 4. **Ceremony.** `portal init` prints the bundle once and refuses to finish
    until the operator re-enters the passphrase and the bundle round-trips.
+   *As implemented (deviation, recorded 2026-10-25):* `init` re-opens the
+   sealed bundle with the same in-memory secret, which proves the bundle
+   round-trips but not that the operator recorded the passphrase. An init
+   that fails before emitting the bundle now owes it durably and emits it on
+   the next run. `key export-recovery --out` never overwrites a file.
+   Interactive re-entry is open for the M6 setup flow.
    The bundle is never written to SQLite, the object store, or the backup
    set. Reserved seams: bundle v2 may carry Shamir `k`-of-`n` shares of the
    KEK; rotation re-wraps content keys under a new `key_id` (post-M1).
@@ -235,7 +241,15 @@ bytes, durability is undemonstrated and `DESIGN.md` §11.1 forbids claiming it.
 drilled (directory and S3 targets, snapshot shipping, catalogs, integrity
 sampling, status, restore; `m1-restore-drill.md`). Retention and expiry are
 delegated to bucket lifecycle and Object Lock configuration rather than a
-portal expiry job (accepted limitation). Closed for M1 on 2026-09-30.**
+portal expiry job (accepted limitation). Closed for M1 on 2026-09-30;
+reopened 2026-10-25. The observability item was not met: `recovery_ready`
+was hard-coded false and no drill result was recorded. The hardening pass
+adds `portal drill record` and derives `recovery_ready` from the recorded
+drill, its window, its target, and current lag. `status --json`, per-file
+`offsite_state`, and `metadata_replication_lag_seconds` are not
+implemented. `portal health` carries per-target pending objects, lag, and
+the last snapshot time instead. GC now waits for backup coverage of deleted
+generations ([hardening-2026-10.md](hardening-2026-10.md)).**
 
 ---
 

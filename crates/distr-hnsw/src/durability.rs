@@ -62,6 +62,54 @@ impl DurableStore {
         Ok(store)
     }
 
+    /// Remove temporary files that an interrupted PUT left behind and that
+    /// are older than `min_age`. Inventory already ignores them; this keeps
+    /// them from silently consuming the volume. Only the agent that owns the
+    /// volume calls it, at startup, so no live PUT's temporary is touched.
+    pub fn sweep_stale_temporaries(
+        &self,
+        min_age: std::time::Duration,
+    ) -> Result<usize, StoreError> {
+        let now = std::time::SystemTime::now();
+        let mut removed = 0;
+        for kind in ObjectKind::ALL {
+            let namespace = self.root.join("objects").join(kind.as_str());
+            for first in sorted_entries(&namespace)? {
+                if !first.path().is_dir() {
+                    continue;
+                }
+                for second in sorted_entries(&first.path())? {
+                    if !second.path().is_dir() {
+                        continue;
+                    }
+                    let mut swept_here = false;
+                    for entry in sorted_entries(&second.path())? {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if !(name.starts_with('.') && name.ends_with(".tmp")) {
+                            continue;
+                        }
+                        let old_enough = entry
+                            .metadata()?
+                            .modified()
+                            .ok()
+                            .and_then(|modified| now.duration_since(modified).ok())
+                            .is_some_and(|age| age >= min_age);
+                        if old_enough {
+                            fs::remove_file(entry.path())?;
+                            removed += 1;
+                            swept_here = true;
+                        }
+                    }
+                    if swept_here {
+                        sync_directory(&second.path())?;
+                    }
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn used_bytes(&self) -> u64 {
         self.used_bytes.load(Ordering::Relaxed)
     }
@@ -177,7 +225,15 @@ impl DurableStore {
         let mut replaced_bytes = 0_u64;
         if final_path.exists() {
             match self.get(kind, expected) {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    // An earlier PUT may have crashed after its rename but
+                    // before the directory sync; acknowledging this one must
+                    // not rely on that entry already being durable.
+                    sync_directory(parent)?;
+                    sync_directory(&first_prefix)?;
+                    sync_directory(&namespace)?;
+                    return Ok(());
+                }
                 Err(StoreError::HashMismatch { .. }) => {
                     replaced_bytes = fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
                 }
@@ -254,13 +310,26 @@ impl DurableStore {
         let mut objects = Vec::with_capacity(limit);
         let mut has_more = false;
 
+        // Prefix directories wholly before the cursor cannot hold a later
+        // hash, so a page reads only from the cursor onward instead of
+        // re-walking the namespace (which made a full listing quadratic).
+        let cursor_first = after.map(|cursor| &cursor.as_str()[0..2]);
+        let cursor_second = after.map(|cursor| &cursor.as_str()[0..4]);
         'prefixes: for first in sorted_entries(&namespace)? {
             if !first.path().is_dir() || !is_hex_prefix(&first.file_name()) {
                 return Err(StoreError::MalformedInventoryEntry(first.path()));
             }
+            let first_name = first.file_name().to_string_lossy().into_owned();
+            if cursor_first.is_some_and(|cursor| first_name.as_str() < cursor) {
+                continue;
+            }
             for second in sorted_entries(&first.path())? {
                 if !second.path().is_dir() || !is_hex_prefix(&second.file_name()) {
                     return Err(StoreError::MalformedInventoryEntry(second.path()));
+                }
+                let second_name = format!("{first_name}{}", second.file_name().to_string_lossy());
+                if cursor_second.is_some_and(|cursor| second_name.as_str() < cursor) {
+                    continue;
                 }
                 for entry in sorted_entries(&second.path())? {
                     let name = entry.file_name();
@@ -423,6 +492,34 @@ mod tests {
             store.get(ObjectKind::Chunk, &hash),
             Err(StoreError::HashMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn stale_temporaries_are_swept_and_objects_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(directory.path()).unwrap();
+        let bytes = b"kept object";
+        let hash = ObjectHash::digest(bytes);
+        store.put(ObjectKind::Chunk, &hash, bytes).unwrap();
+        let parent = store
+            .object_path(ObjectKind::Chunk, &hash)
+            .parent()
+            .unwrap()
+            .to_owned();
+        let leaked = parent.join(".leaked.tmp");
+        fs::write(&leaked, b"partial").unwrap();
+
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(store.sweep_stale_temporaries(hour).unwrap(), 0);
+        assert!(leaked.exists());
+        assert_eq!(
+            store
+                .sweep_stale_temporaries(std::time::Duration::ZERO)
+                .unwrap(),
+            1
+        );
+        assert!(!leaked.exists());
+        assert_eq!(store.get(ObjectKind::Chunk, &hash).unwrap(), bytes);
     }
 
     #[test]

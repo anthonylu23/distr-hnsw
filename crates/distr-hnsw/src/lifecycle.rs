@@ -8,7 +8,11 @@
 //! - `gc` plans physical deletion by recording a proof per object whose
 //!   inputs are content-addressed (content generation, active incarnation
 //!   set, inventory digests); `--apply` re-derives every fact and refuses a
-//!   stale proof. Agent DELETE is reachable only through an applied proof.
+//!   stale proof. The portal issues agent DELETE only through an applied
+//!   proof; agents do not verify proofs themselves until M2 adds authorization.
+//!
+//! All three refuse while the metadata is pending recovery after a snapshot
+//! restore: a restored projection can be older than the agents.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,6 +21,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
+    durability::{InventoryPage, MAX_INVENTORY_PAGE},
     metadata::{
         Database, HistoryObject, IncarnationStatus, JobStatus, MetadataError, NewGcProof,
         PlacementState, PlacementTarget,
@@ -97,6 +102,43 @@ async fn verify_agents(
         });
     }
     Ok(live)
+}
+
+fn refuse_while_recovery_pending(database: &Database) -> Result<(), LifecycleError> {
+    match database.recovery_pending()? {
+        Some(restored_at) => Err(LifecycleError::RecoveryPending(restored_at)),
+        None => Ok(()),
+    }
+}
+
+/// Every hash in one namespace of an agent, or why the listing proves
+/// nothing.
+async fn list_hashes(
+    client: &reqwest::Client,
+    agent: &AgentTarget,
+    kind: ObjectKind,
+) -> Result<Vec<String>, String> {
+    let mut hashes = Vec::new();
+    let mut after: Option<ObjectHash> = None;
+    loop {
+        let mut request = client
+            .get(format!("{}/v1/inventory/{}", agent.base_url, kind.as_str()))
+            .query(&[("limit", MAX_INVENTORY_PAGE.to_string())]);
+        if let Some(cursor) = &after {
+            request = request.query(&[("after", cursor.as_str())]);
+        }
+        let response = request.send().await.map_err(|error| error.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("inventory returned HTTP {}", response.status()));
+        }
+        let page: InventoryPage = response.json().await.map_err(|error| error.to_string())?;
+        hashes.extend(page.objects.iter().map(|object| object.hash.to_string()));
+        match page.next_after {
+            Some(cursor) if !page.objects.is_empty() => after = Some(cursor),
+            Some(_) => return Err("inventory cursor did not advance".to_owned()),
+            None => return Ok(hashes),
+        }
+    }
 }
 
 async fn fetch_valid(
@@ -210,6 +252,7 @@ pub async fn drain(
     if !agents.iter().any(|agent| agent.id == agent_id) {
         return Err(LifecycleError::UnknownAgent(agent_id.to_owned()));
     }
+    refuse_while_recovery_pending(database)?;
     let job_id = database.create_reconcile_job(crate::metadata::JobMode::Repair)?;
     let result = run_drain(database, agents, client, agent_id, dry_run, job_id).await;
     match &result {
@@ -369,6 +412,7 @@ pub async fn retire(
     client: &reqwest::Client,
     agent_id: &str,
 ) -> Result<RetireReportV1, LifecycleError> {
+    refuse_while_recovery_pending(database)?;
     let mut issues = Vec::new();
     let others: Vec<AgentTarget> = agents
         .iter()
@@ -490,6 +534,11 @@ struct ProofContext {
     /// (incarnation, kind) -> latest complete inventory digest.
     observations: BTreeMap<(String, ObjectKind), String>,
     active: Vec<(String, String)>,
+    /// Backup targets that have ever run a job.
+    backup_targets: Vec<String>,
+    /// Facts that block every candidate in this run (metadata behind the
+    /// agents, an unlistable control namespace).
+    global_blockers: Vec<String>,
 }
 
 fn proof_context(database: &Database, now: i64) -> Result<ProofContext, LifecycleError> {
@@ -524,10 +573,60 @@ fn proof_context(database: &Database, now: i64) -> Result<ProofContext, Lifecycl
         observation_digest: observation_hasher.finalize().to_hex().to_string(),
         observations,
         active,
+        backup_targets: database.backup_target_ids()?,
+        global_blockers: Vec::new(),
     })
 }
 
+/// The metadata must know every manifest and deletion marker the agents
+/// hold. One it does not know can make an older or newer generation
+/// authoritative (for example a file committed after the snapshot a portal was
+/// restored from), so collection waits for `recover --apply`.
+async fn control_object_blockers(
+    database: &Database,
+    live: &[LiveAgent],
+    client: &reqwest::Client,
+) -> Result<Vec<String>, LifecycleError> {
+    let known = database.known_control_objects()?;
+    let mut blockers = Vec::new();
+    for agent in live {
+        for kind in [ObjectKind::Manifest, ObjectKind::DeletionMarker] {
+            match list_hashes(client, &agent.target, kind).await {
+                Ok(hashes) => {
+                    let unknown = hashes
+                        .iter()
+                        .filter(|hash| !known.contains(&(kind, (*hash).clone())))
+                        .count();
+                    if unknown > 0 {
+                        blockers.push(format!(
+                            "agent {} holds {unknown} {kind} object(s) unknown to the metadata; run portal recover --apply",
+                            agent.target.id
+                        ));
+                    }
+                }
+                Err(detail) => blockers.push(format!(
+                    "agent {} {kind} inventory could not be listed: {detail}",
+                    agent.target.id
+                )),
+            }
+        }
+    }
+    Ok(blockers)
+}
+
+/// Where a GC candidate came from; each origin carries its own extra facts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateOrigin {
+    /// A generation below a deleted file's marker: part of history, so every
+    /// known backup target must hold a verified copy before it is collected.
+    DeletedGeneration,
+    /// An upload that never committed: never part of history, but recovery
+    /// may own it if the file has since become known.
+    Staging { file_id: Uuid },
+}
+
 /// Evaluate every proof fact for one candidate; blockers are the missing facts.
+#[allow(clippy::too_many_arguments)]
 fn evaluate(
     database: &Database,
     context: &ProofContext,
@@ -535,8 +634,28 @@ fn evaluate(
     hash: &ObjectHash,
     threshold: i64,
     retention: i64,
+    origin: CandidateOrigin,
 ) -> Result<Vec<String>, LifecycleError> {
-    let mut blockers = Vec::new();
+    let mut blockers = context.global_blockers.clone();
+    match origin {
+        CandidateOrigin::DeletedGeneration => {
+            for target in &context.backup_targets {
+                if !database.backup_object_verified(target, kind, hash)? {
+                    blockers.push(format!(
+                        "not yet verified on backup target {target}; offsite retention starts only once it is copied"
+                    ));
+                }
+            }
+        }
+        CandidateOrigin::Staging { file_id } => {
+            if let Some(file) = database.file_projection(file_id)? {
+                blockers.push(format!(
+                    "upload's file {file_id} is known to the projection ({}); recovery owns it",
+                    file.state.as_str()
+                ));
+            }
+        }
+    }
     if database.required_by_live_file(kind, hash)? {
         blockers.push("required by the highest live generation".to_owned());
     }
@@ -596,14 +715,20 @@ pub async fn gc(
             .as_secs(),
     )
     .map_err(|_| LifecycleError::Clock)?;
+    refuse_while_recovery_pending(database)?;
     let mut issues = Vec::new();
     let live = verify_agents(database, agents, client, &mut issues).await?;
-    let context = proof_context(database, now)?;
+    let mut context = proof_context(database, now)?;
+    let control_blockers = control_object_blockers(database, &live, client).await?;
+    context.global_blockers = control_blockers.clone();
 
     // Candidates: superseded generations of deleted files, and expired
     // staging uploads. Anything the live projection needs is never listed.
-    let mut candidates: BTreeMap<(ObjectKind, String), (ObjectHash, String, i64, i64)> =
-        BTreeMap::new();
+    #[allow(clippy::type_complexity)]
+    let mut candidates: BTreeMap<
+        (ObjectKind, String),
+        (ObjectHash, String, i64, i64, CandidateOrigin),
+    > = BTreeMap::new();
     for (file_id, generation, deleted_at) in database.deleted_files()? {
         for (kind, hash) in database.superseded_objects(file_id, generation)? {
             candidates.entry((kind, hash.to_string())).or_insert((
@@ -611,6 +736,7 @@ pub async fn gc(
                 format!("generation below {generation} of deleted file {file_id}"),
                 deleted_at,
                 options.retention_seconds,
+                CandidateOrigin::DeletedGeneration,
             ));
         }
     }
@@ -621,6 +747,9 @@ pub async fn gc(
                 format!("expired staging upload {}", upload.upload_id),
                 upload.created_at,
                 options.staging_grace_seconds,
+                CandidateOrigin::Staging {
+                    file_id: upload.file_id,
+                },
             ));
         }
     }
@@ -628,12 +757,14 @@ pub async fn gc(
     let mut report_candidates = Vec::new();
     let mut totals = GcTotals::default();
     let planned = database.planned_gc_proofs()?;
-    for ((kind, hash_text), (hash, reason, threshold, retention)) in candidates {
+    for ((kind, hash_text), (hash, reason, threshold, retention, origin)) in candidates {
         if database.required_by_live_file(kind, &hash)? || database.gc_applied(kind, &hash)? {
             continue;
         }
         totals.candidates += 1;
-        let blockers = evaluate(database, &context, kind, &hash, threshold, retention)?;
+        let blockers = evaluate(
+            database, &context, kind, &hash, threshold, retention, origin,
+        )?;
         if !blockers.is_empty() {
             // A proof recorded earlier no longer holds; it must never execute.
             for existing in planned
@@ -694,8 +825,9 @@ pub async fn gc(
         let mut status = "planned".to_owned();
         if options.apply {
             // Re-derive at apply time; deletion only follows a fresh proof.
-            let fresh = proof_context(database, now)?;
-            let recheck = evaluate(database, &fresh, kind, &hash, threshold, retention)?;
+            let mut fresh = proof_context(database, now)?;
+            fresh.global_blockers = control_blockers.clone();
+            let recheck = evaluate(database, &fresh, kind, &hash, threshold, retention, origin)?;
             if fresh.content_generation != context.content_generation
                 || fresh.incarnation_digest != context.incarnation_digest
                 || fresh.observation_digest != context.observation_digest
@@ -786,6 +918,8 @@ pub enum LifecycleError {
     UnknownAgent(String),
     #[error("system clock is before the Unix epoch")]
     Clock,
+    #[error("metadata was restored from a snapshot at {0} and has not been reconciled; run portal recover --apply first")]
+    RecoveryPending(i64),
     #[error(transparent)]
     Metadata(#[from] MetadataError),
     #[error(transparent)]

@@ -382,9 +382,22 @@ impl Portal {
                         .as_secs(),
                 )
                 .map_err(|_| PortalError::NumericOverflow)?;
-                let marker_bytes =
-                    encode_deletion_marker(&self.master_key, file_id, generation, deleted_at)?;
-                let marker_hash = ObjectHash::digest(&marker_bytes);
+                // A delete of this generation that was abandoned under another
+                // idempotency key already minted a marker (possibly already on
+                // some agents). Reuse it: one generation, one marker.
+                let (deleted_at, marker_hash, marker_bytes) =
+                    match self.database.pending_delete_marker(file_id, generation)? {
+                        Some(pending) => pending,
+                        None => {
+                            let bytes = encode_deletion_marker(
+                                &self.master_key,
+                                file_id,
+                                generation,
+                                deleted_at,
+                            )?;
+                            (deleted_at, ObjectHash::digest(&bytes), bytes)
+                        }
+                    };
                 self.database.create_delete_operation(&NewDeleteOperation {
                     operation_id: Uuid::new_v4(),
                     idempotency_key: idempotency_key.to_owned(),
@@ -510,20 +523,23 @@ impl Portal {
     ) -> Result<(), PortalError> {
         let mut last_failure = None;
         for agent in self.agents.clone() {
-            if self.database.placement_confirmed(kind, hash, &agent.id)? {
-                continue;
-            }
+            // A placement confirmed by an earlier attempt is re-PUT anyway:
+            // the agent keeps an intact copy as is and replaces a corrupt
+            // one, so a retry can heal a replica damaged since confirmation.
+            let already_confirmed = self.database.placement_confirmed(kind, hash, &agent.id)?;
             let Some(incarnation_id) = self.incarnations.get(&agent.id).cloned() else {
                 last_failure = Some(PortalError::AgentNotVerified(agent.id.clone()));
                 continue;
             };
-            self.database.ensure_pending_placement(
-                kind,
-                hash,
-                &agent.id,
-                &agent.failure_domain,
-                &incarnation_id,
-            )?;
+            if !already_confirmed {
+                self.database.ensure_pending_placement(
+                    kind,
+                    hash,
+                    &agent.id,
+                    &agent.failure_domain,
+                    &incarnation_id,
+                )?;
+            }
             let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
             let response = match self.client.put(url).body(bytes.to_vec()).send().await {
                 Ok(response) => response,
@@ -550,6 +566,9 @@ impl Portal {
                     status: response.status().as_u16(),
                     body: response.text().await.unwrap_or_default(),
                 });
+                continue;
+            }
+            if already_confirmed {
                 continue;
             }
             self.database.confirm_placement(kind, hash, &agent.id)?;
@@ -591,7 +610,9 @@ impl Portal {
                 required_bytes: required,
                 replicas_required: MINIMUM_REPLICAS,
                 domains_eligible: domains.len(),
-                limiting: "quota".to_owned(),
+                // Agents report effective free space: the lesser of quota
+                // headroom and filesystem free space, after reserves.
+                limiting: "effective_free_space".to_owned(),
             });
         }
         Ok(())
@@ -848,6 +869,32 @@ fn new_upload(
     )?;
     let chunk_count =
         u32::try_from(inspection.chunks.len()).map_err(|_| PortalError::TooManyChunks)?;
+    // Refuse before any chunk is written if the finished manifest could not
+    // be stored: a stand-in manifest with the same name and chunk count has
+    // exactly the size of the real one.
+    let stand_in = encode_manifest(
+        master_key,
+        file_id,
+        generation,
+        &ManifestPayload {
+            name: inspection.name.clone(),
+            plaintext_len: inspection.plaintext_size,
+            plaintext_hash: inspection.plaintext_hash,
+            content_key: content_key.clone(),
+            chunks: (0..chunk_count)
+                .map(|ordinal| ChunkRecord {
+                    ordinal,
+                    plaintext_len: 0,
+                    nonce: [0; crate::crypto::NONCE_LEN],
+                    ciphertext_hash: ObjectHash::digest(&[]),
+                    ciphertext_len: 0,
+                })
+                .collect(),
+        },
+    )?;
+    if stand_in.len() > crate::MAX_OBJECT_BYTES {
+        return Err(PortalError::TooManyChunks);
+    }
     let mut chunks = Vec::with_capacity(chunk_count as usize);
     for (ordinal, inspected) in (0..chunk_count).zip(inspection.chunks) {
         chunks.push(NewChunk {
@@ -972,7 +1019,7 @@ pub enum PortalError {
     ManifestMismatch(&'static str),
     #[error("reassembled plaintext hash or length does not match the manifest")]
     PlaintextHashMismatch,
-    #[error("file contains too many chunks for the v1 format")]
+    #[error("file contains too many chunks for one v1 manifest object")]
     TooManyChunks,
     #[error("numeric conversion overflow")]
     NumericOverflow,

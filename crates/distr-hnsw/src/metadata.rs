@@ -1,4 +1,8 @@
-use std::{path::Path, str::FromStr};
+use std::{
+    fs::{self, File, OpenOptions},
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use thiserror::Error;
@@ -10,9 +14,17 @@ use crate::{
     object::{ObjectHash, ObjectKind},
 };
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const MASTER_KEY_ID_META: &str = "master_key_id";
 const CONTENT_GENERATION_META: &str = "content_generation";
+/// Set when metadata was restored from a backup snapshot; cleared by the next
+/// successful `recover --apply`. Physical deletion and movement refuse while
+/// it is set, because a restored projection can be older than the agents.
+const RECOVERY_PENDING_META: &str = "recovery_pending";
+/// Set from the moment `portal init` creates or first binds a master key
+/// until a recovery bundle for it has been emitted, so an init that fails in
+/// between still owes the bundle on its next run.
+const RECOVERY_BUNDLE_OWED_META: &str = "recovery_bundle_owed";
 
 /// SQL predicate selecting placements that count toward the live durability
 /// floor: confirmed rows whose agent incarnation is still active. Legacy rows
@@ -345,6 +357,7 @@ pub struct CompleteScan {
 #[derive(Clone, Debug)]
 pub struct ExpiredUpload {
     pub upload_id: Uuid,
+    pub file_id: Uuid,
     pub created_at: i64,
     pub objects: Vec<(ObjectKind, ObjectHash)>,
 }
@@ -547,6 +560,73 @@ pub struct ObjectHealthSummary {
 
 pub struct Database {
     connection: Connection,
+    lease: ProcessLease,
+}
+
+/// An exclusive advisory lock held for the lifetime of one `Database` handle.
+/// Jobs record the lease that started them, so opening the database from a
+/// second process interrupts only jobs whose owner has actually exited.
+struct ProcessLease {
+    id: Uuid,
+    directory: PathBuf,
+    path: PathBuf,
+    _file: File,
+}
+
+impl ProcessLease {
+    fn acquire(database_path: &Path) -> Result<Self, MetadataError> {
+        let mut name = database_path
+            .file_name()
+            .map(|name| name.to_os_string())
+            .unwrap_or_default();
+        name.push(".leases");
+        let directory = database_path.with_file_name(name);
+        ensure_directory(&directory)?;
+        let id = Uuid::new_v4();
+        let path = directory.join(format!("{id}.lock"));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)?;
+        file.lock()?;
+        Ok(Self {
+            id,
+            directory,
+            path,
+            _file: file,
+        })
+    }
+
+    /// Whether the lease `owner` is still held by a live handle. Unknown
+    /// failures count as alive: a stale `running` row is visible and
+    /// harmless, while interrupting a live job is not.
+    fn is_alive(&self, owner: &str) -> bool {
+        if owner == self.id.to_string() {
+            return true;
+        }
+        if Uuid::parse_str(owner).is_err() {
+            return false;
+        }
+        let path = self.directory.join(format!("{owner}.lock"));
+        let file = match OpenOptions::new().write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        };
+        match file.try_lock() {
+            Ok(()) => {
+                let _ = fs::remove_file(&path);
+                false
+            }
+            Err(_) => true,
+        }
+    }
+}
+
+impl Drop for ProcessLease {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 impl Database {
@@ -571,11 +651,11 @@ impl Database {
             }
             3 => migrate_v3_to_v4(&mut connection)?,
             4..=6 => migrate_to_v7(&mut connection)?,
-            7 => apply_schema(&connection)?,
-            SCHEMA_VERSION => apply_schema(&connection)?,
+            7 | 8 | SCHEMA_VERSION => apply_schema(&connection)?,
             _ => return Err(MetadataError::UnsupportedSchemaVersion(version)),
         }
-        let mut database = Self { connection };
+        let lease = ProcessLease::acquire(path)?;
+        let mut database = Self { connection, lease };
         database.interrupt_running_jobs()?;
         if let Some(parent) = path.parent() {
             sync_directory(parent)?;
@@ -628,6 +708,133 @@ impl Database {
             )
             .optional()?;
         Ok(value.and_then(|text| text.parse().ok()).unwrap_or(0))
+    }
+
+    /// When metadata was restored from a snapshot and recovery has not yet
+    /// reconciled it with the agents, the restore time.
+    pub fn recovery_pending(&self) -> Result<Option<i64>, MetadataError> {
+        let value: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM portal_meta WHERE key = ?1",
+                [RECOVERY_PENDING_META],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.map(|text| text.parse().unwrap_or(0)))
+    }
+
+    pub fn set_recovery_pending(&mut self, restored_at: i64) -> Result<(), MetadataError> {
+        self.connection.execute(
+            "INSERT INTO portal_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = unixepoch()",
+            params![RECOVERY_PENDING_META, restored_at.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// A free-form `portal_meta` value (operator records such as the last
+    /// restore drill).
+    pub fn meta(&self, key: &str) -> Result<Option<String>, MetadataError> {
+        self.connection
+            .query_row(
+                "SELECT value FROM portal_meta WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_meta(&mut self, key: &str, value: &str) -> Result<(), MetadataError> {
+        self.connection.execute(
+            "INSERT INTO portal_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = unixepoch()",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn recovery_bundle_owed(&self) -> Result<bool, MetadataError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM portal_meta WHERE key = ?1)",
+                [RECOVERY_BUNDLE_OWED_META],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn set_recovery_bundle_owed(&mut self, owed: bool) -> Result<(), MetadataError> {
+        if owed {
+            self.connection.execute(
+                "INSERT INTO portal_meta (key, value) VALUES (?1, '1')
+                 ON CONFLICT(key) DO NOTHING",
+                [RECOVERY_BUNDLE_OWED_META],
+            )?;
+        } else {
+            self.connection.execute(
+                "DELETE FROM portal_meta WHERE key = ?1",
+                [RECOVERY_BUNDLE_OWED_META],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_recovery_pending(&mut self) -> Result<(), MetadataError> {
+        self.connection.execute(
+            "DELETE FROM portal_meta WHERE key = ?1",
+            [RECOVERY_PENDING_META],
+        )?;
+        Ok(())
+    }
+
+    /// Every manifest and deletion-marker hash the metadata knows about, from
+    /// committed history and from in-flight uploads and deletes. An agent
+    /// holding a control object outside this set means the metadata is
+    /// behind the agents (for example after a snapshot restore).
+    pub fn known_control_objects(
+        &self,
+    ) -> Result<std::collections::BTreeSet<(ObjectKind, String)>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT 'manifest', manifest_hash FROM file_manifests
+             UNION SELECT 'manifest', manifest_hash FROM uploads WHERE manifest_hash IS NOT NULL
+             UNION SELECT 'manifest', current_manifest_hash FROM files
+                   WHERE current_manifest_hash IS NOT NULL
+             UNION SELECT 'deletion_marker', marker_hash FROM deletion_markers
+             UNION SELECT 'deletion_marker', marker_hash FROM delete_operations
+             UNION SELECT 'deletion_marker', current_deletion_hash FROM files
+                   WHERE current_deletion_hash IS NOT NULL",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(kind, hash)| Ok((kind.parse()?, hash)))
+            .collect()
+    }
+
+    /// The marker of a not-yet-committed delete of `file_id` at `generation`,
+    /// as `(deleted_at, marker_hash, marker_bytes)`.
+    pub fn pending_delete_marker(
+        &self,
+        file_id: Uuid,
+        generation: u64,
+    ) -> Result<Option<(i64, ObjectHash, Vec<u8>)>, MetadataError> {
+        let row: Option<(i64, String, Vec<u8>)> = self
+            .connection
+            .query_row(
+                "SELECT deleted_at, marker_hash, marker_bytes FROM delete_operations
+                 WHERE file_id = ?1 AND generation = ?2
+                 ORDER BY created_at, rowid LIMIT 1",
+                params![file_id.to_string(), to_i64(generation)?],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        row.map(|(deleted_at, hash, bytes)| Ok((deleted_at, ObjectHash::parse(hash)?, bytes)))
+            .transpose()
     }
 
     pub fn master_key_id(&self) -> Result<Option<String>, MetadataError> {
@@ -1079,7 +1286,7 @@ impl Database {
     /// objects)`: staging garbage once the grace period has elapsed.
     pub fn expired_uploads(&self, cutoff: i64) -> Result<Vec<ExpiredUpload>, MetadataError> {
         let mut statement = self.connection.prepare(
-            "SELECT upload_id, created_at, manifest_hash FROM uploads
+            "SELECT upload_id, created_at, manifest_hash, file_id FROM uploads
              WHERE state != 'committed' AND created_at <= ?1 ORDER BY upload_id",
         )?;
         let uploads = statement
@@ -1088,11 +1295,12 @@ impl Database {
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let mut out = Vec::new();
-        for (upload_id, created_at, manifest_hash) in uploads {
+        for (upload_id, created_at, manifest_hash, file_id) in uploads {
             let mut objects = Vec::new();
             if let Some(hash) = manifest_hash {
                 objects.push((ObjectKind::Manifest, ObjectHash::parse(hash)?));
@@ -1107,6 +1315,8 @@ impl Database {
             out.push(ExpiredUpload {
                 upload_id: Uuid::parse_str(&upload_id)
                     .map_err(|_| MetadataError::InvalidBinaryField("upload id".to_owned()))?,
+                file_id: Uuid::parse_str(&file_id)
+                    .map_err(|_| MetadataError::InvalidBinaryField("file id".to_owned()))?,
                 created_at,
                 objects,
             });
@@ -1346,6 +1556,16 @@ impl Database {
     /// Record the incarnation an agent reports on contact. See
     /// [`IncarnationObservation`] for the outcomes. A retired incarnation
     /// attempting to rejoin fails closed.
+    /// Refuse a retired or superseded incarnation without recording anything;
+    /// read-only modes (recovery planning) use this instead of observing.
+    pub fn check_agent_incarnation(
+        &self,
+        agent_id: &str,
+        incarnation_id: &str,
+    ) -> Result<(), MetadataError> {
+        refuse_inactive_incarnation(&self.connection, agent_id, incarnation_id)
+    }
+
     pub fn observe_agent_incarnation(
         &mut self,
         agent_id: &str,
@@ -1353,30 +1573,7 @@ impl Database {
         incarnation_id: &str,
     ) -> Result<IncarnationObservation, MetadataError> {
         let transaction = self.connection.transaction()?;
-        let observed_status: Option<String> = transaction
-            .query_row(
-                "SELECT status FROM agent_incarnations WHERE incarnation_id = ?1",
-                [incarnation_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(status) = &observed_status {
-            match IncarnationStatus::from_str(status)? {
-                IncarnationStatus::Retired => {
-                    return Err(MetadataError::RetiredIncarnation {
-                        agent_id: agent_id.to_owned(),
-                        incarnation_id: incarnation_id.to_owned(),
-                    });
-                }
-                IncarnationStatus::Superseded => {
-                    return Err(MetadataError::SupersededIncarnation {
-                        agent_id: agent_id.to_owned(),
-                        incarnation_id: incarnation_id.to_owned(),
-                    });
-                }
-                IncarnationStatus::Active => {}
-            }
-        }
+        refuse_inactive_incarnation(&transaction, agent_id, incarnation_id)?;
         let active: Option<(String, String)> = transaction
             .query_row(
                 "SELECT incarnation_id, failure_domain FROM agent_incarnations
@@ -1531,9 +1728,9 @@ impl Database {
     pub fn create_reconcile_job(&mut self, mode: JobMode) -> Result<Uuid, MetadataError> {
         let job_id = Uuid::new_v4();
         self.connection.execute(
-            "INSERT INTO reconcile_jobs (job_id, kind, mode, started_at, status)
-             VALUES (?1, 'scrub', ?2, unixepoch(), 'running')",
-            params![job_id.to_string(), mode.as_str()],
+            "INSERT INTO reconcile_jobs (job_id, kind, mode, started_at, status, owner_lease)
+             VALUES (?1, 'scrub', ?2, unixepoch(), 'running', ?3)",
+            params![job_id.to_string(), mode.as_str(), self.lease.id.to_string()],
         )?;
         Ok(job_id)
     }
@@ -1561,18 +1758,30 @@ impl Database {
         Ok(())
     }
 
-    /// Every immutable object any generation in history references, so the
-    /// backup set retains deleted generations until offsite retention expires.
+    /// Every immutable object any generation in history references and that
+    /// garbage collection has not physically deleted, so the backup set
+    /// retains deleted generations until offsite retention expires. Collected
+    /// objects stay in the history tables (the projection is append-only) but
+    /// no longer exist on any agent, so retirement and backup must not expect
+    /// them.
     pub fn history_objects(&self) -> Result<Vec<HistoryObject>, MetadataError> {
         let mut statement = self.connection.prepare(
-            "SELECT 'manifest', m.manifest_hash, NULL, f.updated_at
-             FROM file_manifests AS m JOIN files AS f ON f.file_id = m.file_id
-             UNION ALL
-             SELECT 'chunk', c.ciphertext_hash, c.ciphertext_len, f.updated_at
-             FROM file_chunks AS c JOIN files AS f ON f.file_id = c.file_id
-             UNION ALL
-             SELECT 'deletion_marker', d.marker_hash, NULL, f.updated_at
-             FROM deletion_markers AS d JOIN files AS f ON f.file_id = d.file_id
+            "SELECT kind, hash, len, committed_at FROM (
+                 SELECT 'manifest' AS kind, m.manifest_hash AS hash, NULL AS len,
+                        f.updated_at AS committed_at
+                 FROM file_manifests AS m JOIN files AS f ON f.file_id = m.file_id
+                 UNION ALL
+                 SELECT 'chunk', c.ciphertext_hash, c.ciphertext_len, f.updated_at
+                 FROM file_chunks AS c JOIN files AS f ON f.file_id = c.file_id
+                 UNION ALL
+                 SELECT 'deletion_marker', d.marker_hash, NULL, f.updated_at
+                 FROM deletion_markers AS d JOIN files AS f ON f.file_id = d.file_id
+             ) AS history
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM gc_proofs AS g
+                 WHERE g.object_kind = history.kind AND g.object_hash = history.hash
+                   AND g.status = 'applied'
+             )
              ORDER BY 1, 2",
         )?;
         let rows = statement
@@ -1606,9 +1815,9 @@ impl Database {
     pub fn create_backup_job(&mut self, target_id: &str) -> Result<Uuid, MetadataError> {
         let job_id = Uuid::new_v4();
         self.connection.execute(
-            "INSERT INTO backup_jobs (job_id, target_id, started_at, status)
-             VALUES (?1, ?2, unixepoch(), 'running')",
-            params![job_id.to_string(), target_id],
+            "INSERT INTO backup_jobs (job_id, target_id, started_at, status, owner_lease)
+             VALUES (?1, ?2, unixepoch(), 'running', ?3)",
+            params![job_id.to_string(), target_id, self.lease.id.to_string()],
         )?;
         Ok(job_id)
     }
@@ -1798,26 +2007,54 @@ impl Database {
         Ok(())
     }
 
-    /// Mark jobs left `running` by a previous process as interrupted. Their
-    /// scans prove nothing; the next job repeats the work.
+    /// Mark jobs left `running` by a process that has exited as interrupted.
+    /// Their scans prove nothing; the next job repeats the work. Jobs whose
+    /// owning handle is still open (another process's `--interval` loop) are
+    /// left alone.
     pub fn interrupt_running_jobs(&mut self) -> Result<usize, MetadataError> {
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "UPDATE backup_jobs SET status = 'interrupted', completed_at = unixepoch()
-             WHERE status = 'running'",
-            [],
-        )?;
-        transaction.execute(
-            "UPDATE scan_observations SET status = 'failed',
-                 completed_at = unixepoch(), detail = 'job interrupted before completion'
-             WHERE status = 'running'",
-            [],
-        )?;
-        let changed = transaction.execute(
-            "UPDATE reconcile_jobs SET status = 'interrupted', completed_at = unixepoch()
-             WHERE status = 'running'",
-            [],
-        )?;
+        let dead = |table: &str| -> Result<Vec<String>, MetadataError> {
+            let mut statement = transaction.prepare(&format!(
+                "SELECT job_id, owner_lease FROM {table} WHERE status = 'running'"
+            ))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows
+                .into_iter()
+                .filter(|(_, owner)| {
+                    owner
+                        .as_deref()
+                        .is_none_or(|owner| !self.lease.is_alive(owner))
+                })
+                .map(|(job_id, _)| job_id)
+                .collect())
+        };
+        let dead_backups = dead("backup_jobs")?;
+        let dead_reconciles = dead("reconcile_jobs")?;
+        for job_id in &dead_backups {
+            transaction.execute(
+                "UPDATE backup_jobs SET status = 'interrupted', completed_at = unixepoch()
+                 WHERE job_id = ?1 AND status = 'running'",
+                [job_id],
+            )?;
+        }
+        let mut changed = 0;
+        for job_id in &dead_reconciles {
+            transaction.execute(
+                "UPDATE scan_observations SET status = 'failed',
+                     completed_at = unixepoch(), detail = 'job interrupted before completion'
+                 WHERE job_id = ?1 AND status = 'running'",
+                [job_id],
+            )?;
+            changed += transaction.execute(
+                "UPDATE reconcile_jobs SET status = 'interrupted', completed_at = unixepoch()
+                 WHERE job_id = ?1 AND status = 'running'",
+                [job_id],
+            )?;
+        }
         transaction.commit()?;
         Ok(changed)
     }
@@ -2330,6 +2567,19 @@ impl Database {
         {
             return Err(MetadataError::GenerationConflict(operation.file_id));
         }
+        // One file generation has exactly one deletion marker: a delete
+        // retried under a new idempotency key must reuse the pending marker.
+        let pending: Option<String> = transaction
+            .query_row(
+                "SELECT marker_hash FROM delete_operations
+                 WHERE file_id = ?1 AND generation = ?2 LIMIT 1",
+                params![operation.file_id.to_string(), to_i64(operation.generation)?],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if pending.is_some_and(|hash| hash != operation.marker_hash.as_str()) {
+            return Err(MetadataError::GenerationConflict(operation.file_id));
+        }
         transaction.execute(
             "INSERT INTO delete_operations
              (operation_id, idempotency_key, file_id, generation, deleted_at,
@@ -2450,10 +2700,16 @@ impl Database {
         Ok(agents)
     }
 
+    /// Apply a manifest found on the agents. When an in-flight upload for the
+    /// same file exists (the portal crashed before commit, or the database was
+    /// restored from a snapshot taken mid-upload), the upload is marked
+    /// committed and linked to the file, so a same-key retry returns the file
+    /// instead of colliding with it and GC never treats it as staging garbage.
     pub fn apply_recovered_manifest(
         &mut self,
         manifest: &crate::format::DecodedManifest,
         manifest_hash: &ObjectHash,
+        manifest_bytes: &[u8],
     ) -> Result<(), MetadataError> {
         let transaction = self.connection.transaction()?;
         let existing = file_projection_transaction(&transaction, manifest.file_id)?;
@@ -2526,6 +2782,30 @@ impl Database {
                 manifest_hash.as_str(),
             ],
         )?;
+        let upload: Option<(String, String, i64)> = transaction
+            .query_row(
+                "SELECT upload_id, state, generation FROM uploads WHERE file_id = ?1",
+                [manifest.file_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((upload_id, state, upload_generation)) = upload {
+            if state != UploadState::Committed.as_str()
+                && upload_generation == to_i64(manifest.generation)?
+            {
+                transaction.execute(
+                    "UPDATE uploads
+                     SET state = 'committed', manifest_hash = ?2, manifest_bytes = ?3
+                     WHERE upload_id = ?1",
+                    params![upload_id, manifest_hash.as_str(), manifest_bytes],
+                )?;
+                transaction.execute(
+                    "UPDATE files SET source_upload_id = ?2
+                     WHERE file_id = ?1 AND source_upload_id IS NULL",
+                    params![manifest.file_id.to_string(), upload_id],
+                )?;
+            }
+        }
         transaction.execute(
             "DELETE FROM recovery_issues WHERE file_id = ?1",
             [manifest.file_id.to_string()],
@@ -2565,7 +2845,25 @@ impl Database {
             |row| row.get(0),
         )?;
         if persisted_hash != marker_hash.as_str() {
-            return Err(MetadataError::GenerationConflict(marker.file_id));
+            // Two markers for one generation both record the same deletion.
+            // Recovery prefers the committed one; it reaches here only when
+            // that copy is gone from every agent, so adopt the survivor.
+            let deleted_here = existing.as_ref().is_some_and(|file| {
+                file.state == FileState::Deleted && file.generation == marker.generation
+            });
+            if !deleted_here {
+                return Err(MetadataError::GenerationConflict(marker.file_id));
+            }
+            transaction.execute(
+                "UPDATE deletion_markers SET marker_hash = ?3, deleted_at = ?4
+                 WHERE file_id = ?1 AND generation = ?2",
+                params![
+                    marker.file_id.to_string(),
+                    to_i64(marker.generation)?,
+                    marker_hash.as_str(),
+                    marker.deleted_at,
+                ],
+            )?;
         }
         transaction.execute(
             "INSERT INTO files
@@ -2600,15 +2898,41 @@ impl Database {
     ) -> Result<(), MetadataError> {
         let transaction = self.connection.transaction()?;
         let existing = file_projection_transaction(&transaction, file_id)?;
-        let state = if deletion_hash.is_some()
-            || existing
+        // A file already deleted stays deleted (its committed marker remains
+        // authoritative evidence); the CHECK on `files` requires its hash.
+        let deletion_hash = deletion_hash.cloned().or_else(|| {
+            existing
                 .as_ref()
-                .is_some_and(|file| file.state == FileState::Deleted)
-        {
+                .filter(|file| file.state == FileState::Deleted)
+                .and_then(|file| file.deletion_hash.clone())
+        });
+        let state = if deletion_hash.is_some() {
             FileState::Deleted
         } else {
             FileState::RecoveryBlocked
         };
+        let previous_issue: Option<String> = transaction
+            .query_row(
+                "SELECT detail FROM recovery_issues
+                 WHERE file_id = ?1 AND generation = ?2 AND issue_kind = 'recovery_blocked'
+                   AND resolved_at IS NULL",
+                params![file_id.to_string(), to_i64(generation)?],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let unchanged = previous_issue.as_deref() == Some(issue)
+            && existing.as_ref().is_some_and(|file| {
+                file.state == state
+                    && file.generation >= generation
+                    && (deletion_hash.is_none() || file.deletion_hash == deletion_hash)
+            });
+        if unchanged {
+            // Re-running recovery on a still-blocked file is not a content
+            // change; bumping the generation would ship a new backup snapshot
+            // on every run.
+            transaction.commit()?;
+            return Ok(());
+        }
         transaction.execute(
             "INSERT INTO files (file_id, current_generation, state, current_deletion_hash)
              VALUES (?1, ?2, ?3, ?4)
@@ -2621,7 +2945,7 @@ impl Database {
                 file_id.to_string(),
                 to_i64(generation)?,
                 state.as_str(),
-                deletion_hash.map(ObjectHash::as_str),
+                deletion_hash.as_ref().map(ObjectHash::as_str),
             ],
         )?;
         transaction.execute(
@@ -2636,6 +2960,35 @@ impl Database {
         bump_content_generation(&transaction)?;
         transaction.commit()?;
         Ok(())
+    }
+}
+
+fn refuse_inactive_incarnation(
+    connection: &Connection,
+    agent_id: &str,
+    incarnation_id: &str,
+) -> Result<(), MetadataError> {
+    let observed_status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM agent_incarnations WHERE incarnation_id = ?1",
+            [incarnation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match observed_status
+        .as_deref()
+        .map(IncarnationStatus::from_str)
+        .transpose()?
+    {
+        Some(IncarnationStatus::Retired) => Err(MetadataError::RetiredIncarnation {
+            agent_id: agent_id.to_owned(),
+            incarnation_id: incarnation_id.to_owned(),
+        }),
+        Some(IncarnationStatus::Superseded) => Err(MetadataError::SupersededIncarnation {
+            agent_id: agent_id.to_owned(),
+            incarnation_id: incarnation_id.to_owned(),
+        }),
+        Some(IncarnationStatus::Active) | None => Ok(()),
     }
 }
 
@@ -3054,7 +3407,35 @@ fn apply_schema(connection: &Connection) -> Result<(), MetadataError> {
     connection.execute_batch(BACKUP_SCHEMA)?;
     connection.execute_batch(GC_SCHEMA)?;
     connection.execute_batch(INDEX_ARCHIVE_SCHEMA)?;
-    connection.execute_batch("PRAGMA user_version = 8;")?;
+    apply_v9(connection)?;
+    connection.execute_batch("PRAGMA user_version = 9;")?;
+    Ok(())
+}
+
+/// Schema v9 (additive): job ownership leases, and a guard that every delete
+/// operation for one file generation carries the same deletion marker, so a
+/// retried delete under a new idempotency key can never mint a second marker.
+fn apply_v9(connection: &Connection) -> Result<(), MetadataError> {
+    for table in ["reconcile_jobs", "backup_jobs"] {
+        if !table_has_column(connection, table, "owner_lease")? {
+            connection
+                .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN owner_lease TEXT;"))?;
+        }
+    }
+    connection.execute_batch(
+        r#"
+CREATE TRIGGER IF NOT EXISTS delete_operations_one_marker
+BEFORE INSERT ON delete_operations
+WHEN EXISTS (
+    SELECT 1 FROM delete_operations
+    WHERE file_id = NEW.file_id AND generation = NEW.generation
+      AND marker_hash != NEW.marker_hash
+)
+BEGIN
+    SELECT RAISE(ABORT, 'delete operations for one file generation must share a marker');
+END;
+"#,
+    )?;
     Ok(())
 }
 
@@ -3476,6 +3857,8 @@ fn table_has_column(
         "upload_chunks" => "PRAGMA table_info(upload_chunks)",
         "file_chunks" => "PRAGMA table_info(file_chunks)",
         "placements" => "PRAGMA table_info(placements)",
+        "reconcile_jobs" => "PRAGMA table_info(reconcile_jobs)",
+        "backup_jobs" => "PRAGMA table_info(backup_jobs)",
         _ => return Err(MetadataError::UnknownSchemaTable(table.to_owned())),
     };
     let mut statement = connection.prepare(pragma)?;
@@ -4003,5 +4386,102 @@ PRAGMA user_version = 1;
             Database::open(&path),
             Err(MetadataError::UnsupportedSchemaVersion(99))
         ));
+    }
+    /// A deleted file with conflicting evidence stays deleted: the upsert
+    /// keeps its committed marker instead of tripping the `files` CHECK, and
+    /// re-running recovery on the same blocked state is not a content change.
+    #[test]
+    fn blocked_recovery_of_a_deleted_file_keeps_its_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut database = Database::open(&directory.path().join("blocked.sqlite")).unwrap();
+        let file_id = Uuid::new_v4();
+        let marker = ObjectHash::digest(b"marker");
+        database
+            .connection
+            .execute(
+                "INSERT INTO files (file_id, current_generation, state, current_deletion_hash,
+                                    deleted_at)
+                 VALUES (?1, 2, 'deleted', ?2, 1)",
+                params![file_id.to_string(), marker.as_str()],
+            )
+            .unwrap();
+        database
+            .mark_recovery_blocked(file_id, 2, None, "conflicting evidence")
+            .unwrap();
+        let projection = database.file_projection(file_id).unwrap().unwrap();
+        assert_eq!(projection.state, FileState::Deleted);
+        assert_eq!(projection.deletion_hash, Some(marker));
+
+        let generation = database.content_generation().unwrap();
+        database
+            .mark_recovery_blocked(file_id, 2, None, "conflicting evidence")
+            .unwrap();
+        assert_eq!(database.content_generation().unwrap(), generation);
+        database
+            .mark_recovery_blocked(file_id, 2, None, "a different issue")
+            .unwrap();
+        assert_eq!(database.content_generation().unwrap(), generation + 1);
+    }
+
+    #[test]
+    fn one_file_generation_cannot_get_two_delete_markers() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("markers.sqlite")).unwrap();
+        let insert = |key: &str, marker: &str| {
+            database.connection.execute(
+                "INSERT INTO delete_operations
+                 (operation_id, idempotency_key, file_id, generation, deleted_at,
+                  marker_hash, marker_bytes, state)
+                 VALUES (?1, ?2, 'file', 2, 1, ?3, x'00', 'replicating_marker')",
+                params![Uuid::new_v4().to_string(), key, marker],
+            )
+        };
+        insert("first", "marker-a").unwrap();
+        insert("same-marker", "marker-a").unwrap();
+        assert!(insert("second-marker", "marker-b").is_err());
+    }
+
+    #[test]
+    fn v8_databases_gain_job_owners_and_the_marker_guard() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v8.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        for schema in [
+            BASE_SCHEMA,
+            LIFECYCLE_SCHEMA,
+            META_SCHEMA,
+            BACKUP_SCHEMA,
+            GC_SCHEMA,
+            INDEX_ARCHIVE_SCHEMA,
+        ] {
+            connection.execute_batch(schema).unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO reconcile_jobs (job_id, kind, mode, started_at, status)
+                 VALUES ('legacy', 'scrub', 'verify', 1, 'running');
+                 PRAGMA user_version = 8;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        assert!(table_has_column(&database.connection, "reconcile_jobs", "owner_lease").unwrap());
+        assert!(table_has_column(&database.connection, "backup_jobs", "owner_lease").unwrap());
+        // A legacy running job has no owner, so it is interrupted on open.
+        let status: String = database
+            .connection
+            .query_row(
+                "SELECT status FROM reconcile_jobs WHERE job_id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "interrupted");
+        let version: i64 = database
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 }

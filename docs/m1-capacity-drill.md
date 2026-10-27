@@ -82,7 +82,9 @@ No durability or admission bug was found. Two labelling observations:
   actual limiting factor (`require_admissible_capacity` in `portal.rs` hard
   codes the string); agent A had no quota and was limited by its reserve,
   as the agent's own 507 body correctly said. Cosmetic, but it misdirects an
-  operator reading `portal put` output.
+  operator reading `portal put` output. Fixed in the hardening pass: the
+  pre-check now reports `limiting: effective_free_space`, which is what the
+  agents report (quota headroom or filesystem free space, after reserves).
 - A portal-side refusal never contacts the agent, so the agent's
   `last_refusal_at` stays null after a `portal put` exit 3 unless a client
   reached the agent directly. Agent health alone therefore under-reports

@@ -203,17 +203,40 @@ async fn delete_refuses_to_commit_when_confirmed_marker_replicas_are_gone() {
         )
         .unwrap();
     }
+    // A retry re-PUTs confirmed placements, which would heal agent B; make B
+    // refuse the write so only its stale `confirmed` row remains. That row
+    // must not satisfy the commit's live replica check.
+    use std::os::unix::fs::PermissionsExt;
+    let marker_parent = DurableStore::open(agent_b.volume.path())
+        .unwrap()
+        .object_path(ObjectKind::DeletionMarker, &marker_hash)
+        .parent()
+        .unwrap()
+        .to_owned();
+    fs::set_permissions(&marker_parent, fs::Permissions::from_mode(0o555)).unwrap();
 
     let mut portal =
         Portal::open(&database_path, MasterKey::load(&key_path).unwrap(), agents).unwrap();
-    assert!(matches!(
-        portal.delete(file_id, "delete-missing-marker").await,
-        Err(PortalError::NoValidReplica {
-            kind: ObjectKind::DeletionMarker,
-            ..
-        })
-    ));
+    let result = portal.delete(file_id, "delete-missing-marker").await;
+    fs::set_permissions(&marker_parent, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(PortalError::NoValidReplica {
+                kind: ObjectKind::DeletionMarker,
+                ..
+            })
+        ),
+        "{result:?}"
+    );
     assert!(portal.is_visible(file_id).unwrap());
+
+    // With agent B writable again the same-key retry heals and commits.
+    portal
+        .delete(file_id, "delete-missing-marker")
+        .await
+        .unwrap();
+    assert!(!portal.is_visible(file_id).unwrap());
 }
 
 #[tokio::test]

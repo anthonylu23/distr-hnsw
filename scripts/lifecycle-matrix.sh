@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Large storage, corruption, movement, retirement, and garbage-collection
 # matrix for the M1 blob plane (roadmap M1 "Delete, repair, and capacity
-# safety" evidence). Runs on anthonypc; needs no root.
+# safety" evidence). Runs on anthonypc; needs no root. Section 5 covers the
+# orders the 2026-10-25 audit found broken: retirement after GC, and GC after
+# the portal database is replaced by a snapshot taken mid-upload.
 #
 # Usage: scripts/lifecycle-matrix.sh [--files N] [--max-mib M] [--flip K]
 #        [--work DIR]
@@ -34,9 +36,10 @@ PIDS=(); declare -A AGENT_PID
 cleanup() { for pid in "${PIDS[@]:-}"; do [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
-(cd "$REPO" && cargo build --release -p distr-hnsw >/dev/null 2>&1)
+# The failpoints feature lets section 5 stop an upload mid-flight.
+(cd "$REPO" && cargo build --release -p distr-hnsw --features failpoints >/dev/null 2>&1)
 BIN="$REPO/target/release/distr-hnsw"
-SOURCE_REV="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+SOURCE_REV="$(git -C "$REPO" describe --always --dirty --abbrev=40 2>/dev/null || echo unknown)"
 DB="$WORK/portal.sqlite"; KEY="$WORK/master.key"
 "$BIN" portal init --no-recovery-bundle --database "$DB" --master-key "$KEY" >/dev/null
 
@@ -165,6 +168,36 @@ while IFS=$'\t' read -r name bytes sha id; do
   if kportal get "$id" "$WORK/zombie" >/dev/null 2>&1; then DELETED_READABLE=$((DELETED_READABLE+1)); rm -f "$WORK/zombie"; fi
 done < <(awk 'NR % 4 == 0' "$MANIFEST")
 log "deleted $DELETED; gc before scan blocked=$GC_BLOCKED_BEFORE_SCAN; gc $GC; bytes $USED_BEFORE -> $USED_AFTER; health $FINAL_HEALTH"
+
+# ---- 5. Orders after GC ---------------------------------------------------------
+# 5a. Retirement after GC: collected objects must not count as at risk.
+start_agent "agent-5" "host-5"
+portal drain --agent-id agent-4 >"$WORK/drain-after-gc.json" || true
+kill "${AGENT_PID[agent-4]}" 2>/dev/null || true
+timed retire-after-gc portal retire --agent-id agent-4 >"$WORK/retire-after-gc.json" || true
+RETIRED_AFTER_GC="$(jq -r '.retired_incarnation // "none"' "$WORK/retire-after-gc.json")"
+TARGETS=("${TARGETS[0]}" "${TARGETS[1]}" "${TARGETS[3]}")
+portal scrub --repair >"$WORK/scrub-6.json" || true
+
+# 5b. GC after a stale metadata restore: snapshot while an upload is in flight,
+# let the upload commit, then put the snapshot back. GC must collect nothing
+# until recovery reconciles the metadata, and the acknowledged file survives.
+head -c 3000000 /dev/urandom >"$WORK/originals/late.bin"
+LATE_SHA="$(sha256sum "$WORK/originals/late.bin" | cut -d' ' -f1)"
+DISTR_HNSW_FAILPOINT=after_chunks_durable kportal put --idempotency-key "m-$STAMP-late" "$WORK/originals/late.bin" >/dev/null 2>&1 || true
+python3 -c "import sqlite3,sys; sqlite3.connect(sys.argv[1]).execute('VACUUM INTO ?', (sys.argv[2],))" "$DB" "$WORK/stale.sqlite"
+LATE_ID="$(kportal put --idempotency-key "m-$STAMP-late" "$WORK/originals/late.bin")"
+rm -f "$DB" "$DB-wal" "$DB-shm"; cp "$WORK/stale.sqlite" "$DB"
+portal scrub >"$WORK/scrub-7.json" || true
+portal gc --apply --retention-seconds 0 --staging-grace-seconds 0 >"$WORK/gc-stale.json" || true
+GC_STALE_APPLIED="$(jq '.totals.applied' "$WORK/gc-stale.json")"
+GC_STALE_UNKNOWN="$(jq '[.candidates[] | select(any(.blockers[]; test("unknown to the metadata")))] | length' "$WORK/gc-stale.json")"
+kportal recover --apply >"$WORK/recover-stale.json" || true
+RECOVER_STALE_BLOCKED="$(jq '.totals.blocked' "$WORK/recover-stale.json")"
+LATE_OK=0
+if kportal get "$LATE_ID" "$WORK/late-out.bin" >/dev/null 2>&1 \
+   && [[ "$(sha256sum "$WORK/late-out.bin" | cut -d' ' -f1)" == "$LATE_SHA" ]]; then LATE_OK=1; fi
+log "retired after gc: $RETIRED_AFTER_GC; stale-restore gc applied=$GC_STALE_APPLIED unknown-blocked=$GC_STALE_UNKNOWN; recover blocked=$RECOVER_STALE_BLOCKED; late file intact=$LATE_OK"
 cleanup; PIDS=()
 
 VERDICT=pass
@@ -178,6 +211,9 @@ VERDICT=pass
 [[ "$USED_AFTER" -lt "$USED_BEFORE" ]] || VERDICT=fail
 [[ "$(jq '.health.at_risk + .health.lost + .health.degraded' "$WORK/scrub-5.json")" == 0 ]] || VERDICT=fail
 [[ "$S1_BAD$S2_BAD$S3_BAD" == 000 && "$DELETED_READABLE" == 0 ]] || VERDICT=fail
+[[ "$RETIRED_AFTER_GC" != none ]] || VERDICT=fail
+[[ "$GC_STALE_APPLIED" == 0 && "$GC_STALE_UNKNOWN" -gt 0 ]] || VERDICT=fail
+[[ "$RECOVER_STALE_BLOCKED" == 0 && "$LATE_OK" == 1 ]] || VERDICT=fail
 
 jq -n --arg stamp "$STAMP" --arg rev "$SOURCE_REV" --arg host "$(hostname)" --arg kernel "$(uname -r)" --arg verdict "$VERDICT" \
   --argjson files "$FILES" --argjson bytes "$TOTAL" --argjson required "$REQUIRED" --argjson injected "$INJECTED" \
@@ -190,6 +226,9 @@ jq -n --arg stamp "$STAMP" --arg rev "$SOURCE_REV" --arg host "$(hostname)" --ar
   --argjson t_commit "$(took commit)" --argjson t_detect "$(took scrub-detect)" --argjson t_repair "$(took scrub-repair)" \
   --argjson t_drain "$(took drain)" --argjson t_retire "$(took retire)" --argjson t_rebalance "$(took rebalance)" \
   --argjson t_gc_plan "$(took gc-plan)" --argjson t_gc_apply "$(took gc-apply)" \
+  --arg retired_after_gc "$RETIRED_AFTER_GC" --argjson gc_stale_applied "$GC_STALE_APPLIED" \
+  --argjson gc_stale_unknown "$GC_STALE_UNKNOWN" --argjson recover_stale_blocked "$RECOVER_STALE_BLOCKED" \
+  --argjson late_ok "$LATE_OK" --argjson t_retire_after_gc "$(took retire-after-gc)" \
   --slurpfile injected_log "$WORK/injected.json" \
   '{report_type:"LifecycleMatrixReportV1", version:1, stamp:$stamp, host:$host, kernel:$kernel, source_revision:$rev, verdict:$verdict,
     corpus:{files:$files, bytes:$bytes, required_objects:$required, agents:3},
@@ -201,8 +240,11 @@ jq -n --arg stamp "$STAMP" --arg rev "$SOURCE_REV" --arg host "$(hostname)" --ar
     gc:{deleted_files:$deleted, blocked_before_observation:$gc_blocked_before_scan, totals:$gc,
         bytes_before:$used_before, bytes_after:$used_after, final_health:$final_health,
         sample_downloads_ok:$s3[0], sample_downloads_bad:$s3[1], deleted_files_readable:$zombies},
+    after_gc:{retired_incarnation:$retired_after_gc, stale_restore_gc_applied:$gc_stale_applied,
+              stale_restore_candidates_blocked_by_unknown_objects:$gc_stale_unknown,
+              stale_restore_recover_blocked:$recover_stale_blocked, acknowledged_file_intact:($late_ok == 1)},
     seconds:{commit:$t_commit, scrub_detect:$t_detect, scrub_repair:$t_repair, drain:$t_drain, retire:$t_retire,
-             rebalance:$t_rebalance, gc_plan:$t_gc_plan, gc_apply:$t_gc_apply}}' >"$REPORT"
+             rebalance:$t_rebalance, gc_plan:$t_gc_plan, gc_apply:$t_gc_apply, retire_after_gc:$t_retire_after_gc}}' >"$REPORT"
 log "verdict: $VERDICT  report: $REPORT"
-jq '{verdict, corpus, corruption, movement, gc, seconds}' "$REPORT" >&2
+jq '{verdict, corpus, corruption, movement, gc, after_gc, seconds}' "$REPORT" >&2
 [[ "$VERDICT" == pass ]]

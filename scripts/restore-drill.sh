@@ -64,7 +64,7 @@ t0="$(now)"
 log "building release binary"
 (cd "$REPO" && cargo build --release -p distr-hnsw >/dev/null 2>&1)
 BIN="$REPO/target/release/distr-hnsw"
-SOURCE_REV="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+SOURCE_REV="$(git -C "$REPO" describe --always --dirty --abbrev=40 2>/dev/null || echo unknown)"
 step build "$t0" "$(now)" "$SOURCE_REV"
 
 start_agents() {

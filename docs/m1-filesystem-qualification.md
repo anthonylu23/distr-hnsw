@@ -31,7 +31,12 @@ is followed by an `fsync` of its parent via `ensure_child_directory`).
 
 On any error the temp file is removed. If the final path already exists it is
 read back and hash-verified; a corrupt existing object is overwritten by the
-same sequence. Objects are immutable, so there is no in-place update and no
+same sequence. An intact existing object is acknowledged only after its
+directory chain (object directory, prefix directory, namespace) is synced
+again (hardening pass, 2026-10-25): an earlier PUT may have crashed between
+its rename and its directory sync, and a retry must not acknowledge a rename
+that was never made durable. Temporaries left by interrupted PUTs are swept
+when the agent starts if they are older than one hour. Objects are immutable, so there is no in-place update and no
 torn-overwrite case. This is the sequence recommended by Moyer's "Ensuring data
 reaches disk" [2] and by the storage contract.
 
@@ -50,9 +55,13 @@ Two implementation details matter for the analysis below:
   cache but does not flush metadata or the device cache, so `fsync` would
   still be required.
 
-The same helpers persist the master key (`crypto.rs`), the SQLite parent
-directory (`metadata.rs`), and the portal staging directory (`portal.rs`), so
-the conclusions apply to those paths too.
+The same helpers persist the SQLite parent directory (`metadata.rs`) and the
+portal staging directory (`portal.rs`), so the conclusions apply to those
+paths too. Until the hardening pass the master key was written directly to its
+final path. It now follows the same sequence with a hard link in place of
+the rename, so an existing key is never replaced (`crypto.rs`). These
+changed paths have not yet been re-run through the power-loss drill (see
+[hardening-2026-10.md](hardening-2026-10.md)).
 
 ## Per-filesystem analysis
 

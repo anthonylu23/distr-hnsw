@@ -366,13 +366,14 @@ jq -n \
     --arg fs "$FS" --arg utc "$UTC" --arg host "$(hostname)" --arg kernel "$(uname -r)" \
     --arg mkfs "$MKFS_VERSION" --arg dm "$(sudo dmsetup targets | grep -E '^log-writes' | tr -s ' ')" \
     --arg xfstests "$XFSTESTS_REV" --arg mount_opts "$MOUNT_OPTS" \
+    --arg source_rev "$(git -C "$(dirname "${BASH_SOURCE[0]}")/.." describe --always --dirty 2>/dev/null || echo unknown)" \
     --arg data_wc "$DATA_WC" --arg log_wc "$LOG_WC" --arg dm_wc "$DM_WC" \
     --arg data "$DATA" --arg logdev "$LOG" --argjson entries "${LOG_ENTRIES:-0}" \
     --arg incarnation "$INCARNATION_ORIG" \
     --argjson files "$FILES" --argjson pass "$PASS" --argjson seconds "$((T1 - T0))" \
     --argjson control_size "$CONTROL_SIZE" --argjson control_visible "$CONTROL_VISIBLE" --argjson control_ok "$CONTROL_OK" \
     --slurpfile marks "$RUN/marks.jsonl" --slurpfile results "$RUN/results.jsonl" \
-    '{filesystem:$fs, started_utc:$utc, host:$host, kernel:$kernel, mkfs_version:$mkfs,
+    '{filesystem:$fs, started_utc:$utc, host:$host, kernel:$kernel, source_revision:$source_rev, mkfs_version:$mkfs,
       dm_log_writes_target:$dm, xfstests_rev:$xfstests, replay_tool:"xfstests replay-log",
       mount_options:$mount_opts, loop_write_cache:{data:$data_wc, log:$log_wc, dm:$dm_wc},
       devices:{data:$data, log:$logdev}, log_entries:$entries, original_incarnation:$incarnation,

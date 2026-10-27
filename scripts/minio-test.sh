@@ -104,7 +104,7 @@ run_tests() {
         AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER" \
         AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD" \
         AWS_REGION=us-east-1 \
-        cargo test -p distr-hnsw --test backup_s3 -- --nocapture "$@"
+        cargo test -p distr-hnsw --test backup_s3 -- --ignored --nocapture "$@"
 }
 
 case "${1:-run}" in

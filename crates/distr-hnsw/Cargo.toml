@@ -3,12 +3,17 @@ name = "distr-hnsw"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Self-hosted distributed semantic storage service"
 publish = false
 
 [[bin]]
 name = "distr-hnsw"
 path = "src/main.rs"
+
+[features]
+# Honor DISTR_HNSW_FAILPOINT in release builds (debug builds always do).
+failpoints = []
 
 [dependencies]
 anyhow = "1"

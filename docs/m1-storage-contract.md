@@ -27,9 +27,12 @@ add the bound key identifier, recovery bundle, backup set v1 with a
 versioned-directory target, and the restore path that rebuilt a cluster
 from backup alone in the light local drill. Pass 4 adds capacity admission,
 copy-first movement, formal retirement, and proof-based garbage collection
-with agent DELETE. Agents remain loopback-only and unauthenticated for M1
-development. Until the full M1 exit gate passes, the service must not hold
-the only copy of a file or claim recovery readiness.
+with agent DELETE. The October 2026 hardening pass
+([hardening-2026-10.md](hardening-2026-10.md)) adds the GC, recovery, backup,
+and readiness rules marked below and schema v9. Agents remain loopback-only
+and unauthenticated until M2. A deployment must not hold the only copy of a
+file or claim recovery readiness until its own restore drill has passed
+(see "Recovery readiness").
 
 ## Immutable object namespaces
 
@@ -145,24 +148,33 @@ inserts its immutable generation record, changes the current file projection
 to `deleted`, and marks the operation committed. Downloads remain available
 before that transaction and are denied afterward. Reusing the same key resumes
 or returns the same success. A key reused for another file conflicts; a new key
-for an already deleted file returns `AlreadyDeleted`. Logical deletion never
-calls agent DELETE and never removes older manifests or chunks.
+for an already deleted file returns `AlreadyDeleted`. A new key for a file
+whose delete is still pending (an earlier attempt was abandoned) reuses that
+attempt's marker bytes: one file generation has exactly one deletion marker,
+and schema v9 rejects a second distinct marker for the same generation.
+Logical deletion never calls agent DELETE and never removes older manifests
+or chunks.
 
 ## Backup set v1
 
 `portal backup --target dir:<path>` needs no master key. It copies every
 immutable object any generation in history references (manifests, chunks,
-deletion markers), so deleted generations stay in the set until offsite
-retention expires. Each object is fetched from an agent with a hash-verified
+deletion markers) and that garbage collection has not collected, so deleted
+generations stay in the set until offsite retention expires. GC does not
+collect a deleted generation until every backup target that has run a job
+holds a verified copy of it. Each object is fetched from an agent with a hash-verified
 live copy, written to `backup/v1/objects/<kind>/<hash>` with `create_new`
 semantics (identical bytes are accepted, different bytes are a conflict),
 read back from the target and hash-verified, and only then recorded in
 `backup_objects`. A verified object is skipped on later runs; the job is
 restartable.
 
-A `VACUUM INTO` snapshot of the database is shipped to
-`backup/v1/sqlite/<utc>-<hash8>.db`, read back and verified, whenever the
-content generation changed since the last shipped snapshot. The content
+A `VACUUM INTO` snapshot of the database is taken at the start of a job,
+before objects are copied, whenever the content generation changed since the
+last shipped snapshot. History only grows, so every object the snapshot
+references is among the objects the job then copies. The snapshot is shipped
+to `backup/v1/sqlite/<utc>-<hash8>.db` and read back only when every object
+was verified; otherwise it is withheld and the job reports why. The content
 generation is a `portal_meta` counter bumped by file commit, delete commit,
 and recovery apply; backup bookkeeping alone does not trigger a snapshot.
 Each job then writes `backup/v1/catalog/<utc>-<job>.json` listing the
@@ -171,9 +183,23 @@ self-verifying by content address; the catalog is advisory and the set's
 authenticity rests on the target's versioning and immutability.
 
 `portal health` reports per target the last job, verified and pending object
-counts, backup lag (age of the oldest unverified object's file change), and
-the last snapshot. `recovery_ready` is always false until the representative
-empty-infrastructure drill has passed for the deployment.
+counts, backup lag (age of the oldest unverified object's file change,
+including objects the target refused), and the last snapshot.
+
+### Recovery readiness
+
+`portal drill record --report <RestoreDrillReportV1>` stores the facts of a
+restore drill (`scripts/restore-drill.sh`): stamp, revision, target, verdict,
+declared and actual RPO/RTO. `recovery_ready` in `portal health` is true only
+when all of these hold:
+
+- the recorded drill passed within its declared objectives;
+- it completed within the last 92 days (quarterly, DESIGN §11.1);
+- it ran against a configured backup target (the same S3 bucket, any prefix,
+  or the same directory);
+- that target's backup lag is within the drill's declared blob RPO.
+
+`recovery_ready_reason` names the first condition that fails.
 
 The versioned-directory adapter provides layout-level immutability only and
 durable writes through the same temp-write, sync, link, directory-sync
@@ -195,18 +221,22 @@ enforced by the target's lifecycle rules and Object Lock retention (DESIGN
 ### Restore
 
 `portal restore metadata --target … --database <new>` copies the latest (or
-named) snapshot into a path that must not exist and checks its hash against
-the newest catalog that names it. `portal restore objects --target … --agent
+named) snapshot into a path that must not exist, checks its hash against the
+hash prefix in its name and against the newest catalog that names it, and
+marks the database *recovery pending*. A snapshot that does not open is
+removed so the restore can be retried. While recovery is pending, GC, drain,
+and retire refuse to run: a restored projection can be older than the
+agents. `portal restore objects --target … --agent
 …` copies every backed-up object into the agents until two distinct failure
 domains hold read-back-verified copies; it needs neither key nor database.
-`portal recover --apply` then rebinds placements to the new incarnations and
-converges file records. The light local drill (`commit_spine_process.rs`)
+`portal recover --apply` then rebinds placements to the new incarnations,
+converges file records, and clears the recovery-pending flag. The light local drill (`commit_spine_process.rs`)
 destroys agents, volumes, database, and key file, then rebuilds from the
 backup set, the recovery bundle, and an off-cluster passphrase, and
 downloads the committed file byte for byte while the deleted file stays
 unreadable.
 
-## SQLite schema v8
+## SQLite schema v9
 
 Schema v3 stores `files` as the current projection with generation and
 `committed`, `deleted`, or `recovery_blocked` state. It adds immutable
@@ -219,9 +249,9 @@ Schema v4 rebuilds `placements` with `incarnation_id`, `last_verified_at`,
 and `last_verified_job` columns and the state set `pending`, `confirmed`,
 `missing`, `corrupt`. It adds `agent_incarnations`, `reconcile_jobs`,
 `scan_observations`, and `object_health`. Migrated placement rows keep a NULL
-incarnation until their agent is observed. Opening a database marks any job
-still `running` from a previous process as `interrupted` and fails its open
-scans; interrupted scans prove nothing. Schema v5 adds `portal_meta`, which
+incarnation until their agent is observed. Opening a database marks a job
+still `running` as `interrupted` and fails its open scans only if the process
+that started it has exited (see schema v9); interrupted scans prove nothing. Schema v5 adds `portal_meta`, which
 holds the bound master-key identifier and the content generation. Schema v6
 adds `backup_jobs`, `backup_objects`, and `backup_snapshots`. Schema v7
 rebuilds `placements` to admit `orphaned` and adds `gc_proofs`. Schema v8
@@ -230,13 +260,20 @@ each archived part (`manifest`, `snapshot`, `wal_segment`) of a vector
 partition, keyed by partition id, part, and name, with the part's BLAKE3 and
 size. Archived parts are ordinary files in the commit spine; the table is a
 projection for `distr-hnsw index restore`, and losing it loses only the
-convenience of restoring by partition id, not any data.
+convenience of restoring by partition id, not any data. Schema v9 is
+additive. `reconcile_jobs` and `backup_jobs` gain `owner_lease`: each
+`Database` handle holds an exclusive lock on
+`<database>.leases/<uuid>.lock` and stamps the jobs it starts. A trigger
+rejects a second distinct deletion marker for one file generation in
+`delete_operations`. `portal_meta` also holds the recovery-pending flag, an
+owed-recovery-bundle flag set from key creation until `portal init` emits
+the bundle, and the last recorded restore drill.
 
 The two earlier development lines both used schema version 2 for incompatible
 layouts. Opening a v2 database inspects its table shape and atomically migrates
 either the audited commit-spine layout or the recovery-history layout to
-canonical v3, then v4, then v7, then v8 (v5, v6, and v8 are additive; v7
-rebuilds `placements`). V1 also migrates through the same chain. Existing manifest
+canonical v3, then v4, then v7, then v8 and v9 (v5, v6, v8, and v9 are
+additive; v7 rebuilds `placements`). V1 also migrates through the same chain. Existing manifest
 bytes, ciphertext hashes, and chunk-v1 AAD remain unchanged. Unknown or
 unrecognized schema layouts fail closed.
 
@@ -250,9 +287,13 @@ blocked, and 1 for a global operational or trust failure.
 
 Recovery inventories every configured agent, verifies listed sizes and object
 hashes, decrypts manifests and markers, merges immutable evidence with SQLite,
-and chooses the highest generation per file. Different immutable objects or a
-manifest/marker collision at the same winning generation block the file and
-are never exposed.
+and chooses the highest generation per file. Different manifests, or a
+manifest/marker collision at the same winning generation, block the file and
+are never exposed. Several distinct deletion markers at one generation all
+record the same deletion (earlier releases could mint a second one for a
+retried delete). Recovery keeps one deterministically: the marker the
+projection committed, otherwise the earliest `deleted_at`, then the lowest
+hash. It notes the choice instead of blocking.
 
 Apply converges per file. A winning manifest requires itself and every
 referenced chunk at RF2; a winning marker requires the marker at RF2. A valid
@@ -260,9 +301,16 @@ source copy is repaired to deterministic missing agents in distinct failure
 domains before SQLite exposure. Older generations remain untouched. Missing
 or corrupt required objects persist a recovery issue and make a live winner
 `recovery_blocked`; an existing or winning deletion remains unreadable even
-when its marker cannot regain RF2. Wrong keys, malformed inventories,
-unavailable agents, or another untrustworthy global scan abort without
-mutation.
+when its marker cannot regain RF2 or the evidence conflicts. Wrong keys,
+malformed inventories, unavailable agents, or another untrustworthy global
+scan abort without mutation. Planning (`recover` without `--apply`) records
+nothing, not even agent incarnations. When a winning manifest belongs to an
+in-flight upload (a crash before commit, or a snapshot taken mid-upload),
+apply marks the upload committed and links it to the file, so a same-key
+retry returns the file. Re-running recovery on an unchanged blocked file is
+not a content change. Recovery verifies every replica's hash but keeps only
+control-object bytes in memory; a repair re-reads chunk bytes from a valid
+source.
 
 ## Capacity and admission
 
@@ -371,5 +419,7 @@ at RF2, before tombstone commit, and after commit. Retrying with the same
 idempotency key must converge without premature visibility changes.
 
 Physical lifecycle behavior is governed by
-[`m1-lifecycle-contract.md`](m1-lifecycle-contract.md). Agent DELETE is
-reachable only through an applied garbage-collection proof.
+[`m1-lifecycle-contract.md`](m1-lifecycle-contract.md). The portal issues
+agent DELETE only through an applied garbage-collection proof. Agents do not
+verify proofs and accept DELETE from any local client until M2 adds
+authorization; this is a recorded limitation.

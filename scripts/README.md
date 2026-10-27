@@ -71,14 +71,25 @@ scripts/restore-drill.sh --target s3:bucket/prefix          # offsite target
 ```
 
 Needs no root. Writes `$HOME/distr-hnsw-drill/restore-report-<utc>.json`
-and exits 0 only on a `pass` verdict.
+and exits 0 only on a `pass` verdict. A deployment becomes recovery ready
+only after a passing drill against its own backup target (same bucket, or
+same directory) is recorded into its database:
+
+```sh
+distr-hnsw portal drill record --database /var/lib/distr-hnsw/portal.sqlite \
+  --report ~/distr-hnsw-drill/restore-report-<utc>.json
+```
 
 ## lifecycle-matrix.sh
 
 Large corruption, movement, retirement, and GC matrix: commits ~2 GB across
 three agents, injects byte flips, truncations, and removals, repairs, drains
 and retires an agent, joins a replacement, deletes files, and garbage-collects
-with proofs. Results: [docs/m1-lifecycle-matrix.md](../docs/m1-lifecycle-matrix.md).
+with proofs. It then retires an agent after GC, and replaces the database
+with a snapshot taken mid-upload to check that GC collects nothing until
+`recover --apply` has reconciled it and that the acknowledged file survives.
+It builds the release binary with `--features failpoints` to stop that
+upload. Results: [docs/m1-lifecycle-matrix.md](../docs/m1-lifecycle-matrix.md).
 
 ```sh
 scripts/lifecycle-matrix.sh --files 160 --max-mib 24 --flip 24
@@ -92,7 +103,9 @@ Capacity and real-`ENOSPC` failure injection on a small ext4 loop device
 ## minio-test.sh
 
 Runs the S3 backup target tests against a throwaway MinIO
-(`start|test|stop`, or no argument for all three). Used by the S3 leg of the
+(`start|test|stop`, or no argument for all three). The tests are
+`#[ignore]`d so a plain `cargo test` never counts them as passing; this
+script runs them with `--ignored`. Used by the S3 leg of the
 restore drill: start MinIO, create an Object-Lock bucket, run
 `restore-drill.sh --target s3:<bucket>/<prefix>` with the MinIO credentials in
 the environment, then stop.

@@ -304,6 +304,29 @@ fn utc_stamp(seconds: i64) -> String {
     )
 }
 
+/// Inverse of [`utc_stamp`]: `YYYYMMDDTHHMMSSZ` to seconds since the epoch.
+fn parse_utc_stamp(stamp: &str) -> Option<i64> {
+    let bytes = stamp.as_bytes();
+    if bytes.len() != 16 || bytes[8] != b'T' || bytes[15] != b'Z' {
+        return None;
+    }
+    let field = |range: std::ops::Range<usize>| stamp.get(range)?.parse::<i64>().ok();
+    let (y, m, d) = (field(0..4)?, field(4..6)?, field(6..8)?);
+    let (hh, mm, ss) = (field(9..11)?, field(11..13)?, field(13..15)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // days-from-civil per Howard Hinnant.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
+}
+
 fn now_seconds() -> Result<i64, BackupError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -447,6 +470,24 @@ async fn run_backup(
     snapshot_path_hint: &Path,
     sample: usize,
 ) -> Result<BackupReportV1, BackupError> {
+    // Snapshot first, objects second: history only grows, so every object
+    // the snapshot references is in the history read below, and the snapshot
+    // is shipped only once all of them are verified on the target. A snapshot
+    // taken after the copy could reference files committed meanwhile whose
+    // objects the set lacks.
+    let generation = database.content_generation()?;
+    let latest = database.latest_backup_snapshot(target_id)?;
+    let pending_snapshot = match &latest {
+        Some(previous) if previous.content_generation == generation => None,
+        _ => {
+            let temporary = snapshot_path_hint.with_extension(format!("snapshot-{job_id}.tmp"));
+            let _ = fs::remove_file(&temporary);
+            database.snapshot_into(&temporary)?;
+            let snapshot_bytes = fs::read(&temporary);
+            let _ = fs::remove_file(&temporary);
+            Some(snapshot_bytes?)
+        }
+    };
     let history = database.history_objects()?;
     let mut totals = BackupTotals {
         history_objects: history.len(),
@@ -478,12 +519,18 @@ async fn run_backup(
             continue;
         };
         let path = object_path(object.kind, &object.hash);
+        let mut unverified = |totals: &mut BackupTotals, issue: String| {
+            totals.failed += 1;
+            oldest_unverified = Some(oldest_unverified.map_or(object.committed_at, |current| {
+                current.min(object.committed_at)
+            }));
+            issues.push(issue);
+        };
         match target.put_new(&path, &bytes).await {
             Ok(PutOutcome::Created) => totals.copied_now += 1,
             Ok(PutOutcome::Identical) => totals.identical_on_target += 1,
             Err(error) => {
-                totals.failed += 1;
-                issues.push(format!("target refused {path}: {error}"));
+                unverified(&mut totals, format!("target refused {path}: {error}"));
                 continue;
             }
         }
@@ -492,8 +539,10 @@ async fn run_backup(
             .await?
             .is_some_and(|got| ObjectHash::digest(&got) == object.hash);
         if !verified {
-            totals.failed += 1;
-            issues.push(format!("target copy of {path} did not read back intact"));
+            unverified(
+                &mut totals,
+                format!("target copy of {path} did not read back intact"),
+            );
             continue;
         }
         database.record_backup_object(
@@ -511,25 +560,24 @@ async fn run_backup(
     }
 
     // SQLite snapshot, skipped when no file-visible content changed since the
-    // last shipped one (backup bookkeeping alone does not warrant a snapshot).
+    // last shipped one (backup bookkeeping alone does not warrant a snapshot),
+    // and withheld while any object it may reference is not yet verified.
     let now = now_seconds()?;
-    let generation = database.content_generation()?;
-    let latest = database.latest_backup_snapshot(target_id)?;
-    let (snapshot, skipped) = match latest {
-        Some(previous) if previous.content_generation == generation => (
-            Some(SnapshotRecord {
-                name: previous.name,
-                hash: previous.snapshot_hash,
-                size: previous.size,
-            }),
-            true,
-        ),
-        _ => {
-            let temporary = snapshot_path_hint.with_extension(format!("snapshot-{job_id}.tmp"));
-            let _ = fs::remove_file(&temporary);
-            database.snapshot_into(&temporary)?;
-            let snapshot_bytes = fs::read(&temporary)?;
-            let _ = fs::remove_file(&temporary);
+    let previous = latest.map(|previous| SnapshotRecord {
+        name: previous.name,
+        hash: previous.snapshot_hash,
+        size: previous.size,
+    });
+    let (snapshot, skipped) = match pending_snapshot {
+        None => (previous, true),
+        Some(_) if totals.failed > 0 => {
+            issues.push(format!(
+                "SQLite snapshot not shipped: {} object(s) it may reference are not verified on the target",
+                totals.failed
+            ));
+            (previous, false)
+        }
+        Some(snapshot_bytes) => {
             let snapshot_hash = blake3::hash(&snapshot_bytes).to_hex().to_string();
             let name = format!("{}-{}.db", utc_stamp(now), &snapshot_hash[..8]);
             target
@@ -682,10 +730,160 @@ struct ReportSampleOnly {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BackupStatusV1 {
     pub targets: Vec<BackupTargetStatus>,
-    /// Always false until the empty-infrastructure restore drill has passed
-    /// for this deployment (DESIGN §11.1).
+    /// The last restore drill recorded with `portal drill record`.
+    pub last_restore_drill: Option<RestoreDrillRecord>,
+    /// True only when a passing empty-infrastructure restore drill within
+    /// the drill window covers a configured target whose backup lag is
+    /// within the drill's declared blob RPO (DESIGN §11.1).
     pub recovery_ready: bool,
     pub recovery_ready_reason: String,
+}
+
+const RESTORE_DRILL_META: &str = "last_restore_drill";
+/// A drill is required at least quarterly (DESIGN §11.1); 92 days covers it.
+pub const RESTORE_DRILL_WINDOW_SECONDS: i64 = 92 * 24 * 3600;
+
+/// The facts of one restore drill that recovery readiness depends on,
+/// extracted from a `RestoreDrillReportV1` (scripts/restore-drill.sh).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RestoreDrillRecord {
+    pub stamp: String,
+    pub completed_at: i64,
+    pub recorded_at: i64,
+    pub source_revision: String,
+    pub target: String,
+    pub verdict: String,
+    pub within_targets: bool,
+    pub declared_blob_rpo_seconds: i64,
+    pub declared_portal_rto_seconds: i64,
+    pub actual_recovery_point_lag_ms: i64,
+    pub actual_recovery_time_ms: i64,
+}
+
+/// Record a restore drill report so `recovery_ready` can be derived from it.
+/// The report is validated, not trusted blindly: it must be a
+/// `RestoreDrillReportV1` with a parseable stamp and objectives.
+pub fn record_restore_drill(
+    database: &mut Database,
+    report_json: &str,
+) -> Result<RestoreDrillRecord, BackupError> {
+    let invalid = |detail: &str| BackupError::InvalidDrillReport(detail.to_owned());
+    let report: serde_json::Value = serde_json::from_str(report_json)?;
+    if report["report_type"] != "RestoreDrillReportV1" {
+        return Err(invalid("not a RestoreDrillReportV1"));
+    }
+    let text = |pointer: &str| {
+        report
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| invalid(pointer))
+    };
+    let number = |pointer: &str| {
+        report
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| invalid(pointer))
+    };
+    let stamp = text("/stamp")?;
+    let completed_at = parse_utc_stamp(&stamp).ok_or_else(|| invalid("/stamp"))?;
+    let record = RestoreDrillRecord {
+        completed_at,
+        recorded_at: now_seconds()?,
+        source_revision: text("/source_revision")?,
+        target: text("/target")?,
+        verdict: text("/verdict")?,
+        within_targets: report
+            .pointer("/objectives/within_targets")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| invalid("/objectives/within_targets"))?,
+        declared_blob_rpo_seconds: number("/objectives/declared_blob_rpo_seconds")? as i64,
+        declared_portal_rto_seconds: number("/objectives/declared_portal_loss_rto_seconds")? as i64,
+        actual_recovery_point_lag_ms: (number("/objectives/actual_recovery_point_lag_seconds")?
+            * 1000.0)
+            .round() as i64,
+        actual_recovery_time_ms: (number("/objectives/actual_recovery_time_seconds")? * 1000.0)
+            .round() as i64,
+        stamp,
+    };
+    database.set_meta(RESTORE_DRILL_META, &serde_json::to_string(&record)?)?;
+    Ok(record)
+}
+
+/// Whether a drill run against `drill_target` exercised `target_id`: the
+/// same S3 bucket (any prefix, so a drill may use its own), or the same
+/// directory.
+fn drill_covers(drill_target: &str, target_id: &str) -> bool {
+    match (
+        drill_target.strip_prefix("s3:"),
+        target_id.strip_prefix("s3:"),
+    ) {
+        (Some(drill), Some(target)) => drill.split('/').next() == target.split('/').next(),
+        (None, None) => drill_target == target_id,
+        _ => false,
+    }
+}
+
+fn recovery_readiness(
+    drill: Option<&RestoreDrillRecord>,
+    targets: &[BackupTargetStatus],
+    now: i64,
+) -> (bool, String) {
+    let Some(drill) = drill else {
+        return (
+            false,
+            "no restore drill recorded; run scripts/restore-drill.sh against this deployment's target and `portal drill record`".to_owned(),
+        );
+    };
+    if drill.verdict != "pass" || !drill.within_targets {
+        return (
+            false,
+            format!(
+                "last restore drill ({}) did not pass within its declared RPO/RTO",
+                drill.stamp
+            ),
+        );
+    }
+    if now - drill.completed_at > RESTORE_DRILL_WINDOW_SECONDS {
+        return (
+            false,
+            format!(
+                "last passing restore drill ({}) is older than the quarterly window",
+                drill.stamp
+            ),
+        );
+    }
+    let Some(target) = targets
+        .iter()
+        .find(|target| drill_covers(&drill.target, &target.target_id))
+    else {
+        return (
+            false,
+            format!(
+                "restore drill target {} is not a configured backup target",
+                drill.target
+            ),
+        );
+    };
+    if target.backup_lag_seconds > drill.declared_blob_rpo_seconds {
+        return (
+            false,
+            format!(
+                "backup lag on {} is {}s, above the declared blob RPO of {}s",
+                target.target_id, target.backup_lag_seconds, drill.declared_blob_rpo_seconds
+            ),
+        );
+    }
+    (
+        true,
+        format!(
+            "restore drill {} passed against {}; backup lag {}s within RPO {}s",
+            drill.stamp,
+            target.target_id,
+            target.backup_lag_seconds,
+            drill.declared_blob_rpo_seconds
+        ),
+    )
 }
 
 pub fn backup_status(database: &Database) -> Result<BackupStatusV1, BackupError> {
@@ -726,11 +924,17 @@ pub fn backup_status(database: &Database) -> Result<BackupStatusV1, BackupError>
             target_id,
         });
     }
+    let last_restore_drill = database
+        .meta(RESTORE_DRILL_META)?
+        .map(|json| serde_json::from_str::<RestoreDrillRecord>(&json))
+        .transpose()?;
+    let (recovery_ready, recovery_ready_reason) =
+        recovery_readiness(last_restore_drill.as_ref(), &targets, now);
     Ok(BackupStatusV1 {
         targets,
-        recovery_ready: false,
-        recovery_ready_reason:
-            "empty-infrastructure restore drill has not passed for this deployment".to_owned(),
+        last_restore_drill,
+        recovery_ready,
+        recovery_ready_reason,
     })
 }
 
@@ -769,6 +973,14 @@ pub async fn restore_metadata(
         .await?
         .ok_or_else(|| BackupError::NoSnapshot)?;
     let hash = blake3::hash(&bytes).to_hex().to_string();
+    // Snapshot names end in the first eight hex digits of their BLAKE3 hash.
+    let named_prefix = name
+        .strip_suffix(".db")
+        .and_then(|stem| stem.rsplit('-').next())
+        .unwrap_or_default();
+    if named_prefix.len() != 8 || !hash.starts_with(named_prefix) {
+        return Err(BackupError::SnapshotVerification(name));
+    }
 
     let mut catalog_name = None;
     for (path, _) in target
@@ -807,8 +1019,21 @@ pub async fn restore_metadata(
     if let Some(parent) = database_path.parent() {
         sync_directory(parent)?;
     }
-    // Opening validates the schema and migrates if needed.
-    Database::open(database_path)?;
+    // Opening validates the schema and migrates if needed. A snapshot that
+    // does not open is removed so the restore can be retried.
+    let opened = Database::open(database_path).and_then(|mut database| {
+        // The snapshot can predate objects already on the agents; GC, drain,
+        // and retire refuse until `recover --apply` reconciles them.
+        database.set_recovery_pending(now_seconds().unwrap_or(0))
+    });
+    if let Err(error) = opened {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = database_path.as_os_str().to_owned();
+            path.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(path));
+        }
+        return Err(error.into());
+    }
     Ok(RestoreMetadataReport {
         report_type: "RestoreMetadataReportV1".to_owned(),
         snapshot: SnapshotRecord {
@@ -942,6 +1167,8 @@ pub async fn restore_objects(
 pub enum BackupError {
     #[error("backup target must be dir:<path> or s3:<bucket>[/<prefix>]: {0}")]
     InvalidTarget(String),
+    #[error("restore drill report is invalid or incomplete: {0}")]
+    InvalidDrillReport(String),
     #[error(
         "S3 bucket {0} does not have versioning enabled; enable versioning (and Object Lock) \
          before using it as a backup target"
@@ -1044,6 +1271,21 @@ mod tests {
     fn utc_stamps_are_civil_dates() {
         assert_eq!(utc_stamp(0), "19700101T000000Z");
         assert_eq!(utc_stamp(1_790_704_638), "20260929T175718Z");
+        for seconds in [0, 951_782_400, 1_790_704_638, 4_102_444_799] {
+            assert_eq!(parse_utc_stamp(&utc_stamp(seconds)), Some(seconds));
+        }
+        assert_eq!(parse_utc_stamp("20261325T000000Z"), None);
+        assert_eq!(parse_utc_stamp("not a stamp"), None);
+    }
+
+    #[test]
+    fn drills_cover_same_bucket_or_same_directory() {
+        assert!(drill_covers("s3:offsite/drill-1", "s3:offsite/prod"));
+        assert!(drill_covers("s3:offsite", "s3:offsite/prod"));
+        assert!(!drill_covers("s3:other/prod", "s3:offsite/prod"));
+        assert!(drill_covers("dir:/mnt/backup", "dir:/mnt/backup"));
+        assert!(!drill_covers("dir:/tmp/drill/offsite", "dir:/mnt/backup"));
+        assert!(!drill_covers("dir:/mnt/backup", "s3:mnt"));
     }
 
     #[test]

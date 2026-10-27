@@ -54,17 +54,39 @@ impl MasterKey {
         if let Some(parent) = path.parent() {
             ensure_directory(parent)?;
         }
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(&self.0)?;
-        sync_regular_file(&file)?;
-        if let Some(parent) = path.parent() {
-            sync_directory(parent)?;
-        }
-        Ok(())
+        // Same durable-write sequence as objects: write and fsync a
+        // temporary, then link it into place so a crash never leaves a
+        // truncated key at the final path, and an existing key is never
+        // replaced.
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| CryptoError::Io(std::io::Error::other("key path has no file name")))?
+            .to_string_lossy()
+            .into_owned();
+        let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(&self.0)?;
+            sync_regular_file(&file)?;
+            drop(file);
+            match fs::hard_link(&temporary, path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(CryptoError::KeyAlreadyExists(path.to_owned()));
+                }
+                Err(error) => return Err(error.into()),
+            }
+            if let Some(parent) = path.parent() {
+                sync_directory(parent)?;
+            }
+            Ok(())
+        })();
+        let _ = fs::remove_file(&temporary);
+        result
     }
 
     /// Non-secret identifier derived from the key. It lets the portal refuse a
