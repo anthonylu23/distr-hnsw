@@ -364,6 +364,7 @@ struct PersistReportV1 {
     metric: String,
     dims: usize,
     base_count: usize,
+    queries_evaluated: usize,
     k: usize,
     ef_search: usize,
     parameters: BTreeMap<String, serde_json::Value>,
@@ -398,6 +399,7 @@ struct CompactReportV1 {
     metric: String,
     dims: usize,
     base_count: usize,
+    queries_evaluated: usize,
     deleted: usize,
     concurrent_upserts: usize,
     k: usize,
@@ -671,16 +673,18 @@ fn main() -> anyhow::Result<()> {
                 snapshot_bytes as f64 / 1073741824.0
             );
 
-            // WAL tail: re-upsert the first `tail` rows under new keys.
+            // WAL tail: re-upsert the first `tail` upsertable rows under new
+            // keys that name their source row.
+            let tail_rows = admissible_rows(loaded.metric, &loaded.base, base_count, tail);
             let started = Instant::now();
-            for i in 0..tail.min(base_count) {
+            for (n, &row) in tail_rows.iter().enumerate() {
                 let mut op = [0_u8; 16];
-                op[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                op[..8].copy_from_slice(&(n as u64).to_le_bytes());
                 op[8] = 1;
                 partition.upsert(
                     op,
-                    format!("tail-{i}").as_bytes(),
-                    loaded.base.get(i as RecordId).unwrap(),
+                    format!("tail-{row}").as_bytes(),
+                    loaded.base.get(row).unwrap(),
                     b"{}",
                 )?;
             }
@@ -690,11 +694,12 @@ fn main() -> anyhow::Result<()> {
                 .filter_map(|e| e.metadata().ok())
                 .map(|m| m.len())
                 .sum();
+            let query_ids = admissible_rows(loaded.metric, &loaded.queries, usize::MAX, count);
             let search_all = |p: &Partition| -> Vec<Vec<(Vec<u8>, f32)>> {
-                (0..count)
-                    .into_par_iter()
-                    .map(|q| {
-                        let query = loaded.queries.get(q as RecordId).unwrap();
+                query_ids
+                    .par_iter()
+                    .map(|&q| {
+                        let query = loaded.queries.get(q).unwrap();
                         p.search(query, k, ef, None)
                             .unwrap()
                             .into_iter()
@@ -704,18 +709,20 @@ fn main() -> anyhow::Result<()> {
                     .collect()
             };
             let recall_of = |results: &[Vec<(Vec<u8>, f32)>]| -> (f64, usize) {
-                let (total, mismatched) = (0..count)
-                    .map(|q| {
-                        let query = loaded.queries.get(q as RecordId).unwrap();
-                        let truth = &loaded.groundtruth[q][..k];
+                let (total, mismatched) = query_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &q)| {
+                        let query = loaded.queries.get(q).unwrap();
+                        let truth = &loaded.groundtruth[q as usize][..k];
                         let kth = truth
                             .iter()
                             .map(|id| distance(loaded.metric, query, loaded.base.get(*id).unwrap()))
                             .fold(f32::MIN, f32::max);
-                        verified_recall(&loaded, query, kth, &results[q], k)
+                        verified_recall(&loaded, query, kth, &results[i], k)
                     })
                     .fold((0.0, 0), |(r, m), (dr, dm)| (r + dr, m + dm));
-                (total / count.max(1) as f64, mismatched)
+                (total / query_ids.len().max(1) as f64, mismatched)
             };
             let before = search_all(&partition);
             let (recall_before, mismatched_before) = recall_of(&before);
@@ -745,6 +752,7 @@ fn main() -> anyhow::Result<()> {
                 metric: loaded.metric.as_str().to_owned(),
                 dims: loaded.base.dims(),
                 base_count,
+                queries_evaluated: query_ids.len(),
                 k,
                 ef_search: ef,
                 parameters,
@@ -752,7 +760,7 @@ fn main() -> anyhow::Result<()> {
                 snapshot_write_seconds,
                 snapshot_bytes,
                 snapshot_bytes_per_vector: snapshot_bytes as f64 / base_count.max(1) as f64,
-                wal_tail_entries: tail.min(base_count),
+                wal_tail_entries: tail_rows.len(),
                 wal_tail_seconds,
                 wal_tail_bytes,
                 recovery_seconds,
@@ -841,11 +849,12 @@ fn main() -> anyhow::Result<()> {
                 deleted.iter().map(|k| k.to_le_bytes().to_vec()).collect();
 
             type Results = Vec<Vec<(Vec<u8>, f32)>>;
+            let query_ids = admissible_rows(loaded.metric, &loaded.queries, usize::MAX, count);
             let timed_search = |p: &Partition| -> (Results, f64) {
                 let mut latencies: Vec<f64> = Vec::with_capacity(count);
                 let mut results = Vec::with_capacity(count);
-                for q in 0..count {
-                    let query = loaded.queries.get(q as RecordId).unwrap();
+                for &q in &query_ids {
+                    let query = loaded.queries.get(q).unwrap();
                     let started = Instant::now();
                     let hits = p.search(query, k, ef, None).unwrap();
                     latencies.push(started.elapsed().as_secs_f64() * 1e6);
@@ -856,15 +865,16 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
                 latencies.sort_by(|a, b| a.total_cmp(b));
-                let p50 = latencies.get(count / 2).copied().unwrap_or(0.0);
+                let p50 = latencies.get(latencies.len() / 2).copied().unwrap_or(0.0);
                 (results, p50)
             };
             // Ground truth against the surviving base only.
             let recall_of = |results: &Results| -> (f64, usize) {
-                let total = (0..count)
-                    .into_par_iter()
-                    .map(|q| {
-                        let query = loaded.queries.get(q as RecordId).unwrap();
+                let total = query_ids
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, &q)| {
+                        let query = loaded.queries.get(q).unwrap();
                         let mut truth: Vec<f32> = (0..base_count)
                             .filter(|slot| !(slot % stride == 0 && slot / stride < deleted_count))
                             .map(|slot| {
@@ -877,10 +887,10 @@ fn main() -> anyhow::Result<()> {
                             .collect();
                         truth.sort_by(|a, b| a.total_cmp(b));
                         let kth = truth[k.min(truth.len()) - 1];
-                        verified_recall(&loaded, query, kth, &results[q], k)
+                        verified_recall(&loaded, query, kth, &results[i], k)
                     })
                     .reduce(|| (0.0, 0), |(r, m), (dr, dm)| (r + dr, m + dm));
-                (total.0 / count.max(1) as f64, total.1)
+                (total.0 / query_ids.len().max(1) as f64, total.1)
             };
             let (before, p50_before) = timed_search(&partition);
             let (recall_before, mismatched_before) = recall_of(&before);
@@ -895,6 +905,8 @@ fn main() -> anyhow::Result<()> {
             // Capture under the writer, rebuild on another thread, and keep
             // writing from this one while it runs.
             let started = Instant::now();
+            let concurrent_rows =
+                admissible_rows(loaded.metric, &loaded.base, base_count, concurrent);
             let input = partition.capture_compaction()?;
             let capture_seconds = started.elapsed().as_secs_f64();
             let started = Instant::now();
@@ -904,15 +916,15 @@ fn main() -> anyhow::Result<()> {
             });
             let mut upserts_during_build = 0;
             let mut upsert_max_ms_during_build: f64 = 0.0;
-            for i in 0..concurrent.min(base_count) {
+            for (n, &row) in concurrent_rows.iter().enumerate() {
                 let mut op = [0_u8; 16];
-                op[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                op[..8].copy_from_slice(&(n as u64).to_le_bytes());
                 op[8] = 3;
                 let issued = Instant::now();
                 partition.upsert(
                     op,
-                    format!("concurrent-{i}").as_bytes(),
-                    loaded.base.get(i as RecordId).unwrap(),
+                    format!("concurrent-{row}").as_bytes(),
+                    loaded.base.get(row).unwrap(),
                     b"{}",
                 )?;
                 if !builder.is_finished() {
@@ -939,10 +951,11 @@ fn main() -> anyhow::Result<()> {
             // Recall after includes the concurrent upserts as duplicates of
             // live base rows; recall_by_distance tolerates that.
             let (recall_after, mismatched_after) = recall_of(&after);
-            let concurrent_keys_present = (0..concurrent.min(base_count))
-                .filter(|i| {
+            let concurrent_keys_present = concurrent_rows
+                .iter()
+                .filter(|row| {
                     partition
-                        .slot_for_key(format!("concurrent-{i}").as_bytes())
+                        .slot_for_key(format!("concurrent-{row}").as_bytes())
                         .is_some()
                 })
                 .count();
@@ -965,8 +978,9 @@ fn main() -> anyhow::Result<()> {
                 metric: loaded.metric.as_str().to_owned(),
                 dims: loaded.base.dims(),
                 base_count,
+                queries_evaluated: query_ids.len(),
                 deleted: deleted.len(),
-                concurrent_upserts: concurrent.min(base_count),
+                concurrent_upserts: concurrent_rows.len(),
                 k,
                 ef_search: ef,
                 parameters,
@@ -1349,6 +1363,26 @@ fn main() -> anyhow::Result<()> {
 /// The base row a partition key names in the persist and compact benches:
 /// bulk keys are the row index as 8 little-endian bytes, appended keys are
 /// `<label>-<row>`.
+/// The first `count` of the first `limit` rows of `vectors` that the
+/// partition's public upsert and search accept. Cosine rejects zero-norm
+/// vectors there, while bulk load and the graph keep them for comparability
+/// with the published ground truth (contract §2); `nytimes-256-angular`
+/// holds 239 such base rows and 9 such queries.
+fn admissible_rows(
+    metric: Metric,
+    vectors: &FlatVectors,
+    limit: usize,
+    count: usize,
+) -> Vec<RecordId> {
+    (0..limit.min(vectors.len()) as RecordId)
+        .filter(|&row| {
+            let mut vector = vectors.get(row).unwrap().to_vec();
+            !metric.normalizes() || normalize(&mut vector)
+        })
+        .take(count)
+        .collect()
+}
+
 fn key_row<'a>(loaded: &'a Dataset, key: &[u8]) -> Option<&'a [f32]> {
     let row = if let Ok(bytes) = <[u8; 8]>::try_from(key) {
         u64::from_le_bytes(bytes)
