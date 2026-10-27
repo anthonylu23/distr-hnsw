@@ -3,6 +3,7 @@ name = "distr-hnsw-index"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Single-partition vector engine: flat storage, distance kernels, exact oracle, HNSW"
 publish = false
 

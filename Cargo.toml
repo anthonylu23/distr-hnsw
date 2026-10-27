@@ -6,6 +6,7 @@ members = ["crates/distr-hnsw", "crates/distr-hnsw-index", "crates/distr-hnsw-be
 edition = "2021"
 license = "MIT OR Apache-2.0"
 version = "0.1.0"
+repository = "https://github.com/anthonylu23/distr-hnsw"
 
 # Argon2id is unusably slow unoptimized; recovery-bundle tests would take
 # minutes. Optimize the KDF crates even in dev builds.

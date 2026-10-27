@@ -3,6 +3,7 @@ name = "distr-hnsw-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Benchmark harness for the distr-hnsw vector engine against pinned datasets"
 publish = false
 
