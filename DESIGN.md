@@ -458,7 +458,7 @@ residency can be controlled exactly. Nodes retain OS and compaction headroom;
 they do not pack nominal partition estimates to 100% of physical RAM or disk.
 
 Vectors in the v1 graph and snapshot format are stored **int8
-scalar-quantized** (~4× RAM reduction; measured recall cost at most 0.0005
+scalar-quantized** (~4× RAM reduction; measured recall cost at most 0.0014
 after exact rescoring on the pinned public sets);
 full-precision originals remain in the WAL/snapshot stream so top candidates
 can be exactly rescored and requantization stays possible. File collections

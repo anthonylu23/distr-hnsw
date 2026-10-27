@@ -1,7 +1,10 @@
 # M1 empty-infrastructure restore drill
 
 Status: **passed on `anthonypc` with both the versioned-directory target and
-the S3-compatible target (MinIO with Object Lock), 2026-09-30.**
+the S3-compatible target (MinIO with Object Lock), re-run from the clean
+hardening revision `dc276f3` on 2026-10-27.** Both reports were then
+recorded with `portal drill record`, which derived `recovery_ready` from
+them.
 
 This is the evidence package the roadmap requires for the M1 exit gate: a
 representative cluster is destroyed and rebuilt into empty infrastructure
@@ -32,49 +35,74 @@ committed because they contain file identifiers and local paths.
    every deleted file is still unreadable; final scrub must report every
    required object durable.
 
-## Result (run `20260930T000508Z`)
+## Result (run `20261027T014106Z`, directory target)
 
 | Field | Value |
 |---|---|
 | Host, kernel | `anthonypc`, `7.1.9-200.fc44.x86_64` |
-| Source revision | `9862462` |
+| Source revision | `dc276f3` (clean) |
 | Backup target | versioned directory (`dir:`), local disk |
-| Corpus | 64 files, 247,273,429 bytes; 56 kept, 8 deleted; 3 agents |
-| Backup set | 164 objects copied and read-back verified; second run copied 0, snapshot skipped; 0 pending before loss |
-| Restore | 164 objects placed to 2 domains each (328 placements, 0 failed); recovery converged 64/64 files, 0 blocked |
-| Desired placement | scrub repair applied 147 copies; final health 147 durable, 0 degraded, 0 at risk, 0 lost |
+| Corpus | 64 files, 293,134,603 bytes; 56 kept, 8 deleted; 3 agents |
+| Backup set | 175 objects copied and read-back verified; second run copied 0, snapshot skipped; 0 pending before loss |
+| Restore | 175 objects placed to 2 domains each (350 placements, 0 failed); recovery converged 64/64 files, 0 blocked |
+| Desired placement | final health 155 required objects durable, 0 degraded, 0 at risk, 0 lost |
 | Verification | 56/56 kept files match SHA-256; 8/8 deleted files unreadable; 0 resurrected; no missing control metadata |
-| Report digest (SHA-256, first 16) | `149ea90df3768139` |
+| Report digest (SHA-256, first 16) | `8aae9284fd88556b` |
 
 | Objective | Declared | Actual |
 |---|---|---|
-| Metadata RPO | 300 s (snapshot interval) | 3.7 s from last commit to verified backup |
-| Blob RPO | 900 s | 3.7 s |
-| Portal-loss RTO | 600 s once recovery material is at hand | 7.7 s from loss to converged recovery |
+| Metadata RPO | 300 s (snapshot interval) | 2.5 s from last commit to verified backup |
+| Blob RPO | 900 s | 2.5 s |
+| Portal-loss RTO | 600 s once recovery material is at hand | 3.9 s from loss to converged recovery |
 
-Step timings (seconds): commit 7.3, backup 3.7, destroy 0.2, key restore
-0.1, restore metadata 0.02, restore objects 4.3, recover 3.1, scrub repair
-2.8, verify 3.8.
+Step timings (seconds): commit 7.3, backup 2.5, destroy 0.2, key restore
+0.1, restore metadata 0.0, restore objects 2.6, recover 1.0, scrub repair
+2.3, verify 3.3.
 
-## Result with the S3-compatible target (run `20260930T001413Z`)
+## Result with the S3-compatible target (run `20261027T014126Z`)
 
 Same procedure against MinIO `RELEASE.2025-09-07T16-13-09Z` on this machine,
 bucket created with Object Lock enabled (versioning on, no default retention,
-which the adapter warns about), prefix `site-a`, source revision `c6228e7`.
+which the adapter warns about), prefix `site-a`, source revision `dc276f3`.
 
 | Field | Value |
 |---|---|
-| Corpus | 64 files, 253,674,286 bytes; 56 kept, 8 deleted; 3 agents |
-| Backup set | 164 objects copied and read-back verified through S3; second run copied 0 and skipped the snapshot |
-| Restore | 164 objects placed to 2 domains each (328 placements, 0 failed); recovery converged 64/64, 0 blocked |
-| Verification | 56/56 kept files match SHA-256; 8/8 deleted files unreadable; final health all durable |
-| Actual recovery point lag | 3.9 s |
-| Actual recovery time | 4.2 s |
-| Report digest (SHA-256, first 16) | `bb955c0b3a8bc149` |
+| Corpus | 64 files, 243,636,328 bytes; 56 kept, 8 deleted; 3 agents |
+| Backup set | 165 objects copied and read-back verified through S3; second run copied 0 and skipped the snapshot |
+| Restore | 165 objects placed to 2 domains each (330 placements, 0 failed); recovery converged 64/64, 0 blocked |
+| Verification | 56/56 kept files match SHA-256; 8/8 deleted files unreadable; 0 resurrected; final health 145 durable |
+| Actual recovery point lag | 3.3 s |
+| Actual recovery time | 3.75 s |
+| Report digest (SHA-256, first 16) | `6f38c3a39b4712a4` |
 
-Step timings (seconds): commit 6.8, backup 3.9, key restore 0.1, restore
-metadata 0.02, restore objects 2.6, recover 1.3, scrub repair 2.4, verify
-3.0.
+Step timings (seconds): commit 6.8, backup 3.3, key restore 0.1, restore
+metadata 0.0, restore objects 2.6, recover 0.8, scrub repair 2.0, verify
+2.9. `scripts/minio-test.sh test` passed 3/3 against the same MinIO.
+
+## Recording the drill
+
+Each report was recorded into a copy of its own restored database with
+`portal drill record`:
+
+- directory report into the directory deployment: `recovery_ready: true`
+  ("passed against dir:…/offsite; backup lag 47s within RPO 900s");
+- S3 report into the S3 deployment: `recovery_ready: true` (lag 27 s);
+- S3 report into the directory deployment: `recovery_ready: false`
+  ("restore drill target s3:… is not a configured backup target").
+
+A freshly restored database lists its backup target with every object
+pending and the snapshotting job `interrupted`. The snapshot is taken
+before objects are copied, so it cannot record their verification. The
+next `portal backup` re-verifies the objects as identical on the target
+(none are copied again). Until then, lag grows from the restore time. GC
+also refuses to collect deleted generations until the target holds
+verified copies again.
+
+## Earlier runs
+
+The 2026-09-30 runs (`20260930T000508Z` directory, revision `9862462`;
+`20260930T001413Z` S3, revision `c6228e7`) passed with 7.7 s and 4.2 s
+recovery time. They predate the hardening pass and are superseded.
 
 ## What this proves and what it does not
 

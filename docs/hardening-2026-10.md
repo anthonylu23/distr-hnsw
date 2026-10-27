@@ -1,9 +1,10 @@
 # Hardening pass (October 2026)
 
-**Status:** In progress. Opened 2026-10-25 after a full code and
-documentation audit. M1 is **Reopened** and M3 stays **In progress** until
-the items below marked *required* are done and re-verified from a clean,
-committed revision. M2 starts after this pass.
+**Status:** Fixes done and re-verified. Opened 2026-10-25 after a full code
+and documentation audit. Every item below marked *required* is done. The
+drills and benches were re-run from clean commits on 2026-10-27. M1 stays
+**Reopened** and M3 **In progress** until the owner decides on
+re-acceptance and on the open thresholds below. M2 starts after this pass.
 
 ## Why
 
@@ -123,13 +124,14 @@ Engine items deferred, each recorded in the contract:
 
 | Item | Status |
 |---|---|
-| Re-run `scripts/restore-drill.sh` (directory and MinIO) and `scripts/lifecycle-matrix.sh` from a clean committed revision; add GC-then-retire and GC-after-restore orders to the matrix | Matrix extended. Both pass on the uncommitted tree (2026-10-26: matrix 160 files, retire after GC succeeded, stale-restore GC applied 0, acknowledged file intact; restore drill 56/56 verified, 0 resurrected). Canonical runs pending commit (required). |
+| Re-run `scripts/restore-drill.sh` (directory and MinIO) and `scripts/lifecycle-matrix.sh` from a clean committed revision; add GC-then-retire and GC-after-restore orders to the matrix | Done 2026-10-27 from `dc276f3`. Restore drill passed on both targets (56/56 verified, 0 resurrected, recovery 3.9 s and 3.75 s), and both reports were recorded with `portal drill record` (`recovery_ready` true; false for a target the deployment does not use). The matrix passed, including retire after GC and stale-restore GC (0 collected, acknowledged file intact). `scripts/minio-test.sh` passed 3/3. See [m1-restore-drill.md](m1-restore-drill.md) and [m1-lifecycle-matrix.md](m1-lifecycle-matrix.md). |
 | Re-run `scripts/power-loss-drill.sh` (needs sudo) for the changed durable-write paths (re-PUT directory sync, master key write) | Recommended |
-| Re-run the M3 benches from a clean revision; publish p95; decide the 1M × 512 build-throughput threshold openly | Pending commit (required for M3) |
+| Re-run the M3 benches from a clean revision; publish p95; decide the 1M × 512 build-throughput threshold openly | Re-run done 2026-10-27 with `--canonical` from `dc276f3` (nytimes persistence and compaction from `835f055`). p95 is published next to p50 ([bench/README.md](bench/README.md)). The build-throughput threshold and the cosine default ef wait on owner decisions. |
 | Drill reports record `git describe --dirty` (restore, lifecycle, ENOSPC, power loss) | Done |
 | Roadmap, next steps, AGENTS, contracts, and DESIGN (v2.2) brought in line with the code | Done |
 | Architecture overview and deployment guide | Done ([architecture.md](architecture.md), [deployment.md](deployment.md)) |
 | Root README, license texts, security policy, repository metadata | Done (copyright line reads "The distr-hnsw authors"; owner to confirm) |
+| Persistence and compaction benches on nytimes | Fixed in `835f055`. Both benches re-upserted and queried the first 1,000 rows, but nytimes holds 239 zero-norm base rows and 9 zero-norm queries, which the public cosine API rejects (contract §2), so the WAL tail failed and compaction panicked. They now use the first admissible rows and queries and record `queries_evaluated`. These runs had never covered nytimes before. |
 | CI running fmt, clippy, and the non-sudo tests | Open |
 
 ## Open-source hygiene (owner decisions)

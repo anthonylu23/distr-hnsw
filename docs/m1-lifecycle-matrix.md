@@ -1,9 +1,11 @@
 # M1 lifecycle matrix
 
-Status: **passed on `anthonypc` (2026-09-30)**, run `20260930T001138Z`,
-source revision `861baee`. Automated by
+Status: **passed on `anthonypc`, re-run from the clean hardening revision
+`dc276f3` on 2026-10-27** (run `20261027T014148Z`). Automated by
 [`scripts/lifecycle-matrix.sh`](../scripts/lifecycle-matrix.sh); the full
-report stays under `~/distr-hnsw-drill/` (SHA-256 prefix `585b5a344316ed43`).
+report stays under `~/distr-hnsw-drill/` (SHA-256 prefix `7e32162d036d8730`).
+The first run (`20260930T001138Z`, revision `861baee`) predates the
+hardening pass and did not cover the orders in step 5.
 
 This is the large storage, corruption, movement, retirement, and
 garbage-collection evidence the roadmap's M1 "delete, repair, and capacity
@@ -24,25 +26,36 @@ gigabytes of ciphertext.
    observation, then `portal scrub`, `portal gc` (plan), `portal gc --apply`.
    Measure bytes held by the live agents before and after. Sample kept files
    again and confirm every deleted file is unreadable.
+5. Orders the 2026-10-25 audit found broken. (a) Join `agent-5`, drain and
+   retire `agent-4` after GC has applied proofs. (b) Stop an upload after
+   its chunks are durable (`after_chunks_durable` failpoint, which is why the
+   script builds with `--features failpoints`), snapshot the database with
+   `VACUUM INTO`, let the retry commit the file, then replace the database
+   with the snapshot. Run `portal scrub` and `portal gc --apply` with zero
+   retention and grace, then `portal recover --apply`, and download the
+   acknowledged file.
 
 ## Results
 
 | Field | Value |
 |---|---|
-| Corpus | 160 files, 1,863,883,678 bytes, 677 required objects, 3 agents |
+| Corpus | 160 files, 2,073,181,804 bytes, 734 required objects, 3 agents |
 | Faults injected | 24 (8 byte flips, 8 truncations, 8 removals) |
 | Detected by verify scrub | 16 corrupt copies, 8 missing copies (all 24) |
-| Repaired | 24 copies; health after repair 677 durable, 0 degraded / at risk / lost |
+| Repaired | 24 copies; health after repair 734 durable, 0 degraded / at risk / lost |
 | Downloads during and after faults | 24/24 samples match SHA-256 at each of three checkpoints; corrupt bytes were never served |
-| Drain of agent-3 | 677 objects considered, all already redundant on two other domains, 677 placements orphaned, 0 blocked, 0 moves needed |
-| Retirement | agent-3 retired while unreachable; health 677 durable on the remaining agents |
+| Drain of agent-3 | 734 objects considered, all already redundant on two other domains, 734 placements orphaned, 0 blocked, 0 moves needed |
+| Retirement | agent-3 retired while unreachable; health 734 durable on the remaining agents |
 | Replacement | agent-4 joined; no repairs needed because desired placement (two copies) already held |
-| Garbage collection | 40 files deleted; before a new observation every candidate was blocked (177 blocked); after scrub 177 candidates proven and applied, 0 stale, 0 deferred |
-| Space | 3,727,964,052 bytes held before GC, 2,729,931,746 after |
-| Final health | 540 required objects durable; 0 deleted files readable |
+| Garbage collection | 40 files deleted; before a new observation every candidate was blocked (170 blocked); after scrub 170 candidates proven and applied, 0 stale, 0 deferred |
+| Space | 4,146,569,880 bytes held before GC, 3,231,936,242 after |
+| Final health | 604 required objects durable; 0 deleted files readable |
+| Retire after GC | agent-4 drained and retired after proofs were applied (this was refused forever before the fix, H2) |
+| GC after a stale restore | 0 objects collected; the late file's candidate was blocked as an object unknown to the metadata (H1); `recover --apply` blocked 0 files; the acknowledged file downloads intact |
 
-Timings (seconds): commit 37.7, verify scrub 11.7, repair scrub 11.8,
-drain 10.3, retire 5.9, replacement scrub 8.2, GC plan 0.16, GC apply 0.84.
+Timings (seconds): commit 40.3, verify scrub 12.6, repair scrub 12.9,
+drain 11.5, retire 8.2, replacement scrub 9.2, GC plan 0.16, GC apply 0.76,
+retire after GC 6.4.
 
 ## Interpretation
 
@@ -52,6 +65,9 @@ drain 10.3, retire 5.9, replacement scrub 8.2, GC plan 0.16, GC apply 0.84.
   retired incarnation is locked out.
 - Deletion is refused until every active incarnation has observed the
   namespace after the deletion, and then reclaims space through proofs.
+- Collected objects no longer count toward retirement, and a portal running
+  on stale metadata collects nothing while agents hold objects it does not
+  know.
 - The matrix ran on one machine with loopback agents; failure domains are
   logical, not physical, and network partitions are not exercised. That is
   the M1 scope; multi-node fault injection belongs to M4.

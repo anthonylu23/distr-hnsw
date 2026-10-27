@@ -269,9 +269,9 @@ Each slot stores its full-precision `f32` vector and an int8 copy:
 Search runs on the int8 graph with `ef_search`, collects candidates, then
 **rescoring** recomputes the exact `f32` distance for the top
 `max(4·k, 100)` candidates (configurable) and returns the best `k`. The
-returned distance is always the `f32` distance of the returned slot. Pass 4
-measured the recall cost of int8 at no more than 0.0005 on the public sets
-(threshold 0.01; `docs/bench/README.md`), so int8 traversal with rescoring
+returned distance is always the `f32` distance of the returned slot. The
+canonical re-run (2026-10-27) measured the recall cost of int8 at no more
+than 0.0014 on the public sets (threshold 0.01; `docs/bench/README.md`), so int8 traversal with rescoring
 is the default search mode and the `f32` mode remains available for
 diagnosis. If the graph itself ever needs re-quantization, the `f32`
 originals make that a rebuild, not a data loss.
@@ -301,9 +301,9 @@ The defaults live in code, in one place: `HnswParams::for_metric`,
 `hnsw::default_ef_search`, and `PartitionConfig::for_metric`, which the
 portal should use to create collections. `HnswParams::default()` is the
 `l2`/`dot` row. The cosine `ef_search` of 400 clears 0.97 recall on nytimes
-(0.975) but not on glove (0.966; 0.985 at 800), so the default is a recorded
-open decision for the owner (raise it, or accept glove as the hard case), not
-a met threshold.
+(0.974) but not on glove (0.966; 0.974 at 500, 0.985 at 800), so the default
+is a recorded open decision for the owner (raise it, or accept glove as the
+hard case), not a met threshold.
 | neighbour selection | heuristic (HNSW Algorithm 4) with pruned-candidate backfill | |
 | entry point | the slot with the highest level; updated on insert | |
 

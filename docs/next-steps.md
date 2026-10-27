@@ -16,28 +16,27 @@ tracks only the immediate work queue.
 
 ## Hardening pass (now)
 
-1. Blob-plane and engine fixes are in the working tree with regression
-   tests ([hardening-2026-10.md](hardening-2026-10.md)). Review them.
-2. Commit them as scoped commits (blob plane, engine, docs) so the drills
-   and benches below run from a clean tree.
-3. From that clean revision on `anthonypc`:
-   - `scripts/restore-drill.sh` (directory) and
-     `scripts/restore-drill.sh --target s3:…` against MinIO, then
-     `portal drill record` to exercise `recovery_ready`;
-   - `scripts/lifecycle-matrix.sh`, extended with GC-then-retire and
-     GC-after-metadata-restore orders;
+1. Done: fixes committed (`f6381d3` blob plane, `a7e0371` engine) with
+   regression tests ([hardening-2026-10.md](hardening-2026-10.md)).
+2. Done 2026-10-27 from the clean revision `dc276f3`:
+   - the restore drill on the directory and MinIO targets, both recorded
+     with `portal drill record` ([m1-restore-drill.md](m1-restore-drill.md));
+   - the lifecycle matrix with the GC-then-retire and
+     GC-after-metadata-restore orders
+     ([m1-lifecycle-matrix.md](m1-lifecycle-matrix.md));
    - `scripts/minio-test.sh`;
-   - optionally `scripts/power-loss-drill.sh` (sudo) for the changed
-     durable-write paths.
-4. Re-run the M3 benches with `--canonical` from the same clean revision:
-   `oracle`, `hnsw`, int8, `filtered`, `persist`, and `compact` on all three
-   pinned sets. Publish p95 next to p50 and quote ef next to every recall
-   figure. Record two explicit decisions: the 1M × 512 build-throughput
-   threshold, and the cosine default ef (400 gives glove 0.966, below the
-   0.97 target).
-5. Update the evidence documents and the roadmap. Then decide whether to
-   re-accept M1 and accept M3 (owner decision). `project-nomic-512` still
-   waits on the GPU and remains a recorded M3 limitation.
+   - every M3 bench with `--canonical` on all three pinned sets, with p95.
+     nytimes persistence and compaction came from `835f055`, after a bench
+     fix for zero-norm rows ([bench/README.md](bench/README.md)).
+3. Optional: `scripts/power-loss-drill.sh` (sudo, run by the owner) for the
+   changed durable-write paths (re-PUT directory sync, master key write).
+4. Owner decisions:
+   - the cosine default ef: 400 gives glove 0.966, below 0.97; 500 clears
+     both angular sets at about 25% more latency;
+   - the 1M × 512 build-throughput threshold (≥ 5k vectors/s required;
+     3,182 at 100 dims and 1,725 at 256 dims with M = 32);
+   - re-accepting M1 and accepting M3. `project-nomic-512` still waits on
+     the GPU and remains a recorded M3 limitation.
 
 ## After hardening
 

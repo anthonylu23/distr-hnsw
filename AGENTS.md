@@ -119,8 +119,9 @@ blob-plane slice in `docs/roadmap.md`.
 
 **M1 status:** Reopened 2026-10-25 (accepted 2026-09-30). The audit in
 `docs/hardening-2026-10.md` found GC, retirement, backup, and recovery
-defects; the fixes are covered by `tests/hardening.rs` and wait on drill
-re-runs from a clean revision.
+defects; the fixes are covered by `tests/hardening.rs`, and the drills
+passed again from the clean revision `dc276f3` on 2026-10-27. Re-acceptance
+is the owner's decision.
 The blob plane (`crates/distr-hnsw/`) provides the RF2 commit spine, logical
 deletion, recovery, incarnations and observations, scrub/repair, drain,
 retire, capacity admission, proof-based GC, master-key recovery bundles, and
@@ -139,7 +140,10 @@ honor. Large matrices and drills run on
 **M3 status:** In progress. Seven passes completed and the exit review passed
 on 2026-10-01; the 2026-10-25 audit withdrew it (WAL length-field corruption
 read as a torn tail, unreachable inserts after mass deletion, benchmark
-reports without a source revision). The engine (`crates/distr-hnsw-index`)
+reports without a source revision). The fixes are in, and every bench was
+re-run with `--canonical` on 2026-10-27; acceptance waits on owner
+decisions (cosine default ef, the 1M × 512 build-throughput threshold).
+The engine (`crates/distr-hnsw-index`)
 provides flat and int8 vectors, HNSW, filtered search with a measured
 cutover, WAL and snapshots, two-phase compaction, and RAM budget admission;
 `distr-hnsw index archive|restore` moves partition state through the blob
