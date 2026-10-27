@@ -10,8 +10,8 @@ use distr_hnsw::{
 };
 use distr_hnsw_index::{
     hnsw::HnswParams,
-    partition::{Partition, PartitionConfig},
-    Metric,
+    partition::{Partition, PartitionConfig, PartitionError},
+    wal, Metric,
 };
 use tempfile::TempDir;
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -173,4 +173,150 @@ async fn partition_state_round_trips_through_the_blob_plane() {
         restore(&portal, Uuid::new_v4(), &workspace.path().join("none")).await,
         Err(IndexArchiveError::NothingArchived(_))
     ));
+}
+
+fn wal_header(id: Uuid, first_seq: u64) -> Vec<u8> {
+    let mut header = vec![0_u8; wal::HEADER_LEN];
+    header[0..4].copy_from_slice(wal::WAL_MAGIC);
+    header[4..6].copy_from_slice(&wal::WAL_VERSION.to_le_bytes());
+    header[8..24].copy_from_slice(id.as_bytes());
+    header[24..32].copy_from_slice(&first_seq.to_le_bytes());
+    header
+}
+
+/// Split the partition's single WAL segment into one sealed segment holding
+/// the first `sealed` entries and an active one holding the rest, as a
+/// rotation would have.
+fn split_segment(partition_dir: &std::path::Path, id: Uuid, sealed: usize) {
+    let wal_dir = partition_dir.join("wal");
+    let first = wal_dir.join(format!("{:020}.wal", 1));
+    let bytes = std::fs::read(&first).unwrap();
+    let mut at = wal::HEADER_LEN;
+    for _ in 0..sealed {
+        at += 4 + u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    }
+    let next = sealed as u64 + 1;
+    let mut second = wal_header(id, next);
+    second.extend_from_slice(&bytes[at..]);
+    std::fs::write(wal_dir.join(format!("{next:020}.wal")), second).unwrap();
+    std::fs::write(&first, &bytes[..at]).unwrap();
+}
+
+#[tokio::test]
+async fn archive_is_offline_only_reuploads_lost_parts_and_restore_stages() {
+    let agent_a = start_agent("agent-a", "domain-a").await;
+    let agent_b = start_agent("agent-b", "domain-b").await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
+    let workspace = tempfile::tempdir().unwrap();
+    let key_path = workspace.path().join("master.key");
+    MasterKey::create(&key_path).unwrap();
+    let mut portal = Portal::open(
+        &workspace.path().join("portal.sqlite"),
+        MasterKey::load(&key_path).unwrap(),
+        agents,
+    )
+    .unwrap();
+
+    let dims = 8;
+    let partition_dir = workspace.path().join("partition");
+    let partition_id = Uuid::new_v4();
+    let mut partition = Partition::create(
+        &partition_dir,
+        PartitionConfig::for_metric(partition_id, dims, Metric::L2),
+    )
+    .unwrap();
+    for i in 0..60_u32 {
+        partition
+            .upsert(
+                op(i as u64),
+                format!("key-{i}").as_bytes(),
+                &vector(i, dims),
+                b"p",
+            )
+            .unwrap();
+    }
+
+    // A partition that is open (served) cannot be archived.
+    assert!(matches!(
+        archive(&mut portal, &partition_dir, false).await,
+        Err(IndexArchiveError::Partition(PartitionError::Locked(_)))
+    ));
+    drop(partition);
+
+    // Two segments: 1..=40 sealed, 41..=60 active; a snapshot at 60 covers
+    // the sealed one.
+    split_segment(&partition_dir, partition_id, 40);
+    let (mut partition, _) = Partition::open(&partition_dir).unwrap();
+    partition.snapshot().unwrap();
+    let expected = state(&partition, dims);
+    drop(partition);
+
+    let first = archive(&mut portal, &partition_dir, false).await.unwrap();
+    assert_eq!(first.uploaded, 4, "manifest, two segments, snapshot");
+    // The snapshot is committed last.
+    assert_eq!(first.files.last().unwrap().part, ArchivePart::Snapshot);
+
+    // An archived segment deleted from the blob plane is not "unchanged":
+    // it is uploaded again before anything local may be removed.
+    let sealed = first
+        .files
+        .iter()
+        .find(|f| f.name == format!("{:020}.wal", 1))
+        .unwrap()
+        .clone();
+    portal
+        .delete(sealed.file_id, "test:delete-archived-segment")
+        .await
+        .unwrap();
+    assert!(!portal.is_visible(sealed.file_id).unwrap());
+    let second = archive(&mut portal, &partition_dir, true).await.unwrap();
+    let again = second.files.iter().find(|f| f.name == sealed.name).unwrap();
+    assert_eq!(again.status, "uploaded");
+    assert_ne!(again.file_id, sealed.file_id);
+    assert!(portal.is_visible(again.file_id).unwrap());
+    assert_eq!(second.wal_segments_truncated, 1);
+    assert!(!partition_dir.join("wal").join(&sealed.name).exists());
+
+    // Restore picks the newest snapshot and the segments it needs, verifies
+    // them in a staging directory, and publishes the result.
+    let destination = workspace.path().join("restored");
+    let report = restore(&portal, partition_id, &destination).await.unwrap();
+    assert_eq!(report.recovery_high_water, 60);
+    assert!(
+        report.files.iter().all(|f| f.name != sealed.name),
+        "a covered segment is not needed"
+    );
+    let (restored, _) = Partition::open(&destination).unwrap();
+    assert_eq!(state(&restored, dims), expected);
+    drop(restored);
+
+    // A failed restore (here the archived snapshot was deleted from the
+    // blob plane after the segments were downloaded) leaves neither the
+    // destination nor a staging directory behind.
+    let snapshot = second
+        .files
+        .iter()
+        .find(|f| f.part == ArchivePart::Snapshot)
+        .unwrap();
+    portal
+        .delete(snapshot.file_id, "test:delete-archived-snapshot")
+        .await
+        .unwrap();
+    let failed = workspace.path().join("failed");
+    assert!(matches!(
+        restore(&portal, partition_id, &failed).await,
+        Err(IndexArchiveError::Portal(_))
+    ));
+    assert!(!failed.exists());
+    let leftovers = std::fs::read_dir(workspace.path())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".restoring-")
+        })
+        .count();
+    assert_eq!(leftovers, 0);
 }

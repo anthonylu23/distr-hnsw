@@ -13,6 +13,26 @@ file, and the harness refuses a dataset whose bytes do not match.
 | `glove-100-angular` | 1,183,514 | 100 | cosine | 10,000 | 100-NN |
 | `project-nomic-512` | pending (GPU shared) | 512 | cosine | | exact search |
 
+## Provenance and re-run status
+
+Every number below was measured on 2026-09-30 and 2026-10-01 before the
+harness recorded where it came from: 19 of the 20 reports say
+`source_revision: "unknown"`, and the compaction report names `c3f93ce`, a
+commit that predates the compaction code (it was built from an uncommitted
+tree). The figures do match the report files, but the repository cannot show
+which code produced them. The harness now embeds the revision with a dirty
+flag (`build.rs`), the executable's BLAKE3, and the command line in every
+report, and `--canonical` refuses a dirty or unknown build. **Every table here
+is pending a canonical re-run** from the hardening commit; until then treat
+them as indicative.
+
+The hardening pass changed the parallel builder (back-links are merged, not
+overwritten, and level-0 orphans are relinked) and compaction (the rebuild
+runs on its own thread). An ad-hoc check from the uncommitted tree on
+2026-10-25 (sift 1M, M = 16, f32, 2,000 queries) gave 117.9 s and 8,485
+vectors/s with recall 0.958 / 0.988 / 0.997 at ef 50 / 100 / 200, the same as
+pass 3 within noise.
+
 ## Oracle baseline (pass 1, 2026-09-30)
 
 Exact search with the engine's own kernels, `anthonypc` (16 threads, 15 GiB),
@@ -56,8 +76,12 @@ originals stay available for exact rescoring (contract §7).
 
 Defaults adopted from these measurements (contract §8): `M = 16` for L2 and
 dot collections, `M = 32` for cosine collections; `ef_search` defaults to 100
-for L2/dot and 400 for cosine, per-query overridable. Full reports:
-`~/distr-hnsw-bench/reports/hnsw-*.json`.
+for L2/dot and 400 for cosine, per-query overridable. They live in code as
+`HnswParams::for_metric` and `hnsw::default_ef_search` (the bench passes its
+parameters explicitly). The cosine default of 400 clears 0.97 on nytimes
+(0.975) but **not** on glove (0.966); that shortfall is an open decision
+(raise the default, or accept glove as the hard case), not a met threshold.
+Full reports: `~/distr-hnsw-bench/reports/hnsw-*.json`.
 
 ## Int8 traversal with exact rescoring (pass 4, 2026-09-30)
 
@@ -88,17 +112,20 @@ vector shrinks by about four and more of it stays in cache.
 Graph bytes per vector are a function of M alone: about 182 at M = 16 and
 310 at M = 32, close to the contract's `(M0 + M/(ln M − 1)) × 4` estimate
 plus 40 bytes of levels, lengths, and list headers. The int8 copy is
-`dims + 8`. The published hot-set formula adopted for admission (contract
-§11) is therefore
+`dims + 8`. Admission adds 80 bytes of slot and key bookkeeping per vector;
+the published formula is contract §11, quoted here:
 
-    hot_bytes_per_vector = dims + 8 + graph(M),  graph(16) = 182, graph(32) = 310
+    hot_bytes_per_vector = dims + 8 + graph(M) + 80 + payload
+    graph(M) = 54 + 8·M      (182 at M = 16, 310 at M = 32)
 
-which gives 830 bytes at the product's 512 dims with M = 32, against the
-plan's target of 800 (required: a measured, published factor, which this
-is). The f32 originals (`dims × 4`) are not part of the hot set: they are
-read only to rescore 100 candidates per query and are served from the
-memory-mapped snapshot through the page cache (contract §7, §11). Full
-reports: `~/distr-hnsw-bench/reports/hnsw-*-int8.json`.
+At the product's 512 dims with M = 32 that is 910 bytes before payload,
+against the plan's target of 800 (missed by 14%; required, a measured and
+published factor, met). Each partition also holds its idempotency window
+(about 40 bytes per entry, up to 40 MB at the default window). The f32
+originals (`dims × 4`) are not part of the hot set: they are read only to
+rescore 100 candidates per query and are served from the memory-mapped
+snapshot through the page cache (contract §7, §11). Full reports:
+`~/distr-hnsw-bench/reports/hnsw-*-int8.json`.
 
 ## Filtered search (pass 5, 2026-09-30)
 
@@ -153,9 +180,12 @@ bit (int8 traversal with rescoring, 1,000 queries).
 
 Reading:
 
-- Recovery is dominated by hashing the file (BLAKE3 over 0.8 to 0.9 GiB),
-  copying the int8 and graph sections into RAM, and replaying the tail;
-  the f32 originals are mapped, not read. Against the plan's 60 s required
+- Recovery is dominated by hashing the file (BLAKE3 over 0.8 to 0.9 GiB,
+  which reads every byte through the map, originals included), copying the
+  int8 and graph sections into RAM, and replaying the tail; afterwards the
+  f32 originals are served from the map rather than copied. These runs
+  recovered right after writing, from a warm page cache; a cold-cache
+  recovery (fresh process after dropping caches) is still to be measured. Against the plan's 60 s required
   and 20 s target at 1M × 512, 1.8 to 5.4 s at 100 to 128 dims leaves
   ample room: the 512-dim file is about 3 GiB, of which only the int8 copy
   (0.5 GiB) is copied.
@@ -182,7 +212,7 @@ queries, k = 10, ef = 100, int8 traversal with rescoring.
 | Phase | Time | Notes |
 |---|---:|---|
 | 200,000 deletes | 97.0 s | one `fdatasync` per delete (2,060/s); group commit is the known follow-up |
-| `begin_compaction` | 92.8 s | rebuilds 800,000 live slots beside readers and writers (8,600 vectors/s) |
+| `begin_compaction` | 92.8 s | rebuilds 800,000 live slots (8,600 vectors/s); in this run writers were blocked throughout (see below) |
 | `finish_compaction` | 5.21 s | the exclusive section: replay 1,000 caught-up entries, write the 0.62 GiB snapshot, swap |
 
 | Measure | Before | After |
@@ -196,20 +226,32 @@ queries, k = 10, ef = 100, int8 traversal with rescoring.
 
 Reading:
 
-- The blocking window is the finish phase only. At 1M × 128 it is 5.2 s and
-  is dominated by writing the snapshot; the rebuild runs for 93 s without
-  blocking. A scheduler can therefore compact at the 0.2 ratio without a
-  maintenance window.
+- In this run the 1,000 "concurrent" upserts were issued after
+  `begin_compaction` returned, and `begin_compaction(&self)` borrowed the
+  partition for the whole 93 s rebuild, so writers could not have proceeded
+  during it. The claim that compaction needs no maintenance window was
+  therefore not shown. The hardening pass split `begin` into a short capture
+  and an owned rebuild on another thread; the bench now writes during the
+  rebuild and reports `capture_seconds`, `build_seconds`,
+  `upserts_during_build`, and `upsert_max_ms_during_build`. (A 20,000-vector
+  smoke run acknowledged 884 upserts during a 0.42 s rebuild, slowest
+  2.9 ms.) The finish phase remains the exclusive section: 5.2 s at
+  1M × 128, dominated by writing the snapshot.
 - Compaction removes the tombstoned slots from the graph, the int8 store,
-  and the snapshot: resident bytes fall by the live fraction (19%) and p50
-  latency drops by a third because traversal no longer walks dead nodes.
+  and the snapshot, and p50 latency drops by a third because traversal no
+  longer walks dead nodes. The resident figures above include about 512 MB
+  of f32 originals held on the heap after the bulk load and after the
+  rebuild (the snapshot was written but not mapped); every snapshot now
+  maps its originals, so a re-run will report only the hot set.
 - Recall after compaction (0.9905) is marginally below the masked search of
   the uncompacted graph (0.9929): the old graph was built over 1M points and
   masking makes the search visit more candidates, which is also why it is
   slower. Both are above the 0.98 threshold for sift.
-- No deleted key appears in any result after compaction, and every
-  concurrent upsert is present (`caught_up_entries` = 1,000, high-water
-  marks equal), which is the contract's "never loses, never resurrects"
-  line.
+- No deleted key appears in any result after compaction, and the
+  catch-up replayed every concurrent upsert (`caught_up_entries` = 1,000,
+  high-water marks equal). The bench now also looks each concurrent key up
+  after the swap (`concurrent_keys_present`) and computes recall from the
+  dataset row each hit's key names, not from the distance the engine
+  reported (`score_mismatches` must be 0).
 
 Full report: `~/distr-hnsw-bench/reports/compact-sift-128-euclidean.json`.

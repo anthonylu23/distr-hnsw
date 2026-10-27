@@ -25,8 +25,41 @@ use serde::{Deserialize, Serialize};
 #[derive(Parser)]
 #[command(name = "distr-hnsw-bench", version, about)]
 struct Cli {
+    /// Refuse to run unless the harness was built from a clean, known
+    /// revision (required for any result published under `docs/bench/`).
+    #[arg(long, global = true)]
+    canonical: bool,
     #[command(subcommand)]
     command: Command,
+}
+
+/// What produced a report: the source revision embedded at build time
+/// (`<commit>` or `<commit>-dirty`, see `build.rs`), the BLAKE3 of the
+/// executable that ran, and the exact command line.
+#[derive(Clone, Serialize)]
+struct Provenance {
+    source_revision: String,
+    source_dirty: bool,
+    executable_blake3: String,
+    argv: Vec<String>,
+}
+
+fn provenance(canonical: bool) -> anyhow::Result<Provenance> {
+    let source_revision = env!("DISTR_HNSW_REV").to_owned();
+    let source_dirty = source_revision.ends_with("-dirty") || source_revision == "unknown";
+    if canonical && source_dirty {
+        bail!(
+            "--canonical needs a build from a clean, known revision (this one is {source_revision}); commit first"
+        );
+    }
+    let executable = std::env::current_exe().context("locating the executable")?;
+    let executable_blake3 = blake3::hash(&fs::read(&executable)?).to_hex().to_string();
+    Ok(Provenance {
+        source_revision,
+        source_dirty,
+        executable_blake3,
+        argv: std::env::args().collect(),
+    })
 }
 
 #[derive(Subcommand)]
@@ -280,7 +313,8 @@ struct BenchReportV1 {
     batch_queries_per_second: f64,
     batch_threads: usize,
     host: String,
-    source_revision: String,
+    #[serde(flatten)]
+    provenance: Provenance,
 }
 
 #[derive(Serialize)]
@@ -305,7 +339,8 @@ struct HnswReportV1 {
     max_level: u8,
     points: Vec<EfPoint>,
     host: String,
-    source_revision: String,
+    #[serde(flatten)]
+    provenance: Provenance,
 }
 
 #[derive(Serialize)]
@@ -346,9 +381,13 @@ struct PersistReportV1 {
     rss_bytes_after_recovery: u64,
     recall_before: f64,
     recall_after: f64,
+    /// Hits whose reported distance differed from the distance recomputed
+    /// from the dataset row their key names (must be 0).
+    score_mismatches: usize,
     results_identical: bool,
     host: String,
-    source_revision: String,
+    #[serde(flatten)]
+    provenance: Provenance,
 }
 
 #[derive(Serialize)]
@@ -368,9 +407,20 @@ struct CompactReportV1 {
     slots_before: usize,
     slots_after: usize,
     delete_seconds: f64,
+    /// Copying the live state at the rebuild point (writers wait for this).
+    capture_seconds: f64,
+    /// The rebuild on its own thread, which borrows nothing.
+    build_seconds: f64,
+    /// Phase 1 in total (capture plus rebuild), comparable to earlier reports.
     begin_seconds: f64,
+    /// Upserts acknowledged while the rebuild thread was still running.
+    upserts_during_build: usize,
+    /// Slowest single upsert issued during the rebuild.
+    upsert_max_ms_during_build: f64,
     finish_seconds: f64,
     caught_up_entries: u64,
+    /// Concurrent upserts found under their key after compaction.
+    concurrent_keys_present: usize,
     snapshot_bytes_before: u64,
     snapshot_bytes_after: u64,
     resident_bytes_before: usize,
@@ -379,9 +429,11 @@ struct CompactReportV1 {
     query_p50_us_after: f64,
     recall_before: f64,
     recall_after: f64,
+    score_mismatches: usize,
     deleted_keys_returned_after: usize,
     host: String,
-    source_revision: String,
+    #[serde(flatten)]
+    provenance: Provenance,
 }
 
 #[derive(Serialize)]
@@ -402,7 +454,8 @@ struct FilteredReportV1 {
     crossover_allowed: Option<f64>,
     crossover_c: Option<f64>,
     host: String,
-    source_revision: String,
+    #[serde(flatten)]
+    provenance: Provenance,
 }
 
 #[derive(Serialize)]
@@ -448,6 +501,7 @@ fn percentiles(mut samples: Vec<f64>) -> Percentiles {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let provenance = provenance(cli.canonical)?;
     match cli.command {
         Command::Verify { dataset } => {
             let loaded = load(&dataset)?;
@@ -544,9 +598,7 @@ fn main() -> anyhow::Result<()> {
                 batch_queries_per_second: count as f64 / batch_seconds,
                 batch_threads: threads,
                 host: hostname(),
-                source_revision: option_env!("DISTR_HNSW_REV")
-                    .unwrap_or("unknown")
-                    .to_owned(),
+                provenance: provenance.clone(),
             };
             let json = serde_json::to_string_pretty(&report)?;
             if let Some(out) = out {
@@ -651,8 +703,8 @@ fn main() -> anyhow::Result<()> {
                     })
                     .collect()
             };
-            let recall_of = |results: &[Vec<(Vec<u8>, f32)>]| -> f64 {
-                let total: f64 = (0..count)
+            let recall_of = |results: &[Vec<(Vec<u8>, f32)>]| -> (f64, usize) {
+                let (total, mismatched) = (0..count)
                     .map(|q| {
                         let query = loaded.queries.get(q as RecordId).unwrap();
                         let truth = &loaded.groundtruth[q][..k];
@@ -660,20 +712,13 @@ fn main() -> anyhow::Result<()> {
                             .iter()
                             .map(|id| distance(loaded.metric, query, loaded.base.get(*id).unwrap()))
                             .fold(f32::MIN, f32::max);
-                        let hits: Vec<Hit> = results[q]
-                            .iter()
-                            .map(|(_, d)| Hit {
-                                id: 0,
-                                distance: *d,
-                            })
-                            .collect();
-                        recall_by_distance(kth, &hits, k)
+                        verified_recall(&loaded, query, kth, &results[q], k)
                     })
-                    .sum();
-                total / count.max(1) as f64
+                    .fold((0.0, 0), |(r, m), (dr, dm)| (r + dr, m + dm));
+                (total / count.max(1) as f64, mismatched)
             };
             let before = search_all(&partition);
-            let recall_before = recall_of(&before);
+            let (recall_before, mismatched_before) = recall_of(&before);
             drop(partition);
 
             let started = Instant::now();
@@ -681,7 +726,7 @@ fn main() -> anyhow::Result<()> {
             let recovery_seconds = started.elapsed().as_secs_f64();
             let rss = rss_bytes();
             let after = search_all(&recovered);
-            let recall_after = recall_of(&after);
+            let (recall_after, mismatched_after) = recall_of(&after);
             eprintln!(
                 "recovered in {recovery_seconds:.2}s (replayed {}), recall before {recall_before:.4} after {recall_after:.4}",
                 report.wal_entries_replayed
@@ -717,11 +762,10 @@ fn main() -> anyhow::Result<()> {
                 rss_bytes_after_recovery: rss,
                 recall_before,
                 recall_after,
+                score_mismatches: mismatched_before + mismatched_after,
                 results_identical: before == after,
                 host: hostname(),
-                source_revision: option_env!("DISTR_HNSW_REV")
-                    .unwrap_or("unknown")
-                    .to_owned(),
+                provenance: provenance.clone(),
             };
             let json = serde_json::to_string_pretty(&out_report)?;
             if let Some(out) = out {
@@ -816,8 +860,8 @@ fn main() -> anyhow::Result<()> {
                 (results, p50)
             };
             // Ground truth against the surviving base only.
-            let recall_of = |results: &Results| -> f64 {
-                let total: f64 = (0..count)
+            let recall_of = |results: &Results| -> (f64, usize) {
+                let total = (0..count)
                     .into_par_iter()
                     .map(|q| {
                         let query = loaded.queries.get(q as RecordId).unwrap();
@@ -833,20 +877,13 @@ fn main() -> anyhow::Result<()> {
                             .collect();
                         truth.sort_by(|a, b| a.total_cmp(b));
                         let kth = truth[k.min(truth.len()) - 1];
-                        let hits: Vec<Hit> = results[q]
-                            .iter()
-                            .map(|(_, d)| Hit {
-                                id: 0,
-                                distance: *d,
-                            })
-                            .collect();
-                        recall_by_distance(kth, &hits, k)
+                        verified_recall(&loaded, query, kth, &results[q], k)
                     })
-                    .sum();
-                total / count.max(1) as f64
+                    .reduce(|| (0.0, 0), |(r, m), (dr, dm)| (r + dr, m + dm));
+                (total.0 / count.max(1) as f64, total.1)
             };
             let (before, p50_before) = timed_search(&partition);
-            let recall_before = recall_of(&before);
+            let (recall_before, mismatched_before) = recall_of(&before);
             let tombstone_ratio_before = partition.tombstone_ratio();
             let slots_before = partition.slot_count();
             let resident_bytes_before = partition.resident_bytes();
@@ -855,21 +892,40 @@ fn main() -> anyhow::Result<()> {
                 deleted.len()
             );
 
+            // Capture under the writer, rebuild on another thread, and keep
+            // writing from this one while it runs.
             let started = Instant::now();
-            let plan = partition.begin_compaction()?;
-            let begin_seconds = started.elapsed().as_secs_f64();
-            // Writes that land while the rebuild is "in flight".
+            let input = partition.capture_compaction()?;
+            let capture_seconds = started.elapsed().as_secs_f64();
+            let started = Instant::now();
+            let builder = std::thread::spawn(move || {
+                let plan = input.build();
+                (plan, Instant::now())
+            });
+            let mut upserts_during_build = 0;
+            let mut upsert_max_ms_during_build: f64 = 0.0;
             for i in 0..concurrent.min(base_count) {
                 let mut op = [0_u8; 16];
                 op[..8].copy_from_slice(&(i as u64).to_le_bytes());
                 op[8] = 3;
+                let issued = Instant::now();
                 partition.upsert(
                     op,
                     format!("concurrent-{i}").as_bytes(),
                     loaded.base.get(i as RecordId).unwrap(),
                     b"{}",
                 )?;
+                if !builder.is_finished() {
+                    upserts_during_build += 1;
+                    upsert_max_ms_during_build =
+                        upsert_max_ms_during_build.max(issued.elapsed().as_secs_f64() * 1e3);
+                }
             }
+            let (plan, built_at) = builder
+                .join()
+                .map_err(|_| anyhow::anyhow!("compaction rebuild panicked"))?;
+            let build_seconds = built_at.duration_since(started).as_secs_f64();
+            let begin_seconds = capture_seconds + build_seconds;
             let started = Instant::now();
             let report = partition.finish_compaction(plan)?;
             let finish_seconds = started.elapsed().as_secs_f64();
@@ -882,7 +938,14 @@ fn main() -> anyhow::Result<()> {
             let (after, p50_after) = timed_search(&partition);
             // Recall after includes the concurrent upserts as duplicates of
             // live base rows; recall_by_distance tolerates that.
-            let recall_after = recall_of(&after);
+            let (recall_after, mismatched_after) = recall_of(&after);
+            let concurrent_keys_present = (0..concurrent.min(base_count))
+                .filter(|i| {
+                    partition
+                        .slot_for_key(format!("concurrent-{i}").as_bytes())
+                        .is_some()
+                })
+                .count();
             let deleted_keys_returned_after = after
                 .iter()
                 .flatten()
@@ -911,9 +974,14 @@ fn main() -> anyhow::Result<()> {
                 slots_before,
                 slots_after: report.slots_after,
                 delete_seconds,
+                capture_seconds,
+                build_seconds,
+                upserts_during_build,
+                upsert_max_ms_during_build,
                 begin_seconds,
                 finish_seconds,
                 caught_up_entries: report.caught_up_entries,
+                concurrent_keys_present,
                 snapshot_bytes_before,
                 snapshot_bytes_after,
                 resident_bytes_before,
@@ -922,11 +990,10 @@ fn main() -> anyhow::Result<()> {
                 query_p50_us_after: p50_after,
                 recall_before,
                 recall_after,
+                score_mismatches: mismatched_before + mismatched_after,
                 deleted_keys_returned_after,
                 host: hostname(),
-                source_revision: option_env!("DISTR_HNSW_REV")
-                    .unwrap_or("unknown")
-                    .to_owned(),
+                provenance: provenance.clone(),
             };
             let json = serde_json::to_string_pretty(&out_report)?;
             if let Some(out) = out {
@@ -1083,9 +1150,7 @@ fn main() -> anyhow::Result<()> {
                 crossover_allowed: crossover,
                 crossover_c: crossover.map(|x| x / k as f64),
                 host: hostname(),
-                source_revision: option_env!("DISTR_HNSW_REV")
-                    .unwrap_or("unknown")
-                    .to_owned(),
+                provenance: provenance.clone(),
             };
             let json = serde_json::to_string_pretty(&report)?;
             if let Some(out) = out {
@@ -1269,9 +1334,7 @@ fn main() -> anyhow::Result<()> {
                 max_level: index.max_level(),
                 points,
                 host: hostname(),
-                source_revision: option_env!("DISTR_HNSW_REV")
-                    .unwrap_or("unknown")
-                    .to_owned(),
+                provenance: provenance.clone(),
             };
             let json = serde_json::to_string_pretty(&report)?;
             if let Some(out) = out {
@@ -1281,6 +1344,55 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// The base row a partition key names in the persist and compact benches:
+/// bulk keys are the row index as 8 little-endian bytes, appended keys are
+/// `<label>-<row>`.
+fn key_row<'a>(loaded: &'a Dataset, key: &[u8]) -> Option<&'a [f32]> {
+    let row = if let Ok(bytes) = <[u8; 8]>::try_from(key) {
+        u64::from_le_bytes(bytes)
+    } else {
+        std::str::from_utf8(key)
+            .ok()?
+            .rsplit('-')
+            .next()?
+            .parse()
+            .ok()?
+    };
+    loaded.base.get(row)
+}
+
+/// Distance-based recall@k computed from the dataset rather than from the
+/// distances the engine reported: each hit's distance is recomputed from the
+/// row its key names, and a key returned twice counts once. Returns the
+/// recall and the number of hits whose reported distance disagreed with the
+/// recomputed one (a stale or misattributed score).
+fn verified_recall(
+    loaded: &Dataset,
+    query: &[f32],
+    kth: f32,
+    hits: &[(Vec<u8>, f32)],
+    k: usize,
+) -> (f64, usize) {
+    let mut seen = std::collections::HashSet::new();
+    let mut mismatched = 0;
+    let rescored: Vec<Hit> = hits
+        .iter()
+        .filter(|(key, _)| seen.insert(key.clone()))
+        .filter_map(|(key, reported)| {
+            let row = key_row(loaded, key)?;
+            let exact = distance(loaded.metric, query, row);
+            if (exact - reported).abs() > 1e-4 * exact.abs().max(1.0) {
+                mismatched += 1;
+            }
+            Some(Hit {
+                id: 0,
+                distance: exact,
+            })
+        })
+        .collect();
+    (recall_by_distance(kth, &rescored, k), mismatched)
 }
 
 fn rss_bytes() -> u64 {

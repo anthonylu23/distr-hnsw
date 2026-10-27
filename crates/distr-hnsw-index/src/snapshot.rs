@@ -15,6 +15,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
+    fsutil,
     hnsw::{GraphParts, HnswParams, OwnedGraphParts, Slot},
     quant::QuantizedVectors,
     vector::{FlatVectors, MappedRows},
@@ -41,8 +42,8 @@ const SECTION_IDEMPOTENCY: u16 = 7;
 pub struct SlotRecord {
     pub version: u64,
     pub tombstone: bool,
-    /// Index into the keys section; `u32::MAX` for a slot whose key was
-    /// re-pointed by a later upsert (still recorded for history).
+    /// Index into the keys section: the key this version was written for,
+    /// kept after a later upsert tombstones it.
     pub key_index: u32,
     pub payload: Vec<u8>,
 }
@@ -263,7 +264,7 @@ pub fn write_with_hook(
     input: &SnapshotInput<'_>,
     before_rename: &dyn Fn() -> bool,
 ) -> Result<PathBuf, SnapshotError> {
-    fs::create_dir_all(directory)?;
+    fsutil::create_dir_durable(directory)?;
     let bytes = encode(input)?;
     let final_path = directory.join(snapshot_name(input.high_water));
     let temporary = directory.join(format!(".{}.tmp", Uuid::new_v4()));
@@ -279,7 +280,7 @@ pub fn write_with_hook(
             return Err(io::Error::other("snapshot aborted before rename"));
         }
         fs::rename(&temporary, &final_path)?;
-        File::open(directory)?.sync_all()?;
+        fsutil::sync_dir(directory)?;
         Ok::<(), io::Error>(())
     })();
     // A failure leaves the temporary file; open() ignores non-snapshot names.
@@ -316,16 +317,23 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Verify and load a snapshot. `expected_partition` guards against loading
-/// another partition's file.
-pub fn load(path: &Path, expected_partition: Uuid) -> Result<LoadedSnapshot, SnapshotError> {
-    let file = File::open(path)?;
-    let map = Arc::new(unsafe { memmap2::Mmap::map(&file)? });
-    let bytes: &[u8] = &map;
+struct Header {
+    partition_id: Uuid,
+    dims: usize,
+    metric: Metric,
+    high_water: u64,
+    slot_count: usize,
+    key_count: usize,
+    idem_count: usize,
+    section_count: usize,
+    table_offset: usize,
+}
+
+/// Check the header CRC, magic, version, and partition id.
+fn read_header(bytes: &[u8], expected_partition: Uuid) -> Result<Header, SnapshotError> {
     if bytes.len() < HEADER_LEN + FOOTER_LEN {
         return Err(SnapshotError::Malformed("file too short"));
     }
-    // Header.
     let header = &bytes[..HEADER_LEN];
     let crc = u32::from_le_bytes(header[HEADER_LEN - 4..].try_into().expect("4"));
     if crc32c::crc32c(&header[..HEADER_LEN - 4]) != crc {
@@ -365,6 +373,96 @@ pub fn load(path: &Path, expected_partition: Uuid) -> Result<LoadedSnapshot, Sna
     if dims == 0 {
         return Err(SnapshotError::Malformed("dims"));
     }
+    Ok(Header {
+        partition_id,
+        dims,
+        metric,
+        high_water,
+        slot_count,
+        key_count,
+        idem_count,
+        section_count,
+        table_offset,
+    })
+}
+
+/// One section table entry: `(kind, offset, len, blake3 digest)`.
+type SectionEntry<'a> = (u16, usize, usize, &'a [u8]);
+
+/// Bounds-check the section table: `(kind, offset, len, digest)` per entry.
+fn read_table<'a>(
+    bytes: &'a [u8],
+    header: &Header,
+) -> Result<Vec<SectionEntry<'a>>, SnapshotError> {
+    let footer_at = bytes.len() - FOOTER_LEN;
+    let table_end = header
+        .section_count
+        .checked_mul(SECTION_ENTRY_LEN)
+        .and_then(|len| len.checked_add(header.table_offset))
+        .ok_or(SnapshotError::Malformed("section table"))?;
+    if header.table_offset < HEADER_LEN || table_end > footer_at {
+        return Err(SnapshotError::Malformed("section table"));
+    }
+    let mut sections = Vec::with_capacity(header.section_count);
+    for i in 0..header.section_count {
+        let at = header.table_offset + i * SECTION_ENTRY_LEN;
+        let entry = &bytes[at..at + SECTION_ENTRY_LEN];
+        let kind = u16::from_le_bytes(entry[0..2].try_into().expect("2"));
+        let offset = u64::from_le_bytes(entry[4..12].try_into().expect("8")) as usize;
+        let len = u64::from_le_bytes(entry[12..20].try_into().expect("8")) as usize;
+        if offset < table_end || offset.checked_add(len).is_none_or(|end| end > footer_at) {
+            return Err(SnapshotError::Malformed("section bounds"));
+        }
+        sections.push((kind, offset, len, &entry[20..52]));
+    }
+    Ok(sections)
+}
+
+/// Map the `f32` originals of a snapshot this process just wrote, verifying
+/// the header and that section's BLAKE3, so the rows can be served from the
+/// page cache instead of the heap. The rest of the file is not re-hashed.
+pub fn map_vectors(
+    path: &Path,
+    expected_partition: Uuid,
+    dims: usize,
+    slot_count: usize,
+) -> Result<FlatVectors, SnapshotError> {
+    let file = File::open(path)?;
+    let map = Arc::new(unsafe { memmap2::Mmap::map(&file)? });
+    let header = read_header(&map, expected_partition)?;
+    if header.dims != dims || header.slot_count != slot_count {
+        return Err(SnapshotError::Malformed("snapshot shape"));
+    }
+    let (_, offset, len, digest) = read_table(&map, &header)?
+        .into_iter()
+        .find(|s| s.0 == SECTION_VECTORS_F32)
+        .ok_or(SnapshotError::MissingSection(SECTION_VECTORS_F32))?;
+    if len != slot_count * dims * 4 {
+        return Err(SnapshotError::Malformed("f32 section length"));
+    }
+    if blake3::hash(&map[offset..offset + len]).as_bytes() != digest {
+        return Err(SnapshotError::SectionHash(SECTION_VECTORS_F32));
+    }
+    let mapped = MappedRows::new(map.clone(), offset, slot_count, dims)
+        .map_err(|_| SnapshotError::Malformed("f32 section alignment"))?;
+    FlatVectors::from_mapped(dims, mapped).map_err(|_| SnapshotError::Malformed("dims"))
+}
+
+/// Verify and load a snapshot. `expected_partition` guards against loading
+/// another partition's file.
+pub fn load(path: &Path, expected_partition: Uuid) -> Result<LoadedSnapshot, SnapshotError> {
+    let file = File::open(path)?;
+    let map = Arc::new(unsafe { memmap2::Mmap::map(&file)? });
+    let bytes: &[u8] = &map;
+    let header = read_header(bytes, expected_partition)?;
+    let (partition_id, dims, metric, high_water) = (
+        header.partition_id,
+        header.dims,
+        header.metric,
+        header.high_water,
+    );
+    let (slot_count, key_count, idem_count) =
+        (header.slot_count, header.key_count, header.idem_count);
 
     // Footer over everything before it.
     let footer_at = bytes.len() - FOOTER_LEN;
@@ -373,21 +471,8 @@ pub fn load(path: &Path, expected_partition: Uuid) -> Result<LoadedSnapshot, Sna
     }
 
     // Section table and per-section digests.
-    let table_end = table_offset + section_count * SECTION_ENTRY_LEN;
-    if table_offset < HEADER_LEN || table_end > footer_at {
-        return Err(SnapshotError::Malformed("section table"));
-    }
-    let mut sections: Vec<(u16, usize, usize)> = Vec::with_capacity(section_count);
-    for i in 0..section_count {
-        let entry = &bytes
-            [table_offset + i * SECTION_ENTRY_LEN..table_offset + (i + 1) * SECTION_ENTRY_LEN];
-        let kind = u16::from_le_bytes(entry[0..2].try_into().expect("2"));
-        let offset = u64::from_le_bytes(entry[4..12].try_into().expect("8")) as usize;
-        let len = u64::from_le_bytes(entry[12..20].try_into().expect("8")) as usize;
-        let digest = &entry[20..52];
-        if offset < table_end || offset.checked_add(len).is_none_or(|end| end > footer_at) {
-            return Err(SnapshotError::Malformed("section bounds"));
-        }
+    let mut sections: Vec<(u16, usize, usize)> = Vec::with_capacity(header.section_count);
+    for (kind, offset, len, digest) in read_table(bytes, &header)? {
         if blake3::hash(&bytes[offset..offset + len]).as_bytes() != digest {
             return Err(SnapshotError::SectionHash(kind));
         }
@@ -525,16 +610,23 @@ pub fn load(path: &Path, expected_partition: Uuid) -> Result<LoadedSnapshot, Sna
     if !c.0.is_empty() {
         return Err(SnapshotError::Malformed("graph section trailing bytes"));
     }
-    for (slot, &len) in level0_len.iter().enumerate() {
-        if len as usize > params.m0 {
-            return Err(SnapshotError::Malformed("level0 length"));
-        }
-        for &n in &level0[slot * params.m0..slot * params.m0 + len as usize] {
-            if n as usize >= slot_count {
-                return Err(SnapshotError::Malformed("neighbour out of range"));
-            }
-        }
-    }
+    validate_structure(
+        params,
+        slot_count,
+        &keys,
+        &slots,
+        &OwnedGraphRef {
+            levels: &levels,
+            level0: &level0,
+            level0_len: &level0_len,
+            upper: &upper,
+            upper_len: &upper_len,
+            tombstones: &tombstones,
+            tombstone_count,
+            entry,
+            max_level,
+        },
+    )?;
 
     // Idempotency window.
     let mut c = Cursor(section(SECTION_IDEMPOTENCY)?, 0);
@@ -575,6 +667,100 @@ pub fn load(path: &Path, expected_partition: Uuid) -> Result<LoadedSnapshot, Sna
         idempotency,
         file_bytes: bytes.len() as u64,
     })
+}
+
+struct OwnedGraphRef<'a> {
+    levels: &'a [u8],
+    level0: &'a [Slot],
+    level0_len: &'a [u8],
+    upper: &'a [Vec<Slot>],
+    upper_len: &'a [Vec<u8>],
+    tombstones: &'a [u64],
+    tombstone_count: usize,
+    entry: Option<Slot>,
+    max_level: u8,
+}
+
+/// Cross-check every reference a loaded snapshot holds, so a writer bug or
+/// version skew fails closed at open instead of panicking at query time.
+/// The digests already rule out random corruption.
+fn validate_structure(
+    params: HnswParams,
+    slot_count: usize,
+    keys: &[(Vec<u8>, Slot)],
+    slots: &[SlotRecord],
+    g: &OwnedGraphRef<'_>,
+) -> Result<(), SnapshotError> {
+    let in_range = |n: Slot| (n as usize) < slot_count;
+    for (slot, &len) in g.level0_len.iter().enumerate() {
+        if len as usize > params.m0 {
+            return Err(SnapshotError::Malformed("level0 length"));
+        }
+        let start = slot * params.m0;
+        if !g.level0[start..start + len as usize]
+            .iter()
+            .all(|&n| in_range(n))
+        {
+            return Err(SnapshotError::Malformed("neighbour out of range"));
+        }
+    }
+    for slot in 0..slot_count {
+        if g.levels[slot] > 31 {
+            return Err(SnapshotError::Malformed("level"));
+        }
+        for (level, &len) in g.upper_len[slot].iter().enumerate() {
+            if len as usize > params.m {
+                return Err(SnapshotError::Malformed("upper length"));
+            }
+            let start = level * params.m;
+            if !g.upper[slot][start..start + len as usize]
+                .iter()
+                .all(|&n| in_range(n))
+            {
+                return Err(SnapshotError::Malformed("upper neighbour out of range"));
+            }
+        }
+    }
+    match g.entry {
+        Some(entry) if !in_range(entry) || g.levels[entry as usize] != g.max_level => {
+            return Err(SnapshotError::Malformed("entry point"));
+        }
+        None if slot_count != 0 => return Err(SnapshotError::Malformed("entry point")),
+        _ => {}
+    }
+    let mut tombstones = 0;
+    for (slot, record) in slots.iter().enumerate() {
+        let bit = g
+            .tombstones
+            .get(slot >> 6)
+            .is_some_and(|word| word & (1 << (slot & 63)) != 0);
+        if bit != record.tombstone {
+            return Err(SnapshotError::Malformed(
+                "tombstone bitmap disagrees with slots",
+            ));
+        }
+        tombstones += usize::from(record.tombstone);
+        if record.key_index as usize >= keys.len() {
+            return Err(SnapshotError::Malformed("slot key index"));
+        }
+    }
+    if tombstones != g.tombstone_count {
+        return Err(SnapshotError::Malformed("tombstone count"));
+    }
+    for (index, (_, live)) in keys.iter().enumerate() {
+        if *live == u32::MAX {
+            continue;
+        }
+        let record = slots
+            .get(*live as usize)
+            .ok_or(SnapshotError::Malformed("key slot out of range"))?;
+        if record.tombstone || record.key_index as usize != index {
+            return Err(SnapshotError::Malformed(
+                "key points to a slot it does not own",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Snapshot files in a directory, newest high-water mark first.

@@ -27,14 +27,38 @@ pub struct HnswParams {
     pub seed: u64,
 }
 
+/// The `l2`/`dot` defaults. Cosine collections should use
+/// [`HnswParams::for_metric`]: at M = 16 the angular sets miss the recall
+/// threshold (`docs/bench/README.md`, pass 3).
 impl Default for HnswParams {
     fn default() -> Self {
+        Self::for_metric(Metric::L2)
+    }
+}
+
+impl HnswParams {
+    /// Measured defaults per metric (contract §8): M = 16 for `l2` and `dot`,
+    /// M = 32 for `cosine`, M0 = 2·M, `ef_construction` = 200, seed 0.
+    pub const fn for_metric(metric: Metric) -> Self {
+        let m = match metric {
+            Metric::Cosine => 32,
+            Metric::Dot | Metric::L2 => 16,
+        };
         Self {
-            m: 16,
-            m0: 32,
+            m,
+            m0: 2 * m,
             ef_construction: 200,
             seed: 0,
         }
+    }
+}
+
+/// Measured per-metric `ef_search` default (contract §8): 100 for `l2` and
+/// `dot`, 400 for `cosine`.
+pub const fn default_ef_search(metric: Metric) -> usize {
+    match metric {
+        Metric::Cosine => 400,
+        Metric::Dot | Metric::L2 => 100,
     }
 }
 
@@ -140,7 +164,7 @@ impl SearchMode {
     /// Contract default: rescore `max(4k, 100)` candidates.
     pub fn int8_default(k: usize) -> Self {
         Self::Int8 {
-            rescore: (4 * k).max(100),
+            rescore: k.saturating_mul(4).max(100),
         }
     }
 }
@@ -345,9 +369,12 @@ impl Hnsw {
         let mut entries = vec![entry];
         let top = level.min(self.max_level);
         for lc in (0..=top).rev() {
+            // Construction routes through and links to tombstoned slots
+            // (contract §8): excluding them would leave a node inserted after
+            // mass deletion with no neighbours and unreachable.
             let candidates = {
                 let exact = |s: Slot| self.dist(&query, s);
-                self.search_layer(&exact, &entries, self.params.ef_construction, lc, None)
+                self.search_layer(&exact, &entries, self.params.ef_construction, lc, &|_| true)
             };
             let selected = self.select_heuristic(&query, &candidates, self.capacity(lc));
             self.set_neighbours(slot, lc, &selected);
@@ -450,21 +477,20 @@ impl Hnsw {
     }
 
     /// Beam search on one level returning up to `ef` nearest slots that pass
-    /// `allow` (tombstoned slots never pass). All visited slots route.
+    /// `accepts`. Every visited slot routes, accepted or not.
     fn search_layer(
         &self,
         dist: &dyn Fn(Slot) -> f32,
         entries: &[Slot],
         ef: usize,
         level: u8,
-        allow: Option<&dyn Fn(Slot) -> bool>,
+        accepts: &dyn Fn(Slot) -> bool,
     ) -> Vec<Far> {
         SCRATCH.with(|scratch| {
             let mut visited = scratch.borrow_mut();
             visited.reset(self.len());
             let mut candidates: BinaryHeap<Near> = BinaryHeap::new();
             let mut results: BinaryHeap<Far> = BinaryHeap::new();
-            let accepts = |slot: Slot| !self.is_tombstoned(slot) && allow.is_none_or(|f| f(slot));
             for &entry in entries {
                 if !visited.insert(entry) {
                     continue;
@@ -524,6 +550,9 @@ impl Hnsw {
     /// `Int8` mode the graph is traversed with int8 distances and the best
     /// `rescore` candidates are re-scored exactly from the `f32` originals;
     /// every returned distance is the exact distance of the returned slot.
+    /// The query must have the graph's dimensionality (panics otherwise;
+    /// [`Partition::search`](crate::partition::Partition::search) validates
+    /// queries and returns an error instead).
     pub fn search_with(
         &self,
         query: &[f32],
@@ -532,6 +561,7 @@ impl Hnsw {
         mode: SearchMode,
         allow: Option<&dyn Fn(Slot) -> bool>,
     ) -> Vec<Hit> {
+        assert_eq!(query.len(), self.dims(), "query dimensionality");
         let Some(mut entry) = self.entry else {
             return Vec::new();
         };
@@ -558,7 +588,8 @@ impl Hnsw {
             entry = self.greedy_closest(dist, entry, level);
             level -= 1;
         }
-        let candidates = self.search_layer(dist, &[entry], ef, 0, allow);
+        let accepts = |slot: Slot| !self.is_tombstoned(slot) && allow.is_none_or(|f| f(slot));
+        let candidates = self.search_layer(dist, &[entry], ef, 0, &accepts);
         let mut top = TopK::new(k);
         match mode {
             SearchMode::F32 => {
@@ -659,7 +690,7 @@ impl Hnsw {
     pub const FILTER_CUTOVER_PER_EF: u64 = 200;
 
     pub fn filter_cutover(ef: usize) -> u64 {
-        Self::FILTER_CUTOVER_PER_EF * ef.max(1) as u64
+        Self::FILTER_CUTOVER_PER_EF.saturating_mul(ef.max(1) as u64)
     }
 
     /// Filtered search (contract §9). `allowed` holds the slots a query may
@@ -695,6 +726,7 @@ impl Hnsw {
         k: usize,
         allowed: &roaring::RoaringBitmap,
     ) -> Vec<Hit> {
+        assert_eq!(query.len(), self.dims(), "query dimensionality");
         let mut top = TopK::new(k);
         for slot in allowed.iter() {
             if slot as usize >= self.len() || self.is_tombstoned(slot) {
@@ -706,6 +738,18 @@ impl Hnsw {
             });
         }
         top.into_sorted()
+    }
+
+    /// Serve the `f32` originals from `vectors` (the same rows, typically
+    /// mapped from a snapshot just written). Returns false, changing
+    /// nothing, for a store of another shape.
+    #[must_use]
+    pub(crate) fn replace_vectors(&mut self, vectors: FlatVectors) -> bool {
+        if vectors.dims() != self.vectors.dims() || vectors.len() != self.vectors.len() {
+            return false;
+        }
+        self.vectors = vectors;
+        true
     }
 
     /// Accounted bytes split into `(f32 originals, int8 copies, graph and
@@ -943,7 +987,27 @@ impl BuildCore<'_> {
             let candidates = self.search_layer(query, &entries, self.params.ef_construction, lc);
             let capacity = self.links.capacity(lc);
             let selected = self.select_heuristic(&candidates, capacity);
-            *self.links.list(slot, lc).lock() = selected.clone();
+            {
+                // Other threads may already have linked back to this slot
+                // (it is reachable from the levels above). Overwriting the
+                // list would drop those links and can leave a node with no
+                // in-links, unreachable at any ef; merge and prune instead.
+                let mut own = self.links.list(slot, lc).lock();
+                if own.is_empty() {
+                    own.clone_from(&selected);
+                } else {
+                    let mut merged: Vec<Far> = selected
+                        .iter()
+                        .map(|&s| Far(self.dist(query, s), s))
+                        .collect();
+                    for &s in own.iter() {
+                        if !selected.contains(&s) {
+                            merged.push(Far(self.dist(query, s), s));
+                        }
+                    }
+                    *own = self.select_heuristic(&merged, capacity);
+                }
+            }
             for neighbour in selected {
                 let mut list = self.links.list(neighbour, lc).lock();
                 if list.len() < capacity {
@@ -1059,7 +1123,60 @@ impl Hnsw {
         }
         index.entry = Some(entry);
         index.max_level = max_level;
+        index.link_level0_orphans();
         index
+    }
+
+    /// Give every slot without a level-0 in-link one, so no live record is
+    /// unreachable at any `ef`. Concurrent pruning in the parallel builder
+    /// can strand a few slots that sequential insertion would have kept
+    /// linked. Each orphan is appended to the nearest of its own neighbours
+    /// that has room, or replaces that neighbour's farthest link to a slot
+    /// that keeps another in-link, so the repair never creates a new orphan.
+    fn link_level0_orphans(&mut self) {
+        let slots = self.len();
+        let mut in_degree = vec![0_u32; slots];
+        for slot in 0..slots as Slot {
+            for &n in self.neighbours(slot, 0) {
+                in_degree[n as usize] += 1;
+            }
+        }
+        for orphan in 0..slots as Slot {
+            if in_degree[orphan as usize] > 0 || Some(orphan) == self.entry {
+                continue;
+            }
+            let base = self.vectors.get(u64::from(orphan)).expect("slot").to_vec();
+            let mut hosts: Vec<Far> = self
+                .neighbours(orphan, 0)
+                .iter()
+                .map(|&s| Far(self.dist(&base, s), s))
+                .collect();
+            hosts.sort();
+            for Far(_, host) in hosts {
+                let start = host as usize * self.params.m0;
+                let len = self.level0_len[host as usize] as usize;
+                if len < self.params.m0 {
+                    self.level0[start + len] = orphan;
+                    self.level0_len[host as usize] += 1;
+                    in_degree[orphan as usize] += 1;
+                    break;
+                }
+                let host_vector = self.vectors.get(u64::from(host)).expect("slot");
+                let replace = (0..len)
+                    .filter(|&i| in_degree[self.level0[start + i] as usize] > 1)
+                    .max_by(|&a, &b| {
+                        let da = Far(self.dist(host_vector, self.level0[start + a]), 0);
+                        let db = Far(self.dist(host_vector, self.level0[start + b]), 0);
+                        da.cmp(&db).then(b.cmp(&a))
+                    });
+                if let Some(i) = replace {
+                    in_degree[self.level0[start + i] as usize] -= 1;
+                    self.level0[start + i] = orphan;
+                    in_degree[orphan as usize] += 1;
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -1324,6 +1441,101 @@ mod tests {
             "f32 {f32_recall} vs int8 {int8_recall}"
         );
         assert!(index.accounted_bytes() > index.vectors().resident_bytes());
+    }
+
+    #[test]
+    fn parallel_build_leaves_no_node_without_in_links() {
+        let rows: Vec<Vec<f32>> = (0..4000)
+            .map(|i| {
+                (0..12)
+                    .map(|d| ((i * (d + 5)) as f32 * 0.019).sin() + ((i % 7) as f32) * 0.01)
+                    .collect()
+            })
+            .collect();
+        let mut store = FlatVectors::new(12);
+        for row in &rows {
+            store.push(row, Metric::L2).unwrap();
+        }
+        for seed in 0..4 {
+            let params = HnswParams {
+                m: 8,
+                m0: 16,
+                ef_construction: 64,
+                seed,
+            };
+            let index = Hnsw::build_parallel(store.clone(), Metric::L2, params);
+            let mut linked = vec![false; index.len()];
+            for slot in 0..index.len() as Slot {
+                for &n in index.neighbours(slot, 0) {
+                    linked[n as usize] = true;
+                }
+            }
+            linked[index.entry.unwrap() as usize] = true;
+            let orphans = linked.iter().filter(|l| !**l).count();
+            assert_eq!(orphans, 0, "seed {seed}: {orphans} slots unreachable");
+        }
+    }
+
+    #[test]
+    fn inserts_route_through_tombstones_and_stay_findable() {
+        let rows: Vec<Vec<f32>> = (0..3000)
+            .map(|i| {
+                (0..16)
+                    .map(|d| ((i * (d + 3)) as f32 * 0.013).sin())
+                    .collect()
+            })
+            .collect();
+        for keep_one_in in [0_usize, 100] {
+            let mut index = build(16, Metric::L2, &rows[..2700]);
+            for slot in 0..2700_u32 {
+                if keep_one_in == 0 || !(slot as usize).is_multiple_of(keep_one_in) {
+                    index.tombstone(slot);
+                }
+            }
+            let mut unfindable = 0;
+            for row in &rows[2700..] {
+                let slot = index.insert(row).unwrap();
+                assert!(
+                    !index.neighbours(slot, 0).is_empty(),
+                    "a new slot is linked even when every neighbour is tombstoned"
+                );
+            }
+            for (offset, row) in rows[2700..].iter().enumerate() {
+                let slot = 2700 + offset as u64;
+                let hit = index.search(row, 1, 64, None);
+                if hit.first().map(|h| h.id) != Some(slot) {
+                    unfindable += 1;
+                }
+                assert!(hit.iter().all(|h| !index.is_tombstoned(h.id as Slot)));
+            }
+            assert_eq!(unfindable, 0, "keep 1 in {keep_one_in}");
+        }
+    }
+
+    #[test]
+    fn huge_k_and_ef_do_not_overflow_or_preallocate() {
+        let rows: Vec<Vec<f32>> = (0..50).map(|i| vec![i as f32, 1.0]).collect();
+        let index = build(2, Metric::L2, &rows);
+        assert_eq!(
+            index
+                .search(&[3.0, 1.0], usize::MAX, usize::MAX, None)
+                .len(),
+            50
+        );
+        assert_eq!(
+            SearchMode::int8_default(usize::MAX),
+            SearchMode::Int8 {
+                rescore: usize::MAX
+            }
+        );
+        assert_eq!(Hnsw::filter_cutover(usize::MAX), u64::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "query dimensionality")]
+    fn a_short_query_panics_instead_of_truncating() {
+        let rows: Vec<Vec<f32>> = (0..10).map(|i| vec![i as f32, 1.0, 0.5]).collect();
+        build(3, Metric::L2, &rows).search(&[1.0, 2.0], 3, 10, None);
     }
 
     proptest! {

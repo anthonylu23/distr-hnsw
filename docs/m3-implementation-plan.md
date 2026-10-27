@@ -1,13 +1,15 @@
 # M3 implementation plan
 
-Status: **In progress** (passes 1 public part and 2 through 6 done by
-2026-10-01: datasets pinned, oracle and kernels landed, engine contract
-written in [m3-engine-contract.md](m3-engine-contract.md), HNSW core meets
-the f32 recall thresholds, int8 traversal with exact rescoring costs at most
-0.0005 recall, the memory formula is measured, filtered search has a
-measured cutover of 200 · ef, and WAL, snapshots, and recovery pass every
-crash and corruption test with 1.8 s recovery at 1M; results in
-[bench/README.md](bench/README.md)). The milestone scope, acceptance criteria,
+Status: **In progress**. All seven passes were completed on 2026-10-01
+(datasets pinned, oracle and kernels, the engine contract in
+[m3-engine-contract.md](m3-engine-contract.md), HNSW, int8 with exact
+rescoring, filtered search, WAL/snapshot/recovery, compaction, budget, and
+blob-plane archive; results in [bench/README.md](bench/README.md)). The
+2026-10-25 audit found defects in the WAL torn-tail rule, recovery's history
+checks, insertion after mass deletion, the parallel builder, and the
+compaction concurrency claim; the hardening pass fixed them in code and
+tests, and the published benchmark numbers wait on re-runs from a clean,
+committed revision (`--canonical`). The milestone scope, acceptance criteria,
 and exit gate remain in [`roadmap.md`](roadmap.md) (M3). This page fixes the
 order of work and, deliberately, puts the benchmark datasets and the
 brute-force oracle before any engine code: every recall threshold is written
@@ -70,7 +72,7 @@ parameters M = 16, `ef_construction` = 200, `ef_search` chosen per dataset.
 | Filtered recall@10 at 0.1%, 1%, 10%, 50% | ≥ 0.95 at every level | ≥ 0.98 |
 | Query latency, 1M × 512, single thread | p95 ≤ 5 ms | p95 ≤ 2 ms |
 | Build throughput, 1M × 512, 16 threads (parallel bulk build) | ≥ 5k vectors/s | ≥ 20k vectors/s |
-| RAM per vector at 512 dims, int8 | measured overhead factor published; admission uses it | ≤ 800 bytes hot set (measured 830 at M = 32: target missed by 4%, required met) |
+| RAM per vector at 512 dims, int8 | measured overhead factor published; admission uses it | ≤ 800 bytes hot set (910 at M = 32 with the slot and key bookkeeping admission charges, contract §11: target missed by 14%, required met) |
 | Snapshot + WAL-tail recovery, 1M × 512 | ≤ 60 s to serving | ≤ 20 s |
 | WAL fsync path | every acknowledged entry survives `kill -9` at every boundary | same, plus host power loss on the qualified filesystems |
 
@@ -91,17 +93,23 @@ by a documented decision, never by editing after a run.
 - `crates/distr-hnsw-index`: the engine library. No tokio, no network. Modules
   `vector` (flat store, f32 and int8), `distance` (SIMD kernels with scalar
   reference), `oracle` (exact search), `hnsw`, `quant`, `filter` (roaring
-  masks and cutover), `wal`, `snapshot`, `partition` (the state machine that
-  ties them together), `budget` (memory accounting).
+  masks and cutover; filtering lives in `hnsw`), `wal`, `snapshot`,
+  `partition` (the state machine that ties them together, including memory
+  accounting), and `fsutil` (durable directory creation and the partition
+  directory lock).
 - `crates/distr-hnsw-bench`: the harness binary. Loads pinned datasets,
-  runs oracle and engine, writes `BenchReportV1` JSON with source revision,
-  dataset digests, hardware, parameters, recall, latency percentiles, build
-  time, RSS and accounted memory, snapshot bytes, and recovery time. Sanitized
-  summaries go under `docs/bench/`, following the phase-0 discipline.
+  runs oracle and engine, writes `BenchReportV1` JSON with provenance
+  (source revision with a dirty flag embedded by `build.rs`, the BLAKE3 of
+  the executable, and the command line), dataset digests, hardware,
+  parameters, recall, latency percentiles, build time, RSS and accounted
+  memory, snapshot bytes, and recovery time. `--canonical` refuses a dirty or
+  unknown revision; published results must use it. Sanitized summaries go
+  under `docs/bench/`, following the phase-0 discipline.
 - `crates/distr-hnsw` gains `index archive` and `index restore` (pass 7):
   a partition's manifest, newest snapshot, and WAL segments are committed as
   ordinary blob-plane files and recorded in `index_archives` (schema v8);
-  restore downloads them into an empty directory and recovers.
+  restore assembles them in a staging directory, recovers there, and
+  renames the result into place.
 
 ## Passes
 
@@ -154,9 +162,15 @@ updated contract documentation. Estimates are solo-effort scale markers.
    fail closed. Exit: exactly-once replay proven; recovery time measured at
    1M × 512. **Result:** every crash point and corruption case covered by
    tests (in-process crash model: the partition is dropped without a clean
-   close and reopened); recovery 1.8 s on sift 1M and 5.4 s on glove with
-   byte-identical search results; snapshot 821 bytes/vector at 128 dims.
-   The 1M × 512 measurement waits on the project dataset.
+   close and reopened; no process kill or power-loss evidence yet, contract
+   §12); recovery 1.8 s on sift 1M and 5.4 s on glove with byte-identical
+   search results; snapshot 821 bytes/vector at 128 dims. The 1M × 512
+   measurement waits on the project dataset. The 2026-10-25 audit found
+   that a damaged length field mid-log read as a torn tail and discarded
+   acknowledged entries, that a WAL ending below the snapshot or a lost
+   bulk-load snapshot opened successfully, and that the writer kept
+   appending after a failed sync; the hardening pass fixed all four with
+   regression tests (contract §4 rules 3 and 6, §6).
 7. **Compaction, budget, blob-plane archive** (~2 weeks; done in one day).
    Background rebuild with crash points at the swap; concurrent reads and
    writes during compaction; memory accounting from the measured overhead
@@ -164,14 +178,18 @@ updated contract documentation. Estimates are solo-effort scale markers.
    segments archived as blob-plane objects and a partition restored from
    them through the M1 restore path. Exit: the M3 acceptance checklist has
    evidence for every line and the benchmark report is published.
-   **Result:** two-phase compaction (`begin` beside readers and writers,
-   `finish` as a bounded exclusive section that replays the WAL delta and
-   swaps) with a crash point before the swap; writes landing between the
-   phases are caught up and verified; RAM budget admission refuses upserts
-   over `budget − headroom` with a typed error and always admits deletes;
-   `distr-hnsw index archive|restore` round-trips a partition through
-   loopback RF2 agents with byte-identical search results. Compaction
-   measurements are in `docs/bench/README.md`.
+   **Result:** two-phase compaction (`finish` as a bounded exclusive section
+   that replays the WAL delta and swaps) with a crash point before the swap;
+   RAM budget admission refuses upserts over `budget − headroom` with a
+   typed error and always admits deletes; `distr-hnsw index archive|restore`
+   round-trips a partition through loopback RF2 agents with byte-identical
+   search results. Compaction measurements are in `docs/bench/README.md`.
+   The pass-7 evidence issued its "concurrent" writes after `begin`
+   returned, and `begin(&self)` borrowed the partition for the whole
+   rebuild, so writers could not in fact proceed. The hardening pass split
+   `begin` into a short capture and an owned rebuild that runs on another
+   thread, with a multithreaded test and a bench that writes during the
+   rebuild; the published compaction numbers must be re-run with it.
 
 Total: roughly 9 to 10 weeks, consistent with the roadmap's 1 to 2 months
 plus a data-preparation week.
@@ -191,8 +209,8 @@ M2 (Tailscale identity) is independent and can proceed alongside.
 | Metric, ties, upsert, tombstones | pass 3 model-based tests against the oracle |
 | Unfiltered and filtered recall on public and project data | passes 3 to 5 benchmark reports |
 | Int8 plus rescore budget, never a stale score | pass 4 tests and report |
-| WAL survives restart, exactly-once replay | pass 6 failpoint harness |
+| WAL survives restart, exactly-once replay | pass 6 failpoint harness (in-process; process kill and power loss still owed) |
 | Snapshot plus tail reproduces state | pass 6 recovery tests |
 | Corrupt inputs fail closed | pass 6 corruption tests |
-| Compaction never loses or resurrects | pass 7 concurrency and crash tests |
+| Compaction never loses or resurrects | pass 7 crash tests; multithreaded rebuild test from the hardening pass |
 | Hard limits respected | pass 7 budget tests against the measured formula |

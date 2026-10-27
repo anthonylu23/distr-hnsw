@@ -41,7 +41,9 @@ impl TopK {
     pub fn new(k: usize) -> Self {
         Self {
             k,
-            heap: BinaryHeap::with_capacity(k + 1),
+            // Sized for typical k; a huge k grows on demand instead of
+            // reserving memory for hits that may never exist.
+            heap: BinaryHeap::with_capacity(k.min(1024) + 1),
         }
     }
 

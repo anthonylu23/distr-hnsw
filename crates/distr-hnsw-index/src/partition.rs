@@ -4,7 +4,8 @@
 //!
 //! Every mutation is one WAL entry: appended, synced, then applied, and only
 //! then acknowledged. Recovery loads the newest verifiable snapshot and
-//! replays the WAL tail exactly once in order.
+//! replays the WAL tail exactly once in order. An open partition holds an
+//! exclusive lock on its directory.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -19,7 +20,8 @@ use uuid::Uuid;
 
 use crate::{
     distance::normalize,
-    hnsw::{Hnsw, HnswParams, SearchMode, Slot},
+    fsutil::{self, PartitionLock},
+    hnsw::{default_ef_search, Hnsw, HnswParams, SearchMode, Slot},
     quant::QuantizedVectors,
     snapshot::{self, LoadedSnapshot, SlotRecord, SnapshotError, SnapshotInput},
     vector::VectorError,
@@ -31,6 +33,10 @@ const MANIFEST_NAME: &str = "partition.json";
 const WAL_DIR: &str = "wal";
 const SNAP_DIR: &str = "snap";
 pub const DEFAULT_IDEMPOTENCY_WINDOW: usize = 1_000_000;
+/// Largest `k` a search accepts (contract §3).
+pub const MAX_K: usize = 10_000;
+/// Largest `ef_search` or `ef_construction` a partition accepts.
+pub const MAX_EF: usize = 100_000;
 
 /// Static configuration persisted in `partition.json` at creation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -52,6 +58,15 @@ pub struct PartitionConfig {
     /// Tombstone ratio at which compaction is recommended (contract §10).
     #[serde(default = "default_compaction_ratio")]
     pub compaction_tombstone_ratio: f64,
+    /// Per-collection `ef_search` default; `None` = the metric's measured
+    /// default ([`default_ef_search`]).
+    #[serde(default)]
+    pub ef_search: Option<usize>,
+    /// History begins with a snapshot that is not in the WAL (a bulk load).
+    /// Such a partition refuses to open without a verifiable snapshot, since
+    /// the WAL alone cannot reproduce it (contract §6).
+    #[serde(default)]
+    pub base_snapshot: bool,
 }
 
 fn default_headroom() -> f64 {
@@ -76,14 +91,79 @@ impl PartitionConfig {
             ram_budget_bytes: None,
             headroom_fraction: default_headroom(),
             compaction_tombstone_ratio: default_compaction_ratio(),
+            ef_search: None,
+            base_snapshot: false,
         }
     }
 
+    /// The measured per-metric defaults (contract §8): `M` and `ef_search`
+    /// from [`HnswParams::for_metric`] and [`default_ef_search`], with the
+    /// level seed derived from the partition id so partitions do not share
+    /// level sequences.
+    pub fn for_metric(id: Uuid, dims: usize, metric: Metric) -> Self {
+        let mut params = HnswParams::for_metric(metric);
+        params.seed = u64::from_le_bytes(id.as_bytes()[..8].try_into().expect("8"));
+        Self::new(id, dims, metric, params)
+    }
+
+    /// The `ef_search` used when a query does not choose one.
+    pub fn ef_search(&self) -> usize {
+        self.ef_search.unwrap_or_else(|| {
+            self.metric()
+                .map(default_ef_search)
+                .unwrap_or(default_ef_search(Metric::L2))
+        })
+    }
+
+    /// Reject configurations the formats or the graph cannot represent:
+    /// list lengths are stored as `u8`, the WAL caps dims, and `M` must be at
+    /// least 2 for the level distribution to be finite.
+    pub fn validate(&self) -> Result<(), PartitionError> {
+        self.metric()?;
+        if self.dims == 0 || self.dims > wal::MAX_DIMS {
+            return Err(PartitionError::Manifest("dims must be between 1 and 65536"));
+        }
+        if !(2..=255).contains(&self.m) {
+            return Err(PartitionError::Manifest("m must be between 2 and 255"));
+        }
+        if self.m0 < self.m || self.m0 > 255 {
+            return Err(PartitionError::Manifest("m0 must be between m and 255"));
+        }
+        if self.ef_construction == 0 || self.ef_construction > MAX_EF {
+            return Err(PartitionError::Manifest(
+                "ef_construction must be between 1 and 100000",
+            ));
+        }
+        if self.ef_search.is_some_and(|ef| ef == 0 || ef > MAX_EF) {
+            return Err(PartitionError::Manifest(
+                "ef_search must be between 1 and 100000",
+            ));
+        }
+        if self.idempotency_window == 0 {
+            return Err(PartitionError::Manifest(
+                "idempotency window must be positive",
+            ));
+        }
+        if !(0.0..=0.9).contains(&self.headroom_fraction) {
+            return Err(PartitionError::Manifest(
+                "headroom fraction must be between 0 and 0.9",
+            ));
+        }
+        if !(self.compaction_tombstone_ratio > 0.0 && self.compaction_tombstone_ratio <= 1.0) {
+            return Err(PartitionError::Manifest(
+                "compaction tombstone ratio must be in (0, 1]",
+            ));
+        }
+        Ok(())
+    }
+
     /// Bytes an upsert of one vector with `payload_len` bytes adds to the
-    /// hot set under the measured model (`docs/bench/README.md`): int8 copy
-    /// and scalars, graph links for this M, slot and key bookkeeping.
+    /// hot set under the published model (contract §11): int8 copy and
+    /// scalars, graph links for this M, slot and key bookkeeping. `graph(M)`
+    /// is the line through the two measured points, 182 bytes at M = 16 and
+    /// 310 at M = 32 (`docs/bench/README.md`).
     pub fn hot_bytes_per_insert(&self, payload_len: usize) -> usize {
-        let graph = if self.m <= 16 { 182 } else { 310 };
+        let graph = 54 + 8 * self.m;
         self.dims + 8 + graph + 80 + payload_len
     }
 
@@ -103,7 +183,8 @@ impl PartitionConfig {
 
 /// Named crash boundaries (contract §12). The partition returns
 /// [`PartitionError::Injected`] at the boundary; dropping it and reopening
-/// the directory models the crash.
+/// the directory models the crash. A failpoint between the WAL append and
+/// the apply poisons the writer, as a real failure there would.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failpoint {
     AfterWalAppend,
@@ -116,7 +197,58 @@ pub enum Failpoint {
     CompactionBeforeSwap,
 }
 
-/// The frozen rebuild produced by [`Partition::begin_compaction`].
+/// Live state captured at the rebuild point by
+/// [`Partition::capture_compaction`]. It owns copies of everything the
+/// rebuild needs and borrows nothing, so [`build`](Self::build) can run on
+/// another thread while the partition keeps serving reads and writes.
+pub struct CompactionInput {
+    rebuild_point: u64,
+    metric: Metric,
+    params: HnswParams,
+    vectors: crate::vector::FlatVectors,
+    /// Old slot of each new slot, in slot order.
+    old_slots: Vec<Slot>,
+    slots: Vec<SlotRecord>,
+    key_table: Vec<Vec<u8>>,
+    keys: HashMap<Vec<u8>, (u32, Option<Slot>)>,
+    idempotency: Vec<([u8; 16], u64)>,
+}
+
+impl CompactionInput {
+    pub fn rebuild_point(&self) -> u64 {
+        self.rebuild_point
+    }
+
+    /// Phase 1b: rebuild the graph over the captured live slots. This is
+    /// the long part of compaction and touches no partition state.
+    pub fn build(self) -> CompactionPlan {
+        let old_to_new: HashMap<Slot, Slot> = self
+            .old_slots
+            .iter()
+            .enumerate()
+            .map(|(new, old)| (*old, new as Slot))
+            .collect();
+        let index = Hnsw::build_parallel(self.vectors, self.metric, self.params);
+        let keys = self
+            .keys
+            .into_iter()
+            .map(|(key, (index_in_table, live))| {
+                let live = live.and_then(|old| old_to_new.get(&old).copied());
+                (key, (index_in_table, live))
+            })
+            .collect();
+        CompactionPlan {
+            rebuild_point: self.rebuild_point,
+            index,
+            key_table: self.key_table,
+            keys,
+            slots: self.slots,
+            idempotency: self.idempotency,
+        }
+    }
+}
+
+/// The frozen rebuild produced by [`CompactionInput::build`].
 pub struct CompactionPlan {
     rebuild_point: u64,
     index: Hnsw,
@@ -159,9 +291,10 @@ pub struct SearchHit {
     pub slot: Slot,
 }
 
-/// What `open` found and did.
+/// What `open` (or `inspect`) found and did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
+    pub partition_id: Uuid,
     pub snapshot_used: Option<PathBuf>,
     pub snapshot_high_water: u64,
     pub snapshots_rejected: Vec<(PathBuf, String)>,
@@ -169,6 +302,8 @@ pub struct RecoveryReport {
     pub wal_entries_replayed: u64,
     pub wal_entries_skipped: u64,
     pub torn_tails_truncated: Vec<(PathBuf, u64)>,
+    /// A torn tail found by [`Partition::inspect`], which repairs nothing.
+    pub torn_tail_found: Option<(PathBuf, u64)>,
     pub high_water: u64,
 }
 
@@ -226,26 +361,35 @@ pub struct Partition {
     high_water: u64,
     snapshot_high_water: u64,
     failpoint: Option<Failpoint>,
+    /// Held while the partition is open; `None` only for the staged state
+    /// inside `finish_compaction` and during recovery.
+    lock: Option<PartitionLock>,
 }
 
 impl Partition {
     /// Create an empty partition directory. Fails if the directory already
     /// holds a manifest.
     pub fn create(directory: &Path, config: PartitionConfig) -> Result<Self, PartitionError> {
-        fs::create_dir_all(directory)?;
+        config.validate()?;
+        let metric = config.metric()?;
+        fsutil::create_dir_durable(directory)?;
+        let lock = Self::lock(directory)?;
         let manifest = directory.join(MANIFEST_NAME);
         if manifest.exists() {
             return Err(PartitionError::AlreadyExists(directory.to_owned()));
         }
-        let metric = config.metric()?;
-        if config.dims == 0 {
-            return Err(PartitionError::Manifest("dims must be positive"));
+        // Both subdirectories exist before the directory sync that makes the
+        // manifest durable, so neither entry can be lost after creation.
+        for sub in [WAL_DIR, SNAP_DIR] {
+            if !directory.join(sub).is_dir() {
+                fs::create_dir(directory.join(sub))?;
+            }
         }
         let temporary = directory.join(format!(".{MANIFEST_NAME}.tmp"));
         fs::write(&temporary, serde_json::to_vec_pretty(&config)?)?;
         fs::File::open(&temporary)?.sync_all()?;
         fs::rename(&temporary, &manifest)?;
-        fs::File::open(directory)?.sync_all()?;
+        fsutil::sync_dir(directory)?;
         let wal = WalWriter::open(&directory.join(WAL_DIR), config.id, 0)?;
         Ok(Self {
             directory: directory.to_owned(),
@@ -258,22 +402,33 @@ impl Partition {
             high_water: 0,
             snapshot_high_water: 0,
             failpoint: None,
+            lock: Some(lock),
             metric,
             config,
         })
+    }
+
+    /// Take the exclusive directory lock, failing with
+    /// [`PartitionError::Locked`] when another owner holds it.
+    pub fn lock(directory: &Path) -> Result<PartitionLock, PartitionError> {
+        PartitionLock::try_acquire(directory)?
+            .ok_or_else(|| PartitionError::Locked(directory.to_owned()))
     }
 
     /// Create a partition from a fixed set of vectors using the parallel
     /// bulk builder (contract §8, "Bulk build") and persist it as a snapshot
     /// at high-water mark 0. Keys are supplied per row; payloads are empty.
     /// Used for bulk loads and benchmarks; ordinary writes go through
-    /// [`upsert`](Self::upsert).
+    /// [`upsert`](Self::upsert). The manifest records that history starts
+    /// with this snapshot (`base_snapshot`), so the partition fails closed if
+    /// it is ever lost, including when the load itself is interrupted.
     pub fn bulk_load(
         directory: &Path,
-        config: PartitionConfig,
+        mut config: PartitionConfig,
         vectors: crate::vector::FlatVectors,
         keys: impl Iterator<Item = Vec<u8>>,
     ) -> Result<(Self, PathBuf), PartitionError> {
+        config.base_snapshot = true;
         let mut partition = Self::create(directory, config)?;
         if vectors.dims() != partition.config.dims {
             return Err(PartitionError::Vector(VectorError::WrongDims {
@@ -312,12 +467,43 @@ impl Partition {
         Ok((partition, path))
     }
 
-    /// Recover a partition from its directory (contract §6).
+    /// Recover a partition from its directory (contract §6) and open it for
+    /// writes. The directory lock is held until the partition is dropped.
+    /// A torn tail is truncated only after the whole log has been validated.
     pub fn open(directory: &Path) -> Result<(Self, RecoveryReport), PartitionError> {
+        let lock = Self::lock(directory)?;
+        let (mut partition, mut report) = Self::recover(directory)?;
+        if let Some((path, offset)) = report.torn_tail_found.take() {
+            wal::truncate_torn_tail(&path, offset)?;
+            report.torn_tails_truncated.push((path, offset));
+        }
+        partition.wal = Some(WalWriter::open(
+            &directory.join(WAL_DIR),
+            partition.config.id,
+            partition.high_water,
+        )?);
+        partition.lock = Some(lock);
+        Ok((partition, report))
+    }
+
+    /// Verify a partition without changing it: the full recovery (snapshot
+    /// verification, WAL validation, replay into memory) runs, but nothing
+    /// is repaired and no writer is opened. The caller holds the directory
+    /// lock, so nothing can be appending meanwhile.
+    pub fn inspect(lock: &PartitionLock) -> Result<RecoveryReport, PartitionError> {
+        let (_, report) = Self::recover(lock.directory())?;
+        Ok(report)
+    }
+
+    fn recover(directory: &Path) -> Result<(Self, RecoveryReport), PartitionError> {
         let config: PartitionConfig =
             serde_json::from_slice(&fs::read(directory.join(MANIFEST_NAME))?)?;
+        config.validate()?;
         let metric = config.metric()?;
-        let mut report = RecoveryReport::default();
+        let mut report = RecoveryReport {
+            partition_id: config.id,
+            ..RecoveryReport::default()
+        };
 
         // Newest verifiable snapshot.
         let mut loaded: Option<LoadedSnapshot> = None;
@@ -330,11 +516,21 @@ impl Partition {
                 Err(error) => report.snapshots_rejected.push((path, error.to_string())),
             }
         }
+        if loaded.is_none() && config.base_snapshot {
+            return Err(PartitionError::BaseSnapshotUnavailable {
+                rejected: report.snapshots_rejected.len(),
+            });
+        }
 
-        let (mut index, key_table, keys, slots, idempotency, high_water) = match loaded {
+        let (index, key_table, keys, slots, idempotency, high_water) = match loaded {
             Some(snapshot) => {
                 if snapshot.dims != config.dims || snapshot.metric != metric {
                     return Err(PartitionError::Manifest("snapshot disagrees with manifest"));
+                }
+                if snapshot.params != config.params() {
+                    return Err(PartitionError::Manifest(
+                        "snapshot graph parameters disagree with manifest",
+                    ));
                 }
                 report.snapshot_used = Some(snapshot.path.clone());
                 report.snapshot_high_water = snapshot.high_water;
@@ -379,7 +575,7 @@ impl Partition {
         };
         let mut partition = Self {
             directory: directory.to_owned(),
-            index: std::mem::replace(&mut index, Hnsw::new(1, metric, config.params())),
+            index,
             key_table,
             keys,
             slots,
@@ -388,26 +584,34 @@ impl Partition {
             high_water,
             snapshot_high_water: high_water,
             failpoint: None,
+            lock: None,
             metric,
             config: config.clone(),
         };
-        drop(index);
 
-        // Replay the WAL tail exactly once, in order.
+        // Validate every segment before anything is repaired, and replay the
+        // tail exactly once, in order. Only the newest segment may end in a
+        // torn tail.
         let segments = wal::list_segments(&directory.join(WAL_DIR))?;
-        // A snapshot without any WAL segment reaching its high-water mark
-        // cannot prove that nothing followed it; only an empty partition may
+        // A snapshot cannot prove that nothing followed it unless the WAL
+        // continues from it: some segment must start at or before the next
+        // sequence and the log must reach the snapshot's high-water mark.
+        // Only an empty partition (or a bulk base with no writes yet) may
         // have no history at all.
         let mut saw_history = partition.high_water == 0 && segments.is_empty();
-        for (first_seq, path) in &segments {
+        let mut wal_end: Option<u64> = None;
+        let newest = segments.len().saturating_sub(1);
+        for (position, (first_seq, path)) in segments.iter().enumerate() {
             report.wal_segments_read += 1;
-            let read = wal::read_segment(path, config.id, true)?;
+            let read = wal::read_segment(path, config.id, position == newest)?;
             if let Some((offset, _)) = read.torn_tail {
-                report.torn_tails_truncated.push((path.clone(), offset));
+                report.torn_tail_found = Some((path.clone(), offset));
             }
             if *first_seq <= partition.high_water + 1 {
                 saw_history = true;
             }
+            let end = read.last_seq().unwrap_or(first_seq.saturating_sub(1));
+            wal_end = Some(wal_end.map_or(end, |seen| seen.max(end)));
             for entry in read.entries {
                 if entry.seq <= partition.high_water {
                     report.wal_entries_skipped += 1;
@@ -424,18 +628,12 @@ impl Partition {
                 report.wal_entries_replayed += 1;
             }
         }
-        if !saw_history {
+        if !saw_history || wal_end.is_some_and(|end| end < report.snapshot_high_water) {
             return Err(PartitionError::MissingHistory {
-                snapshot_high_water: partition.high_water,
+                snapshot_high_water: report.snapshot_high_water,
                 first_wal_seq: segments.first().map(|s| s.0),
             });
         }
-        // Reposition the writer after the recovered high-water mark.
-        partition.wal = Some(WalWriter::open(
-            &directory.join(WAL_DIR),
-            config.id,
-            partition.high_water,
-        )?);
         report.high_water = partition.high_water;
         Ok((partition, report))
     }
@@ -589,16 +787,17 @@ impl Partition {
         self.tombstone_ratio() >= self.config.compaction_tombstone_ratio
     }
 
-    /// Phase 1 of compaction (contract §10): freeze the rebuild point and
-    /// build a new state from the live slots in slot order, preserving
-    /// relative order so ties resolve as before. Takes `&self`, so reads and
-    /// (behind an outer lock) writes may proceed while this runs.
-    pub fn begin_compaction(&self) -> Result<CompactionPlan, PartitionError> {
-        let rebuild_point = self.high_water;
-        let mut live_vectors =
-            crate::vector::FlatVectors::with_capacity(self.config.dims, self.index.live_len());
-        let mut slot_records = Vec::with_capacity(self.index.live_len());
-        let mut old_to_new: HashMap<Slot, Slot> = HashMap::with_capacity(self.index.live_len());
+    /// Phase 1a of compaction (contract §10): freeze the rebuild point and
+    /// copy the live slots, in slot order, with the key table and the
+    /// idempotency window. This is the only part of phase 1 that borrows the
+    /// partition (a memory copy of the live rows); the rebuild itself runs in
+    /// [`CompactionInput::build`], which owns its inputs, so a caller that
+    /// keeps the partition behind a lock releases it for the rebuild.
+    pub fn capture_compaction(&self) -> Result<CompactionInput, PartitionError> {
+        let live = self.index.live_len();
+        let mut vectors = crate::vector::FlatVectors::with_capacity(self.config.dims, live);
+        let mut slots = Vec::with_capacity(live);
+        let mut old_slots = Vec::with_capacity(live);
         for (old_slot, record) in self.slots.iter().enumerate() {
             if record.tombstone {
                 continue;
@@ -609,24 +808,28 @@ impl Partition {
                 .get(old_slot as u64)
                 .ok_or(PartitionError::Manifest("slot without vector"))?;
             // Rows are already normalized; store as given.
-            let new_slot = live_vectors.push(row, Metric::L2)? as Slot;
-            old_to_new.insert(old_slot as Slot, new_slot);
-            slot_records.push(record.clone());
+            vectors.push(row, Metric::L2)?;
+            old_slots.push(old_slot as Slot);
+            slots.push(record.clone());
         }
-        let index = Hnsw::build_parallel(live_vectors, self.metric, self.config.params());
-        let mut keys = HashMap::with_capacity(self.keys.len());
-        for (key, (index_in_table, live)) in &self.keys {
-            let live = live.and_then(|old| old_to_new.get(&old).copied());
-            keys.insert(key.clone(), (*index_in_table, live));
-        }
-        Ok(CompactionPlan {
-            rebuild_point,
-            index,
+        Ok(CompactionInput {
+            rebuild_point: self.high_water,
+            metric: self.metric,
+            params: self.config.params(),
+            vectors,
+            old_slots,
+            slots,
             key_table: self.key_table.clone(),
-            keys,
-            slots: slot_records,
+            keys: self.keys.clone(),
             idempotency: self.idempotency.entries(),
         })
+    }
+
+    /// Phase 1 in one call: [`capture_compaction`](Self::capture_compaction)
+    /// then [`CompactionInput::build`]. Holding `&self` for the whole rebuild,
+    /// it blocks writers for that long; use the two steps to avoid that.
+    pub fn begin_compaction(&self) -> Result<CompactionPlan, PartitionError> {
+        Ok(self.capture_compaction()?.build())
     }
 
     /// Phase 2 of compaction: apply every entry acknowledged after the
@@ -659,17 +862,20 @@ impl Partition {
             high_water: rebuild_point,
             snapshot_high_water: self.snapshot_high_water,
             failpoint: None,
+            lock: None,
         };
         for (op_id, seq) in idempotency {
             staged.idempotency.record(op_id, seq);
         }
         // Catch up from the durable log: every entry after the rebuild point.
         let mut replayed = 0_u64;
-        for (first_seq, path) in wal::list_segments(&self.directory.join(WAL_DIR))? {
+        let segments = wal::list_segments(&self.directory.join(WAL_DIR))?;
+        let newest = segments.len().saturating_sub(1);
+        for (position, (first_seq, path)) in segments.into_iter().enumerate() {
             if first_seq > self.high_water {
                 continue;
             }
-            let read = wal::read_segment(&path, self.config.id, false)?;
+            let read = wal::read_segment(&path, self.config.id, position == newest)?;
             for entry in read.entries {
                 if entry.seq <= rebuild_point || entry.seq > self.high_water {
                     continue;
@@ -717,6 +923,28 @@ impl Partition {
             .as_mut()
             .expect("writer is open after recovery")
             .append_unsynced(op_id, operation.clone())?;
+        // From here the log may hold an entry the in-memory state lacks. Any
+        // early exit poisons the writer, so no later entry is applied or
+        // logged behind it until a reopen replays the log.
+        if let Err(error) = self.sync_and_apply(seq, op_id, operation) {
+            if let Some(wal) = self.wal.as_mut() {
+                wal.poison();
+            }
+            return Err(error);
+        }
+        self.hit(Failpoint::AfterApply)?;
+        Ok(Applied {
+            seq,
+            deduplicated: false,
+        })
+    }
+
+    fn sync_and_apply(
+        &mut self,
+        seq: u64,
+        op_id: [u8; 16],
+        operation: Operation,
+    ) -> Result<(), PartitionError> {
         self.hit(Failpoint::AfterWalAppend)?;
         self.wal
             .as_mut()
@@ -727,11 +955,6 @@ impl Partition {
             seq,
             op_id,
             operation,
-        })?;
-        self.hit(Failpoint::AfterApply)?;
-        Ok(Applied {
-            seq,
-            deduplicated: false,
         })
     }
 
@@ -785,7 +1008,9 @@ impl Partition {
     }
 
     /// Approximate top-k over live records with the default int8 mode and,
-    /// if given, a filter over slots (contract §9 cutover applies).
+    /// if given, a filter over slots (contract §9 cutover applies). Slots
+    /// are internal and change on upsert and compaction, so a filter is only
+    /// meaningful against the state it was computed from.
     pub fn search(
         &self,
         query: &[f32],
@@ -798,6 +1023,23 @@ impl Partition {
                 expected: self.config.dims,
                 actual: query.len(),
             }));
+        }
+        if query.iter().any(|v| !v.is_finite()) {
+            return Err(PartitionError::Vector(VectorError::NonFinite));
+        }
+        if k > MAX_K {
+            return Err(PartitionError::QueryLimit {
+                what: "k",
+                value: k,
+                max: MAX_K,
+            });
+        }
+        if ef > MAX_EF {
+            return Err(PartitionError::QueryLimit {
+                what: "ef",
+                value: ef,
+                max: MAX_EF,
+            });
         }
         let mut q = query.to_vec();
         if self.metric.normalizes() && !normalize(&mut q) {
@@ -826,7 +1068,20 @@ impl Partition {
             .collect())
     }
 
-    /// Write a snapshot at the current high-water mark (contract §5).
+    /// [`search`](Self::search) with the collection's `ef_search` default.
+    pub fn search_default(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<&RoaringBitmap>,
+    ) -> Result<Vec<SearchHit>, PartitionError> {
+        self.search(query, k, self.config.ef_search(), filter)
+    }
+
+    /// Write a snapshot at the current high-water mark (contract §5), then
+    /// serve the `f32` originals from it, so rows appended since the last
+    /// snapshot (or copied by a bulk load or compaction) leave the heap
+    /// (contract §7, §11).
     pub fn snapshot(&mut self) -> Result<PathBuf, PartitionError> {
         let keys: Vec<(Vec<u8>, Slot)> = self
             .key_table
@@ -853,6 +1108,13 @@ impl Partition {
         let abort = self.failpoint == Some(Failpoint::SnapshotBeforeRename);
         let path = snapshot::write_with_hook(&self.directory.join(SNAP_DIR), &input, &|| !abort)?;
         self.snapshot_high_water = self.high_water;
+        let mapped =
+            snapshot::map_vectors(&path, self.config.id, self.config.dims, self.slots.len())?;
+        if !self.index.replace_vectors(mapped) {
+            return Err(PartitionError::Snapshot(SnapshotError::Malformed(
+                "f32 section shape",
+            )));
+        }
         self.hit(Failpoint::SnapshotAfterRename)?;
         Ok(path)
     }
@@ -873,12 +1135,14 @@ impl Partition {
             }
         }
         if removed > 0 {
-            fs::File::open(self.directory.join(WAL_DIR))?.sync_all()?;
+            fsutil::sync_dir(&self.directory.join(WAL_DIR))?;
         }
         Ok(removed)
     }
 
-    /// Hot-set bytes per the contract §11 model (RAM-resident parts only).
+    /// Heap-resident bytes per the contract §11 model: int8, graph, slot,
+    /// key, payload, and idempotency bookkeeping, plus any `f32` rows not yet
+    /// served from a snapshot (appended since the last one).
     pub fn resident_bytes(&self) -> usize {
         let payloads: usize = self.slots.iter().map(|s| s.payload.len() + 32).sum();
         let keys: usize = self.key_table.iter().map(|k| k.len() + 48).sum();
@@ -899,6 +1163,16 @@ impl Partition {
 pub enum PartitionError {
     #[error("partition already exists at {0}")]
     AlreadyExists(PathBuf),
+    #[error("partition at {0} is locked by another owner")]
+    Locked(PathBuf),
+    #[error("{what} = {value} exceeds the maximum of {max}")]
+    QueryLimit {
+        what: &'static str,
+        value: usize,
+        max: usize,
+    },
+    #[error("partition history starts with a bulk-load snapshot and no verifiable snapshot remains ({rejected} rejected); refusing to serve without it")]
+    BaseSnapshotUnavailable { rejected: usize },
     #[error("partition manifest is invalid: {0}")]
     Manifest(&'static str),
     #[error("cosine collections reject zero-norm vectors")]
@@ -1030,6 +1304,12 @@ mod tests {
         assert_eq!(hit.key, b"key-120");
         assert_eq!(hit.payload, b"v2");
         assert!(reopened.slot_for_key(b"key-7").is_none());
+        // The directory lock admits one owner at a time.
+        assert!(matches!(
+            Partition::open(directory.path()),
+            Err(PartitionError::Locked(_))
+        ));
+        drop(reopened);
 
         // Nothing but the WAL (no snapshot) also recovers exactly.
         fs::remove_dir_all(directory.path().join(SNAP_DIR)).unwrap();
@@ -1515,5 +1795,533 @@ mod tests {
             .search(&vector(1), 3, 16, None)
             .unwrap()
             .is_empty());
+    }
+
+    fn wal_header(id: Uuid, first_seq: u64) -> Vec<u8> {
+        let mut header = vec![0_u8; wal::HEADER_LEN];
+        header[0..4].copy_from_slice(wal::WAL_MAGIC);
+        header[4..6].copy_from_slice(&wal::WAL_VERSION.to_le_bytes());
+        header[8..24].copy_from_slice(id.as_bytes());
+        header[24..32].copy_from_slice(&first_seq.to_le_bytes());
+        header
+    }
+
+    /// Offsets of every frame in a segment file.
+    fn frame_starts(bytes: &[u8]) -> Vec<usize> {
+        let mut starts = Vec::new();
+        let mut at = wal::HEADER_LEN;
+        while at < bytes.len() {
+            starts.push(at);
+            at += 4 + u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        }
+        starts
+    }
+
+    #[test]
+    fn records_inserted_after_mass_deletion_stay_reachable() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let mut partition = Partition::create(directory.path(), config(id)).unwrap();
+        fill(&mut partition, 0..600);
+        for i in 0..600 {
+            partition
+                .delete(op(10_000 + i as u64), format!("key-{i}").as_bytes())
+                .unwrap();
+        }
+        assert_eq!(partition.live_count(), 0);
+        for i in 600..700 {
+            partition
+                .upsert(
+                    op(i as u64),
+                    format!("key-{i}").as_bytes(),
+                    &vector(i),
+                    b"new",
+                )
+                .unwrap();
+        }
+        let found = |p: &Partition| {
+            (600..700)
+                .filter(|&i| {
+                    p.search(&vector(i), 1, 64, None)
+                        .unwrap()
+                        .first()
+                        .is_some_and(|hit| hit.key == format!("key-{i}").as_bytes())
+                })
+                .count()
+        };
+        assert_eq!(
+            found(&partition),
+            100,
+            "every new record is its own nearest neighbour"
+        );
+        drop(partition);
+        let (reopened, _) = Partition::open(directory.path()).unwrap();
+        assert_eq!(found(&reopened), 100, "replay rebuilds the same links");
+    }
+
+    #[test]
+    fn a_bulk_load_without_its_snapshot_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut rows = crate::vector::FlatVectors::new(8);
+        for i in 0..300 {
+            rows.push(&vector(i), Metric::Cosine).unwrap();
+        }
+        let (mut partition, snapshot) = Partition::bulk_load(
+            directory.path(),
+            config(Uuid::new_v4()),
+            rows,
+            (0..300_u64).map(|i| i.to_le_bytes().to_vec()),
+        )
+        .unwrap();
+        fill(&mut partition, 1000..1003);
+        assert_eq!(partition.live_count(), 303);
+        drop(partition);
+
+        // A damaged base snapshot: the WAL alone holds only three entries.
+        let good = fs::read(&snapshot).unwrap();
+        let mut bad = good.clone();
+        let middle = bad.len() / 2;
+        bad[middle] ^= 0x10;
+        fs::write(&snapshot, &bad).unwrap();
+        assert!(matches!(
+            Partition::open(directory.path()),
+            Err(PartitionError::BaseSnapshotUnavailable { rejected: 1 })
+        ));
+        // A missing one, likewise.
+        fs::remove_file(&snapshot).unwrap();
+        assert!(matches!(
+            Partition::open(directory.path()),
+            Err(PartitionError::BaseSnapshotUnavailable { rejected: 0 })
+        ));
+        // Restored, it opens with every record.
+        fs::write(&snapshot, &good).unwrap();
+        let (reopened, _) = Partition::open(directory.path()).unwrap();
+        assert_eq!(reopened.live_count(), 303);
+    }
+
+    #[test]
+    fn a_wal_that_stops_short_of_the_snapshot_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let mut partition = Partition::create(directory.path(), config(id)).unwrap();
+        fill(&mut partition, 0..10);
+        let segment = partition.wal.as_ref().unwrap().current_segment().to_owned();
+        let stale = fs::read(&segment).unwrap();
+        fill(&mut partition, 10..20);
+        partition.snapshot().unwrap();
+        drop(partition);
+        // An older copy of the segment (for example from an archive set that
+        // recorded the snapshot but not the grown segment) ends at 10.
+        fs::write(&segment, &stale).unwrap();
+        let result = Partition::open(directory.path());
+        assert!(
+            matches!(
+                result,
+                Err(PartitionError::MissingHistory {
+                    snapshot_high_water: 20,
+                    ..
+                })
+            ),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn damage_in_a_sealed_segment_fails_closed_without_touching_any_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let mut partition = Partition::create(directory.path(), config(id)).unwrap();
+        fill(&mut partition, 0..10);
+        let segment = partition.wal.as_ref().unwrap().current_segment().to_owned();
+        drop(partition);
+        // Split the log into a sealed segment (1..=5) and an active one (6..=10).
+        let full = fs::read(&segment).unwrap();
+        let starts = frame_starts(&full);
+        let mut second = wal_header(id, 6);
+        second.extend_from_slice(&full[starts[5]..]);
+        let second_path = directory
+            .path()
+            .join(WAL_DIR)
+            .join(format!("{:020}.wal", 6));
+        fs::write(&second_path, &second).unwrap();
+        fs::write(&segment, &full[..starts[5]]).unwrap();
+        let (split, _) = Partition::open(directory.path()).unwrap();
+        assert_eq!(split.high_water(), 10);
+        drop(split);
+
+        // Cut the sealed segment's last entry: corruption, and nothing on
+        // disk may change, so the evidence survives for the operator.
+        let sealed = fs::read(&segment).unwrap();
+        fs::write(&segment, &sealed[..sealed.len() - 10]).unwrap();
+        let before = (fs::read(&segment).unwrap(), fs::read(&second_path).unwrap());
+        assert!(matches!(
+            Partition::open(directory.path()),
+            Err(PartitionError::Wal(WalError::Corrupt { .. }))
+        ));
+        assert_eq!(
+            (fs::read(&segment).unwrap(), fs::read(&second_path).unwrap()),
+            before
+        );
+    }
+
+    #[test]
+    fn a_damaged_length_field_fails_closed_instead_of_dropping_acknowledged_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let mut partition = Partition::create(directory.path(), config(id)).unwrap();
+        fill(&mut partition, 0..10);
+        let segment = partition.wal.as_ref().unwrap().current_segment().to_owned();
+        drop(partition);
+        let full = fs::read(&segment).unwrap();
+        let starts = frame_starts(&full);
+        let mut damaged = full.clone();
+        damaged[starts[1] + 3] ^= 0x01; // len of entry 2 grows by 16 MiB
+        fs::write(&segment, &damaged).unwrap();
+        assert!(matches!(
+            Partition::open(directory.path()),
+            Err(PartitionError::Wal(WalError::Corrupt { .. }))
+        ));
+        assert_eq!(fs::read(&segment).unwrap(), damaged, "nothing truncated");
+    }
+
+    #[test]
+    fn inspect_repairs_nothing_and_open_truncates_after_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let mut partition = Partition::create(directory.path(), config(id)).unwrap();
+        fill(&mut partition, 0..12);
+        let segment = partition.wal.as_ref().unwrap().current_segment().to_owned();
+        drop(partition);
+        let full = fs::read(&segment).unwrap();
+        fs::write(&segment, &full[..full.len() - 7]).unwrap();
+
+        let lock = Partition::lock(directory.path()).unwrap();
+        let report = Partition::inspect(&lock).unwrap();
+        assert_eq!(report.partition_id, id);
+        assert_eq!(report.high_water, 11);
+        assert!(report.torn_tail_found.is_some());
+        assert!(report.torn_tails_truncated.is_empty());
+        assert_eq!(fs::read(&segment).unwrap().len(), full.len() - 7);
+        assert!(matches!(
+            Partition::open(directory.path()),
+            Err(PartitionError::Locked(_))
+        ));
+        drop(lock);
+
+        let (mut reopened, report) = Partition::open(directory.path()).unwrap();
+        assert_eq!(report.torn_tails_truncated.len(), 1);
+        assert!(report.torn_tail_found.is_none());
+        assert_eq!(reopened.high_water(), 11);
+        fill(&mut reopened, 100..101);
+        drop(reopened);
+        let (again, _) = Partition::open(directory.path()).unwrap();
+        assert_eq!(again.high_water(), 12);
+    }
+
+    #[test]
+    fn the_writer_is_poisoned_between_append_and_apply() {
+        for point in [Failpoint::AfterWalAppend, Failpoint::AfterWalSync] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut partition =
+                Partition::create(directory.path(), config(Uuid::new_v4())).unwrap();
+            fill(&mut partition, 0..5);
+            let mut failing = partition.with_failpoint(point);
+            assert!(matches!(
+                failing.upsert(op(50), b"lost?", &vector(50), b""),
+                Err(PartitionError::Injected(p)) if p == point
+            ));
+            failing.clear_failpoint();
+            // The log holds seq 6 that memory lacks; appending seq 7 behind
+            // it would make replicas of this log diverge.
+            assert!(matches!(
+                failing.upsert(op(51), b"next", &vector(51), b""),
+                Err(PartitionError::Wal(WalError::Poisoned))
+            ));
+            assert!(matches!(
+                failing.delete(op(52), b"key-1"),
+                Err(PartitionError::Wal(WalError::Poisoned))
+            ));
+            assert_eq!(failing.high_water(), 5);
+            drop(failing);
+            let (reopened, _) = Partition::open(directory.path()).unwrap();
+            assert_eq!(
+                reopened.high_water(),
+                6,
+                "{point:?}: the logged entry replays"
+            );
+            assert!(reopened.slot_for_key(b"next").is_none());
+        }
+    }
+
+    #[test]
+    fn non_finite_queries_and_oversized_requests_are_rejected_on_every_metric() {
+        for metric in [Metric::Cosine, Metric::Dot, Metric::L2] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut partition = Partition::create(
+                directory.path(),
+                PartitionConfig::new(Uuid::new_v4(), 8, metric, params()),
+            )
+            .unwrap();
+            fill(&mut partition, 0..20);
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut query = vector(3);
+                query[2] = bad;
+                assert!(
+                    matches!(
+                        partition.search(&query, 3, 16, None),
+                        Err(PartitionError::Vector(VectorError::NonFinite))
+                    ),
+                    "{metric:?} {bad}"
+                );
+                assert!(matches!(
+                    partition.upsert(op(99), b"bad", &query, b""),
+                    Err(PartitionError::Vector(VectorError::NonFinite))
+                ));
+            }
+            assert!(matches!(
+                partition.search(&vector(3), 1 << 40, 16, None),
+                Err(PartitionError::QueryLimit { what: "k", .. })
+            ));
+            assert!(matches!(
+                partition.search(&vector(3), 3, usize::MAX, None),
+                Err(PartitionError::QueryLimit { what: "ef", .. })
+            ));
+            assert!(matches!(
+                partition.search(&vector(3)[..7], 3, 16, None),
+                Err(PartitionError::Vector(VectorError::WrongDims { .. }))
+            ));
+            // k beyond the live count returns every live record, once.
+            assert_eq!(
+                partition.search(&vector(3), MAX_K, 16, None).unwrap().len(),
+                20
+            );
+        }
+    }
+
+    #[test]
+    fn unrepresentable_configurations_are_refused_at_create() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = config(Uuid::new_v4());
+        let cases: Vec<(&str, PartitionConfig)> = vec![
+            (
+                "m=1",
+                PartitionConfig {
+                    m: 1,
+                    ..base.clone()
+                },
+            ),
+            (
+                "m0>255",
+                PartitionConfig {
+                    m0: 256,
+                    ..base.clone()
+                },
+            ),
+            (
+                "m0<m",
+                PartitionConfig {
+                    m: 16,
+                    m0: 8,
+                    ..base.clone()
+                },
+            ),
+            (
+                "dims=0",
+                PartitionConfig {
+                    dims: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "dims>max",
+                PartitionConfig {
+                    dims: wal::MAX_DIMS + 1,
+                    ..base.clone()
+                },
+            ),
+            (
+                "ef_construction=0",
+                PartitionConfig {
+                    ef_construction: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "window=0",
+                PartitionConfig {
+                    idempotency_window: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "headroom",
+                PartitionConfig {
+                    headroom_fraction: 1.5,
+                    ..base.clone()
+                },
+            ),
+            (
+                "ratio",
+                PartitionConfig {
+                    compaction_tombstone_ratio: 0.0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "ef_search",
+                PartitionConfig {
+                    ef_search: Some(0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "metric",
+                PartitionConfig {
+                    metric: "hamming".into(),
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (name, bad) in cases {
+            assert!(
+                matches!(
+                    Partition::create(&directory.path().join(name), bad),
+                    Err(PartitionError::Manifest(_))
+                ),
+                "{name}"
+            );
+            assert!(!directory.path().join(name).join(MANIFEST_NAME).exists());
+        }
+    }
+
+    #[test]
+    fn per_metric_defaults_come_from_one_place() {
+        let id = Uuid::new_v4();
+        let cosine = PartitionConfig::for_metric(id, 8, Metric::Cosine);
+        assert_eq!((cosine.m, cosine.m0, cosine.ef_search()), (32, 64, 400));
+        let l2 = PartitionConfig::for_metric(id, 8, Metric::L2);
+        assert_eq!((l2.m, l2.m0, l2.ef_search()), (16, 32, 100));
+        assert_eq!(HnswParams::default(), HnswParams::for_metric(Metric::Dot));
+        assert_ne!(
+            PartitionConfig::for_metric(Uuid::new_v4(), 8, Metric::L2).seed,
+            l2.seed,
+            "level seeds differ between partitions"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let mut partition = Partition::create(directory.path(), cosine).unwrap();
+        fill(&mut partition, 0..50);
+        assert_eq!(
+            partition.search_default(&vector(7), 3, None).unwrap(),
+            partition.search(&vector(7), 3, 400, None).unwrap()
+        );
+    }
+
+    #[test]
+    fn f32_originals_leave_the_heap_at_every_snapshot_and_accounting_survives_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut partition = Partition::create(directory.path(), config(Uuid::new_v4())).unwrap();
+        fill(&mut partition, 0..500);
+        let heap_with_rows = partition.resident_bytes();
+        partition.snapshot().unwrap();
+        let after_snapshot = partition.resident_bytes();
+        assert_eq!(
+            heap_with_rows - after_snapshot,
+            500 * 8 * 4,
+            "rows remapped"
+        );
+        assert_eq!(partition.mapped_bytes(), 500 * 8 * 4);
+        let expected = state(&partition);
+        drop(partition);
+        let (mut reopened, _) = Partition::open(directory.path()).unwrap();
+        assert_eq!(reopened.resident_bytes(), after_snapshot);
+        assert_eq!(state(&reopened), expected);
+
+        // Compaction copies live rows to the heap to rebuild; the swapped-in
+        // state serves them from its new snapshot.
+        for i in (0..500).step_by(2) {
+            reopened
+                .delete(op(70_000 + i as u64), format!("key-{i}").as_bytes())
+                .unwrap();
+        }
+        let plan = reopened.begin_compaction().unwrap();
+        reopened.finish_compaction(plan).unwrap();
+        assert_eq!(reopened.index().vectors().resident_bytes(), 0);
+        assert_eq!(reopened.mapped_bytes(), 250 * 8 * 4);
+        let compacted = reopened.resident_bytes();
+        drop(reopened);
+        let (again, _) = Partition::open(directory.path()).unwrap();
+        assert_eq!(again.resident_bytes(), compacted);
+    }
+
+    #[test]
+    fn compaction_rebuilds_on_another_thread_while_reads_and_writes_continue() {
+        use std::sync::{mpsc, Arc, RwLock};
+
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Partition>();
+        assert_send_sync::<CompactionInput>();
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut partition = Partition::create(directory.path(), config(Uuid::new_v4())).unwrap();
+        fill(&mut partition, 0..400);
+        for i in (0..400).step_by(3) {
+            partition
+                .delete(op(50_000 + i as u64), format!("key-{i}").as_bytes())
+                .unwrap();
+        }
+        let shared = Arc::new(RwLock::new(partition));
+        // Only the capture holds the partition; the rebuild owns its input.
+        let input = shared.read().unwrap().capture_compaction().unwrap();
+        let rebuild_point = input.rebuild_point();
+        let (started, wait) = mpsc::channel();
+        let builder = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            input.build()
+        });
+        wait.recv().unwrap();
+        let reader = {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                for i in 0..40 {
+                    let hits = shared
+                        .read()
+                        .unwrap()
+                        .search(&vector(i), 3, 32, None)
+                        .unwrap();
+                    assert!(!hits.is_empty());
+                }
+            })
+        };
+        for i in 400..440 {
+            let mut writer = shared.write().unwrap();
+            writer
+                .upsert(
+                    op(i as u64),
+                    format!("key-{i}").as_bytes(),
+                    &vector(i),
+                    b"w",
+                )
+                .unwrap();
+        }
+        shared
+            .write()
+            .unwrap()
+            .delete(op(60_000), b"key-1")
+            .unwrap();
+        reader.join().unwrap();
+        let plan = builder.join().unwrap();
+        let mut partition = Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap();
+        let report = partition.finish_compaction(plan).unwrap();
+        assert_eq!(report.rebuild_point, rebuild_point);
+        assert_eq!(report.caught_up_entries, 41);
+        for i in 400..440 {
+            assert!(partition
+                .slot_for_key(format!("key-{i}").as_bytes())
+                .is_some());
+        }
+        assert!(partition.slot_for_key(b"key-1").is_none());
+        assert!(partition.slot_for_key(b"key-3").is_none());
+        assert_eq!(partition.index().tombstone_count(), 1);
     }
 }

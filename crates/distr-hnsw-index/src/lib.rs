@@ -1,11 +1,13 @@
 //! Single-partition vector engine for distr-hnsw (roadmap M3).
 //!
-//! Pass 1 provides the pieces everything else is measured against: flat
-//! vector storage, distance kernels with scalar references, and the exact
-//! oracle whose deterministic tie rules define the engine's semantics
-//! (`docs/m3-implementation-plan.md`). No networking, no async runtime.
+//! Flat `f32` and int8 vector storage, distance kernels with scalar
+//! references, the exact oracle whose deterministic tie rules define the
+//! engine's semantics, HNSW with filtered search, and a durable partition
+//! (WAL, snapshots, recovery, compaction, RAM admission). Semantics and
+//! formats: `docs/m3-engine-contract.md`. No networking, no async runtime.
 
 pub mod distance;
+pub mod fsutil;
 pub mod hnsw;
 pub mod oracle;
 pub mod partition;

@@ -1,7 +1,10 @@
 # M3 engine contract
 
 Status: **Proposed** (2026-09-30, pass 2 of
-[m3-implementation-plan.md](m3-implementation-plan.md)). This document pins
+[m3-implementation-plan.md](m3-implementation-plan.md); revised 2026-10-25
+by the hardening pass that followed the project audit, which tightened the
+WAL torn-tail rule, recovery's history checks, and several claims the code
+did not meet). This document pins
 the semantics, persistent formats, parameters, and crash boundaries of the
 single-partition vector engine before graph code is written. It is
 subordinate to `DESIGN.md` §6 and `roadmap.md` M3; later passes may extend
@@ -24,7 +27,8 @@ exact oracle in `crates/distr-hnsw-index/src/oracle.rs` already defines
 not: distance ascending, then slot ascending. Slots are assigned in WAL
 order, so ties resolve to the earlier insertion and the order is identical on
 every replica that applied the same log. NaN is impossible: vectors with a
-non-finite component are rejected at insert and query time.
+non-finite component are rejected at insert and query time
+(`VectorError::NonFinite` on every metric).
 
 ## 2. Metrics
 
@@ -61,9 +65,28 @@ different slot than the one it returns.
 client-assigned). The partition keeps a window of the last `W` applied
 `op_id`s with their `seq` (default `W` = 1,000,000), persisted in snapshots.
 An entry whose `op_id` is in the window is not re-applied; the original
-`seq` is returned. An `op_id` older than the window is applied again, which
-is safe because upsert and delete are idempotent in effect and only the
-version changes.
+`seq` is returned. Two limits follow, and callers must respect them:
+
+- Deduplication is by `op_id` alone. A retry that reuses an `op_id` with a
+  different key or vector is reported as `deduplicated` and changes
+  nothing; the engine does not compare request contents. The portal must
+  derive `op_id`s so that one id always names one request.
+- An `op_id` older than the window is applied again. That is only harmless
+  when no other write touched the same key in between: a delayed retry of
+  `upsert(k, v1)` after `upsert(k, v2)` would silently restore `v1`, and a
+  stale delete would remove a re-inserted record. Retries must therefore be
+  bounded well inside the window (`W` operations on this partition). M4
+  enforces that with epochs and the committed high-water mark (DESIGN
+  §6.3), or by storing a request fingerprint per `op_id`; until then the
+  window is the only guard.
+
+**Limits.** A search accepts `k ≤ 10,000` (`MAX_K`) and `ef ≤ 100,000`
+(`MAX_EF`); larger values return `PartitionError::QueryLimit` rather than
+reserving memory for them. A partition's configuration is validated at
+create and open: `1 ≤ dims ≤ 65,536`, `2 ≤ M ≤ 255`, `M ≤ M0 ≤ 255`
+(neighbour-list lengths are stored as `u8`), `1 ≤ ef_construction ≤
+100,000`, a positive idempotency window, headroom in `[0, 0.9]`, and a
+compaction ratio in `(0, 1]`.
 
 ## 4. Write-ahead log
 
@@ -90,11 +113,35 @@ Rules:
    earlier entries in the batch are durable.
 2. `seq` must increase by exactly one across entries and segments. A gap or
    repeat is corruption.
-3. On open, a segment is read to its end. A final entry that is short, has a
-   wrong `len`, or fails its CRC is a **torn tail**: it is discarded and the
-   file is truncated to the last good entry, which is logged. Any bad entry
-   that is not the last one, or a bad header, **fails closed** with a
-   diagnosis naming the segment and offset; the partition does not serve.
+3. On open, every segment is read to its end before anything is repaired.
+   A legal `len` lies between 32 (a delete with a 1-byte key) and 328,231
+   (an upsert with the largest key, payload, and vector). The `len` field is
+   not covered by the CRC, so a damaged frame is classified by what follows
+   it, never by the length it claims:
+   - In the **newest** segment, a frame that is short, has a `len` outside
+     the legal range or past the end of the file, or fails its CRC is a
+     **torn tail** only if no CRC-valid frame starts anywhere after it. Then
+     it and everything after it (for example a zero-filled region left by a
+     crash between `write` and `fdatasync`) were never acknowledged; the
+     file is truncated to the last good entry, and that is reported. If a
+     valid frame does follow, the damage is in the middle of the log and the
+     partition **fails closed**: a corrupted length can never discard the
+     acknowledged entries behind it.
+   - A newest segment shorter than its header, or all zeros, was created by
+     an interrupted rotation (the header is synced before any entry is
+     appended) and holds nothing; it is removed.
+   - **Sealed** segments (all but the newest) are synced before their
+     successor is created, so any damage in them is corruption and fails
+     closed. Nothing is truncated: the bytes are left for diagnosis.
+   - A frame whose CRC matches but whose body is invalid, a bad header, or a
+     header whose first sequence disagrees with the file name fails closed.
+
+   A failure names the segment and offset; the partition does not serve.
+   These rules (2026-10-25) changed the reader, not the format: WAL version
+   1 segments written before them read the same way.
+   Group commit (rule 1) will batch unsynced frames, so a torn batch can
+   leave a valid frame after a torn one; that case currently fails closed
+   and needs its own rule when group commit lands.
 4. Entries with `seq` at or below the loaded snapshot's high-water mark are
    skipped during replay; every later entry is applied exactly once in
    order.
@@ -102,13 +149,26 @@ Rules:
    to the blob plane (M1 object class `wal_segment`) and local truncation,
    in that order; a segment is never deleted before its archive copy is
    verified (M1 copy-first rule).
+6. The writer is **poisoned** after any failed write, `fdatasync`, or
+   rotation, and after an injected failure between append and apply: the
+   file may hold a partial frame, or an entry the in-memory state lacks.
+   A poisoned writer refuses every later append (`WalError::Poisoned`)
+   until the partition is reopened and recovery re-establishes the end of
+   the log. A failed `fdatasync` is never retried (Linux may report a
+   writeback error once and drop the dirty pages). The writer extends the
+   newest segment only when that segment ends exactly at the recovered
+   high-water mark; otherwise it refuses to open rather than append behind
+   a stale or damaged tail.
 
 ## 5. Snapshot
 
 A snapshot is one file `snap/<high_water_seq, 20 digits>.snap`, written to a
 temporary name, synced, renamed, with the directory synced (the M1 durable
-write sequence). Sections are 64-byte aligned so the file can be memory
-mapped and served from the page cache when a partition is demoted from RAM.
+write sequence). The partition directory, `wal/`, and `snap/` are created
+with their parents synced, so no directory entry the engine relies on can
+vanish after power loss. Sections are 64-byte aligned so the file can be
+memory mapped and served from the page cache when a partition is demoted
+from RAM.
 
 ```text
 header (128 bytes)
@@ -140,11 +200,20 @@ and WAL directories, `partition.json` records the static configuration
 (partition id, dims, metric, graph parameters, idempotency window) and is
 written durably at creation; a snapshot that disagrees with it is refused.
 Two snapshots at the same high-water mark share a name and the later
-atomically replaces the earlier (their content is identical). An aborted
-write leaves its temporary file, which loading ignores.
+atomically replaces the earlier. They describe the same logical state but
+need not be byte-identical (a compaction renumbers slots), so archives
+identify a snapshot by its BLAKE3, never by its name. An aborted write leaves
+its temporary file, which loading ignores. `partition.json` also records
+`base_snapshot` when history begins with a bulk-load snapshot that is not in
+the WAL (§6).
 
 Loading verifies the header CRC, every section's BLAKE3, and the footer; a
-mismatch fails closed with the section named. The newest snapshot whose
+mismatch fails closed with the section named. It then cross-checks every
+reference the snapshot holds (neighbour targets and list lengths on every
+level, the entry point's level, key-to-slot and slot-to-key links, and the
+tombstone bitmap against the per-slot flags and count), and the graph
+parameters must equal `partition.json`; any disagreement is refused at open
+rather than discovered as a panic at query time. The newest snapshot whose
 checks pass is used; an older one is used only when the newer fails and the
 operator is told. A snapshot is content-addressed by its BLAKE3 when archived
 (M1 object class `snapshot`).
@@ -161,9 +230,23 @@ operator is told. A snapshot is content-addressed by its BLAKE3 when archived
 3. The committed high-water mark becomes the last replayed `seq`. Serving
    begins only after replay completes.
 
-A snapshot with a positive high-water mark and no WAL segment reaching it
-fails closed (`MissingHistory`): the partition cannot prove that nothing
-followed the snapshot. Only an empty partition may have no history at all.
+The WAL must continue from the snapshot: some segment must start at or
+before `high_water + 1`, and the log must reach the snapshot's high-water
+mark. Otherwise recovery fails closed (`MissingHistory`): the partition
+cannot prove that nothing followed the snapshot, and a writer appending
+after a stale segment would brick the next restart. Only an empty partition
+may have no history at all. A partition created by a bulk load
+(`base_snapshot` in `partition.json`) holds data that is in no WAL entry, so
+it refuses to open without a verifiable snapshot
+(`BaseSnapshotUnavailable`) instead of starting empty; the flag is written
+before the load begins, so an interrupted load fails closed too.
+
+`open` takes an exclusive advisory lock (`flock` on `LOCK` in the partition
+directory) for as long as the partition is open, so a server, an archive,
+and a restore can never touch one directory at once (`Locked`).
+`Partition::inspect` runs the whole recovery in memory under that lock but
+repairs nothing and opens no writer; it reports a torn tail instead of
+truncating it.
 The recovery report (snapshot used, snapshots rejected, segments read,
 entries replayed and skipped, torn tails truncated, final high-water mark)
 is returned to the caller for logging.
@@ -196,8 +279,12 @@ originals make that a rebuild, not a data loss.
 The `f32` originals are **not** part of the RAM hot set: traversal touches
 only int8 codes and graph links, and rescoring reads at most the rescoring
 depth of originals per query. Originals therefore live in the memory-mapped
-snapshot (§5) and are served through the page cache; a partition's RAM
-budget (§11) counts int8 codes, scalars, and graph only.
+snapshot (§5) and are served through the page cache. Rows appended since the
+last snapshot, and rows a bulk load or compaction has just built, are on the
+heap until the next snapshot; every snapshot write maps its `f32` section
+(after checking that section's BLAKE3) and serves the originals from it, so
+they leave the heap. `resident_bytes` counts those heap rows while they
+exist (§11).
 
 ## 8. HNSW parameters and construction
 
@@ -206,30 +293,58 @@ budget (§11) counts int8 codes, scalars, and graph only.
 | `M` | 16 for `l2` and `dot`, 32 for `cosine` | max neighbours per node on upper levels; set from the pass 3 measurements (`docs/bench/README.md`) |
 | `M0` | `2 · M` | max neighbours on level 0 |
 | `ef_construction` | 200 | candidate list during insert |
-| `ef_search` | 100 for `l2` and `dot`, 400 for `cosine` | per query, at least `k`; per-collection default, per-query override |
+| `ef_search` | 100 for `l2` and `dot`, 400 for `cosine` | per query, at least `k`; per-collection default (`PartitionConfig::ef_search`), per-query override |
 | level multiplier | `1 / ln(M)` | levels drawn from a geometric distribution |
-| level RNG | seeded by `(partition_id, slot)` | deterministic levels, so the same log yields the same graph on every replica and in tests |
+| level RNG | splitmix64 over `(seed, slot)` | `seed` is configured; `PartitionConfig::for_metric` derives it from the partition id. Deterministic levels, so the same log yields the same levels on every replica and in tests |
+
+The defaults live in code, in one place: `HnswParams::for_metric`,
+`hnsw::default_ef_search`, and `PartitionConfig::for_metric`, which the
+portal should use to create collections. `HnswParams::default()` is the
+`l2`/`dot` row. The cosine `ef_search` of 400 clears 0.97 recall on nytimes
+(0.975) but not on glove (0.966; 0.985 at 800), so the default is a recorded
+open decision for the owner (raise it, or accept glove as the hard case), not
+a met threshold.
 | neighbour selection | heuristic (HNSW Algorithm 4) with pruned-candidate backfill | |
 | entry point | the slot with the highest level; updated on insert | |
 
 Inserts follow the standard greedy descent then `ef_construction` search per
 level with bidirectional linking and pruning. Tombstoned slots stay linked
-and are traversed but never scored into results. Concurrency: queries take a
-read guard on the partition state; inserts serialize on the writer; a query
-never observes a partially linked slot because linking completes before the
-high-water mark advances.
+and are traversed but never scored into results. Construction treats them
+as ordinary candidates and neighbours (as hnswlib does): excluding them
+would leave a record inserted after mass deletion with no neighbours and
+unreachable until compaction. Concurrency: `Partition` is a single-writer
+`&mut self` API with no internal lock; a server keeps it behind a
+read-write lock, queries take the read guard, and writes take the write
+guard. A query never observes a partially linked slot because linking
+completes before the high-water mark advances.
 
 **Bulk build.** Bulk loads, compaction rebuilds, and benchmarks may use the
 parallel builder: levels and the entry point are the same deterministic
 function of `(seed, slot)`, but neighbour selection depends on thread
 scheduling, so two parallel builds of one log are not byte-identical (recall
-agreed within 0.001 in pass 3). The WAL apply path inserts sequentially and
-stays deterministic.
+agreed within 0.001 in pass 3). A slot's own list is merged with the
+back-links other threads added to it rather than overwritten, and a final
+pass gives every level-0 slot without an in-link one (replacing only a link
+whose target keeps another in-link), so no live record is unreachable after
+a bulk load or compaction. The WAL apply path inserts sequentially and stays
+deterministic. Because compaction uses the parallel builder, replicas that
+compact independently hold different graphs; M4 must either ship the
+primary's compacted snapshot or make the build deterministic before relying
+on identical approximate results across replicas.
 
 ## 9. Filtered search
 
-The portal supplies the allowed set as a roaring bitmap of external keys,
-translated to live slots by the partition. Two modes, chosen per query:
+The allowed set is a roaring bitmap of **slots** in the partition's current
+state (`Partition::search(.., Some(&bitmap))`). Slots are internal: an upsert
+moves a key to a new slot, compaction renumbers every slot, and replicas
+number slots differently, so a slot bitmap is valid only against the state
+it was computed from, and `SearchHit::slot` is not a stable identifier. The
+original intent, a bitmap of external keys translated by the partition, is
+not representable (keys are byte strings) and is deferred: M4/M5 must add a
+stable, portal-assigned `u32` record id to each slot (WAL and snapshot), have
+the partition translate a record-id bitmap to slots under the same state it
+searches, and remove slot-space filters from the public API before filters
+carry authorization (M2 grants). Two modes, chosen per query:
 
 - **Selective**: if `|allowed| ≤ T`, exact distances over the allowed slots
   only (the oracle path) with the same tie rule. **`T = 200 · ef_search`**,
@@ -255,12 +370,16 @@ scheduled against load (pass 7).
 
 Compaction is two-phase (`begin_compaction` / `finish_compaction`):
 
-1. **Begin** (`&self`, runs beside readers and writers). Freeze the rebuild
-   point `S` = current high-water mark. Build a new graph from the live slots
-   at `S` in slot order, assigning new dense slots in the same relative order
-   so tie order is preserved; external keys are unchanged. Writes continue
-   to the old state and the WAL. The plan carries the rebuilt index, the key
-   table, and a copy of the idempotency window.
+1. **Begin**, in two steps. *Capture* (`capture_compaction(&self)`) freezes
+   the rebuild point `S` = current high-water mark and copies the live slots
+   at `S` in slot order, with the key table and the idempotency window; it
+   holds the partition only for that memory copy (writers behind the lock
+   wait for it). *Build* (`CompactionInput::build`) owns its input and
+   borrows nothing, so it runs on another thread while readers and writers
+   continue on the old state and the WAL. It builds a new graph assigning
+   new dense slots in the same relative order, so tie order is preserved;
+   external keys are unchanged. `begin_compaction(&self)` does both in one
+   call and therefore blocks writers for the whole rebuild.
 2. **Finish** (`&mut self`, an exclusive section). Replay WAL entries
    `(S, now]` into the staged state from the segments on disk; the replay
    must reach exactly the current high-water mark or the finish fails with
@@ -272,8 +391,14 @@ Compaction is two-phase (`begin_compaction` / `finish_compaction`):
 
 Because the snapshot name is the high-water mark, a compaction that finishes
 with no concurrent writes rewrites the snapshot the previous state already
-had at that mark. The two files describe the same logical state (contract
-§5), so the rename is a same-name atomic replace, never a loss of history.
+had at that mark. The two files describe the same logical state (§5), so the
+rename is a same-name atomic replace, never a loss of history.
+
+Compaction is not admitted against the RAM budget: the rebuild holds a
+second index (int8, graph, and a heap copy of the live `f32` rows) beside the
+served one, which at 512 dims exceeds the 35% headroom. Until a measured
+peak model gates `begin` (deferred), the caller must schedule compaction
+only when the host has that memory.
 
 A crash before the swap (`CompactionBeforeSwap`) leaves the old state
 authoritative; on recovery the compacted snapshot is simply the newest
@@ -282,38 +407,64 @@ write is lost because every acknowledged entry is in the WAL regardless of
 which state it was applied to; no deleted record becomes visible because
 tombstones are replayed into the staged state too.
 
-**Archival.** `distr-hnsw index archive` commits a partition's manifest,
-newest snapshot, and WAL segments as ordinary blob-plane files (M1 contract:
-4 MiB encrypted chunks, RF2, immutable manifests) under the idempotency key
-`index:<partition>:<part>:<name>:<blake3>`; the portal records the part-to-
-file mapping in `index_archives` (schema v8). An unchanged part is not
-re-uploaded; a grown WAL segment becomes a new file version. With
-`--truncate-wal`, segments wholly below the archived snapshot are removed
-locally only after their archive copy is committed (§4 rule 5). `index
-restore` downloads every recorded part into an empty directory, verifies
-each BLAKE3, and opens the partition through the normal recovery path (§6).
+**Archival.** `distr-hnsw index archive` commits a partition's manifest, WAL
+segments, and newest verifiable snapshot, in that order, as ordinary
+blob-plane files (M1 contract: 4 MiB encrypted chunks, RF2, immutable
+manifests) under the idempotency key `index:<partition>:<part>:<name>:<blake3>`;
+the portal records the part-to-file mapping in `index_archives` (schema v8).
+The snapshot goes last, so an interrupted archive can leave an older
+snapshot with newer segments (recoverable) but never a newer snapshot with
+stale segments. Archive is **offline only**: it takes the partition lock
+(failing with `Locked` while a server holds it), verifies the partition with
+`inspect` (no repair, no writer), and keeps the lock until it finishes, so no
+file changes between hashing and upload. A part counts as unchanged only when
+its recorded hash matches and the recorded file is still visible in the blob
+plane; otherwise it is committed again (as a new file, since a grown segment
+or a re-upload after deletion is a different file). With `--truncate-wal`,
+segments wholly below the archived snapshot are removed locally only after
+their archive copy was verified in that run (§4 rule 5).
+
+`index restore` takes the manifest, the newest archived snapshot, and the
+segments it does not wholly cover (names validated against the expected
+patterns), downloads them into a sibling staging directory, verifies each
+BLAKE3, and runs a full recovery there; only a set that opens is renamed into
+the destination (which must be absent or empty), so a failed restore leaves
+nothing behind. Superseded archive files are never deleted: retention of
+archived parts (deleting files covered by a newer committed snapshot through
+the logical-delete path, and marking them as system files) is deferred to
+M4, and GC and `portal delete` do not yet treat archived parts as
+referenced.
 
 ## 11. Memory accounting and admission
 
 Hot set per slot (RAM): `dims + 8` (int8, scale, norm) + graph links and
 bookkeeping, **measured** in pass 4 as 182 bytes at M = 16 and 310 bytes at
 M = 32 (`docs/bench/README.md`), + slot metadata (32) + key map (≈ 48) +
-payload bytes when payloads are RAM-resident. Published formula:
+payload bytes when payloads are RAM-resident. This section is the single
+source of the published formula:
 
     hot_bytes_per_vector = dims + 8 + graph(M) + 80 + payload
+    graph(M) = 54 + 8·M      (the line through 182 at M = 16 and 310 at M = 32)
 
-with `graph(16) = 182`, `graph(32) = 310`; at 512 dims and M = 32 that is
-about 900 bytes before payload. The `f32` originals (`dims × 4`) and the
-snapshot file count against the **disk** budget and the page cache, not the
-RAM budget. Admission uses these measured values, not the estimate.
+At 512 dims and M = 32 that is 910 bytes before payload. Each partition also
+holds its idempotency window, about 40 bytes per entry (up to 40 MB at the
+default `W`), counted in `resident_bytes` but not per vector. The `f32`
+originals (`dims × 4`) and the snapshot file count against the **disk**
+budget and the page cache, not the RAM budget, except while they are on the
+heap between a write and the next snapshot (§7). Admission uses these
+measured values, not the estimate.
 
 A partition has an optional RAM budget (`ram_budget_bytes`; none means
 unlimited) and reserves compaction headroom (`headroom_fraction`, default
 35%). An upsert is refused with `PartitionError::OverBudget` (which reports
 resident, projected, admissible, and budget bytes) when
 `resident_bytes + hot_bytes_per_insert(payload) > budget × (1 − headroom)`,
-where `resident_bytes` is the accounted int8, graph, key, slot, and payload
-footprint and `hot_bytes_per_insert` is the published formula. Deletes are
+where `resident_bytes` is the accounted int8, graph, key, slot, payload, and
+idempotency footprint plus any `f32` rows not yet served from a snapshot,
+and `hot_bytes_per_insert` is the published formula. `resident_bytes` is the
+same before and after a reopen once a snapshot has been written. It is
+recomputed by a scan on every budgeted upsert (O(n)); a running counter is a
+deferred optimization that should land with group commit. Deletes are
 always admitted because they only add a tombstone bit and must stay possible
 when the partition is full; compaction then reclaims the space. Refusals
 never lower durability or drop data, mirroring the M1 rule. The budget can
@@ -323,8 +474,15 @@ and the portal's capacity admission (M1) governs the archive copies.
 
 ## 12. Named crash points
 
-The failpoint harness (M1 style: the process exits at the boundary and a
-fresh process recovers) covers:
+The failpoint harness covers the points below. It is an **in-process**
+model: the partition returns `Injected` at the boundary, the test drops it
+without a clean close, and a new `Partition::open` recovers the directory.
+That proves exactly-once replay and the recovery logic, but not durability:
+the page cache keeps unsynced bytes across a drop, so it cannot catch a
+missing or misplaced `fdatasync`. A subprocess kill harness and a
+`dm-log-writes` run of the WAL and snapshot paths (reusing
+`scripts/power-loss-drill.sh`) are still owed; until then host power loss
+for the engine is an explicit M3 limitation.
 
 | Point | Expected outcome after recovery |
 |---|---|
@@ -333,12 +491,18 @@ fresh process recovers) covers:
 | after apply, before ack | same; the client retry with the same `op_id` deduplicates |
 | snapshot temp written, before rename | temp ignored; recovery from the previous snapshot plus WAL |
 | after snapshot rename, before WAL truncation | new snapshot used; older segments still present and harmless |
-| compaction: new snapshot written, before swap | recovery uses the newest verifiable snapshot; content identical either way |
+| compaction: new snapshot written, before swap | recovery uses the newest verifiable snapshot; the same logical state either way |
 | compaction: after swap, before old-state cleanup | old files harmless; collected later |
 
 Corruption cases that must fail closed: bad segment header, bad mid-segment
-entry, `seq` gap, snapshot header CRC, any section BLAKE3, footer hash, a
-snapshot for another partition id, an unsupported version.
+entry (including a damaged `len` field anywhere before the last entry), any
+damage in a sealed segment (with nothing truncated), `seq` gap, a WAL that
+ends below the snapshot's high-water mark, a missing or unverifiable
+bulk-load base snapshot, snapshot header CRC, any section BLAKE3, footer
+hash, a snapshot that disagrees with `partition.json` or holds a dangling
+reference, a snapshot for another partition id, an unsupported version.
+Cases that must recover as torn tails: a short or CRC-failing final entry, a
+zero-filled tail, and a newest segment whose header was never written.
 
 ## 13. Out of scope for this contract
 
