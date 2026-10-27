@@ -2,8 +2,9 @@
 
 Self-hosted, Tailscale-native distributed semantic storage service: replicated
 encrypted blobs plus distributed HNSW vector search. Product design lives in
-`DESIGN.md`. M0 is accepted; M1 blob-plane implementation is in progress under
-`crates/distr-hnsw/`.
+`DESIGN.md`. M0 is accepted. M1 (blob plane, `crates/distr-hnsw/`) is
+reopened and M3 (vector engine, `crates/distr-hnsw-index/`) is in progress
+while the October 2026 hardening pass (`docs/hardening-2026-10.md`) lands.
 
 
 ## Stack
@@ -31,7 +32,7 @@ encrypted blobs plus distributed HNSW vector search. Product design lives in
 
 - Documentation should go in /docs. If there isn't /docs already, create the directory.
 - Update documentation as you go. Should be concise, accurate, with docs on the tech stack, architecture, etc.
-- Documentation should be professional, as the end goal fo this project is not only a learning project, but also hopefully something we can open-source.
+- Documentation should be professional, as the end goal of this project is not only a learning project, but also hopefully something we can open-source.
 
 ## Git
 
@@ -46,20 +47,27 @@ encrypted blobs plus distributed HNSW vector search. Product design lives in
 - `DESIGN.md` — product and architecture specification.
 - `AGENTS.md` / `CLAUDE.md` — repository guidance.
 - `docs/` — living documentation (phase status, next steps).
+- `docs/architecture.md` — system overview for new readers.
+- `docs/deployment.md` — deployment guide and the limitations it must carry.
 - `docs/roadmap.md` — gated milestones, acceptance criteria, and verification.
+- `docs/next-steps.md` — the immediate work queue.
+- `docs/hardening-2026-10.md` — the audit that reopened M1 and M3, and its
+  fix list (required items gate re-acceptance).
 - `docs/m1-storage-contract.md` — persistent-format and durability contract for
   the implemented M1 blob-plane passes.
 - `docs/m1-implementation-plan.md` — M1 work packages and dependency order.
 - `docs/m1-lifecycle-contract.md` — safety gates for reconciliation, movement,
   retirement, and physical deletion.
 - `docs/m1-filesystem-qualification.md` — durable-write review per filesystem
-  and the power-loss drill still owed.
+  and the power-loss drill results.
 - `docs/m1-phase-1-decisions.md` — ratified phase-1 decisions (key custody,
   backup target, admission) and the tests each must pass.
 - `docs/m1-restore-drill.md`, `docs/m1-lifecycle-matrix.md`,
   `docs/m1-capacity-drill.md` — M1 drill evidence.
 - `scripts/` — operational drills and the MinIO test harness (see
-  `scripts/README.md`).
+  `scripts/README.md`); `scripts/bench/` — dataset preparation for the
+  engine benches.
+- `docs/bench/` — pinned dataset manifests and published benchmark results.
 - `crates/distr-hnsw/` — product service and CLI; keep this separate from the
   disposable phase-0 prototype.
 - `crates/distr-hnsw-index/` — single-partition vector engine (M3): flat
@@ -109,30 +117,35 @@ DESIGN §15 (`docs/phase-0-validation.md`). Do not retune the holdout or grow th
 prototype into product code. M1 is unblocked and starts with the recovery-first
 blob-plane slice in `docs/roadmap.md`.
 
-**M1 status:** Accepted 2026-09-30 with recorded limitations (`docs/roadmap.md`).
+**M1 status:** Reopened 2026-10-25 (accepted 2026-09-30). The audit in
+`docs/hardening-2026-10.md` found GC, retirement, backup, and recovery
+defects; the fixes are covered by `tests/hardening.rs` and wait on drill
+re-runs from a clean revision.
 The blob plane (`crates/distr-hnsw/`) provides the RF2 commit spine, logical
 deletion, recovery, incarnations and observations, scrub/repair, drain,
 retire, capacity admission, proof-based GC, master-key recovery bundles, and
 backup set v1 with directory and S3 targets (`portal init|put|get|delete|
-recover|scrub|health|key|backup|restore|drain|retire|gc`). Drills and their
+recover|scrub|health|key|backup|restore|drill|drain|retire|gc`). SQLite schema
+is v9. Drills and their
 evidence: `scripts/` and `docs/m1-*-drill.md`, `docs/m1-lifecycle-matrix.md`,
 `docs/m1-filesystem-qualification.md`. Agents stay loopback-only until M2.
 Tests use `TMPDIR=target/` via `.cargo/config.toml` so they run on a real
-filesystem; `aws-lc-sys` needs a C compiler. Large matrices and drills run on
+filesystem; `aws-lc-sys` needs a C compiler. The S3 tests are `#[ignore]`d
+and run against MinIO with `scripts/minio-test.sh`. Process tests rely on
+`DISTR_HNSW_FAILPOINT`, which only debug builds or `--features failpoints`
+honor. Large matrices and drills run on
 `anthonypc`.
 
-**M3 status:** Exit review passed 2026-10-01; acceptance proposed with one
-limitation (`project-nomic-512` measurements wait on the shared GPU). The
-engine (`crates/distr-hnsw-index`) provides flat and int8 vectors, HNSW with
-measured per-metric defaults, filtered search with a measured cutover, WAL and
-snapshots with fail-closed recovery, two-phase compaction, and RAM budget
-admission; `distr-hnsw index archive|restore` moves partition state through
-the blob plane. Evidence: `docs/bench/README.md`, `docs/m3-engine-contract.md`.
-
-**M3 status:** Exit review passed 2026-10-01; acceptance proposed with one
-limitation (`project-nomic-512` measurements wait on the shared GPU). The
-engine (`crates/distr-hnsw-index`) provides flat and int8 vectors, HNSW with
-measured per-metric defaults, filtered search with a measured cutover, WAL and
-snapshots with fail-closed recovery, two-phase compaction, and RAM budget
-admission; `distr-hnsw index archive|restore` moves partition state through
-the blob plane. Evidence: `docs/bench/README.md`, `docs/m3-engine-contract.md`.
+**M3 status:** In progress. Seven passes completed and the exit review passed
+on 2026-10-01; the 2026-10-25 audit withdrew it (WAL length-field corruption
+read as a torn tail, unreachable inserts after mass deletion, benchmark
+reports without a source revision). The engine (`crates/distr-hnsw-index`)
+provides flat and int8 vectors, HNSW, filtered search with a measured
+cutover, WAL and snapshots, two-phase compaction, and RAM budget admission;
+`distr-hnsw index archive|restore` moves partition state through the blob
+plane. An open `Partition` holds an exclusive directory lock, so archive is
+offline-only and fails with `Locked` beside a running server. Durable
+directory creation lives in `fsutil.rs`. Published bench numbers must come
+from a clean commit with `--canonical`; the harness embeds `git describe
+--dirty` and the executable hash. Evidence: `docs/bench/README.md`,
+`docs/m3-engine-contract.md`.

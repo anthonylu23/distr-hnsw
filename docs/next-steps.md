@@ -2,39 +2,62 @@
 
 The full gated implementation sequence, milestone acceptance criteria, and
 verification requirements are maintained in [roadmap.md](roadmap.md). This page
-tracks only the immediate work needed to advance the current milestone.
+tracks only the immediate work queue.
 
-## M0 and M1 closed
+## Current position
 
-M0 was accepted on 2026-07-19 (`nomic-embed-text @ 512`, see
-[phase-0-validation.md](phase-0-validation.md)). M1 was accepted on
-2026-09-30 with recorded limitations; the evidence is indexed in
-[roadmap.md](roadmap.md) and the accepted limitations are listed there.
-Keep `prototype/` disposable.
+- M0 accepted on 2026-07-19 (`nomic-embed-text @ 512`, see
+  [phase-0-validation.md](phase-0-validation.md)). Keep `prototype/`
+  disposable.
+- M1 accepted on 2026-09-30 and **reopened on 2026-10-25**. M3 exit review
+  withdrawn the same day. Both result from the audit in
+  [hardening-2026-10.md](hardening-2026-10.md).
+- M2 starts after the hardening pass.
 
-## M3 exit review passed
+## Hardening pass (now)
 
-The single-partition engine completed its seven passes on 2026-10-01
-([m3-implementation-plan.md](m3-implementation-plan.md)); the roadmap holds
-the per-criterion evidence and proposes acceptance with one limitation.
+1. Blob-plane and engine fixes are in the working tree with regression
+   tests ([hardening-2026-10.md](hardening-2026-10.md)). Review them.
+2. Commit them as scoped commits (blob plane, engine, docs) so the drills
+   and benches below run from a clean tree.
+3. From that clean revision on `anthonypc`:
+   - `scripts/restore-drill.sh` (directory) and
+     `scripts/restore-drill.sh --target s3:…` against MinIO, then
+     `portal drill record` to exercise `recovery_ready`;
+   - `scripts/lifecycle-matrix.sh`, extended with GC-then-retire and
+     GC-after-metadata-restore orders;
+   - `scripts/minio-test.sh`;
+   - optionally `scripts/power-loss-drill.sh` (sudo) for the changed
+     durable-write paths.
+4. Re-run the M3 benches with `--canonical` from the same clean revision:
+   `oracle`, `hnsw`, int8, `filtered`, `persist`, and `compact` on all three
+   pinned sets. Publish p95 next to p50 and quote ef next to every recall
+   figure. Record two explicit decisions: the 1M × 512 build-throughput
+   threshold, and the cosine default ef (400 gives glove 0.966, below the
+   0.97 target).
+5. Update the evidence documents and the roadmap. Then decide whether to
+   re-accept M1 and accept M3 (owner decision). `project-nomic-512` still
+   waits on the GPU and remains a recorded M3 limitation.
 
-Immediate tasks:
+## After hardening
 
-1. **Owner decision:** accept M3 with the recorded limitation, or hold
-   acceptance until the project dataset is measured.
-2. Build `project-nomic-512` when the GPU is free (`scripts/bench/` plus the
-   M0 prototype embedder), then run `oracle`, `hnsw`, `filtered`,
-   `persist`, and `compact` against it and append the rows to
-   [bench/README.md](bench/README.md). No code change is expected.
-3. Start M2 (Tailscale identity and authorization): decide the test tailnet
+1. **M2 (Tailscale identity and authorization).** Choose the test tailnet
    (a second machine or VM as the unauthorized node) and the portal
-   certificate approach.
-4. Write the deployment guide that carries the M1 accepted limitations and
-   requires `scripts/restore-drill.sh --target s3:...` against the real
-   offsite bucket before a deployment is called recovery ready.
-5. Engine follow-ups that M4 will want: WAL group commit (contract §4 rule
-   1), and a scheduler that calls `begin_compaction` when
-   `compaction_recommended()` is true.
+   certificate approach. The authorization matrix must cover agent `DELETE`
+   and inventory first, bind agent ids to node keys, and refuse a DELETE
+   without a portal-signed GC proof.
+2. **M4 design prerequisites** (design before code):
+   - WAL and snapshot entries carry no epoch; promotion needs `(epoch, seq)`
+     or a hash chain, which is a format v2 change.
+   - Parallel build is scheduling-dependent, so replicas diverge after
+     compaction; decide what replicas must agree on.
+   - The engine needs a concurrency model for searches during compaction
+     finish and snapshot writes.
+   - Snapshot cadence, compaction scheduling, and WAL group commit.
+3. **Open-source hygiene.** Remove the personal vault fixture from the tree
+   (history rewrite is the owner's call). Replace host and user names in
+   public docs with roles. Add CI running fmt, clippy, and the non-sudo
+   tests.
 
 ## Ops notes
 

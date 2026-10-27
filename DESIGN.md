@@ -1,4 +1,4 @@
-# distr-hnsw — Design Document (v2.1)
+# distr-hnsw — Design Document (v2.2)
 
 **A unified distributed semantic storage service, self-hosted on a Tailscale
 network.**
@@ -12,7 +12,10 @@ same indexing substrate to advanced applications; it is an extension of the
 storage service, not a second product. The system is designed so that other
 people can deploy it on their own tailnets.
 
-Status: pre-implementation design, v2.1 (2026-07-17). Supersedes the v1
+Status: design v2.2 (2026-10-25). Implementation status and milestone
+evidence live in [docs/roadmap.md](docs/roadmap.md); this document states
+intended behavior and invariants. v2.2 aligns §6.5, §6.6, §10, §11, §13, and
+§14 with the accepted M1 decisions and the M3 measurements. v2.1 (2026-07-17) superseded the v1
 file-system-only spec after the pivot to vector-native organization. v2.1
 folds in design-review feedback: a phase-0 validation prototype, hybrid
 keyword+semantic search, filtered-ANN execution modes, a first-class
@@ -455,14 +458,18 @@ residency can be controlled exactly. Nodes retain OS and compaction headroom;
 they do not pack nominal partition estimates to 100% of physical RAM or disk.
 
 Vectors in the v1 graph and snapshot format are stored **int8
-scalar-quantized** (~4× RAM reduction, typically ~1% recall cost);
+scalar-quantized** (~4× RAM reduction; measured recall cost at most 0.0005
+after exact rescoring on the pinned public sets);
 full-precision originals remain in the WAL/snapshot stream so top candidates
 can be exactly rescored and requantization stays possible. File collections
 default to **≤768 dimensions** (natively or via Matryoshka truncation).
-Capacity planning and admission control share one published formula —
-`vectors × dims × bytes_per_dim × overhead_factor` against aggregate cluster
-budgets, with the overhead factor (graph links ≈ 100–150 bytes/node at M=16,
-payload, allocator slack) *measured* by the benchmark suite, not assumed. A
+Capacity planning and admission control share one published, additive
+per-vector formula, *measured* by the benchmark suite rather than assumed
+(engine contract §11): `hot_bytes = dims + 8 + graph(M) + 80 + payload`, with
+`graph(M) = 54 + 8·M` (182 bytes measured at M=16, 310 at M=32), or about
+910 bytes per vector at 512 dims and M=32. Each partition also holds its
+idempotency window. The `f32` originals live in the memory-mapped snapshot
+and count against disk and page cache, not the RAM budget. A
 collection's ceiling is the aggregate RAM budget across machines — RAM scales
 linearly with added machines via partition placement — but a single
 partition's graph must stay RAM-local to one node, which the size-triggered
@@ -479,7 +486,8 @@ used.
   mutable metadata, which avoids double-writing tags into vector payloads —
   and ships the matching-id set to index nodes as a roaring bitmap (a 1M-file
   id space compresses to KBs–low MBs; fine over the tailnet).
-- **Selective filter** (candidates below a threshold on the order of 50×k):
+- **Selective filter** (at most `200 · ef_search` candidates, set from the
+  M3 measurements; the latency crossover scales with `ef`, not `k`):
   skip the graph entirely and brute-force exact distances over just the
   matching vectors. Perfect recall, trivially cheap — precisely the regime
   where graph traversal collapses.
@@ -489,7 +497,11 @@ used.
 
 The recall benchmark measures filtered queries at multiple selectivity levels
 (0.1%, 1%, 10%, 50%); the brute-force cutover threshold is set from those
-measurements, not guessed.
+measurements, not guessed. The single-partition engine (M3) accepts the
+allowed set as a bitmap of internal slots, which are not stable across
+upserts, compaction, or replicas. Before filters carry authorization (M2
+grants), each record gains a stable portal-assigned id and the partition
+translates record-id bitmaps to slots under the state it searches.
 
 ---
 
@@ -696,7 +708,10 @@ replace browser-session or application authorization.
   by Argon2id (RFC 9106 parameters, floor enforced) from a passphrase kept
   off-cluster. The bundle is emitted once at `init` as printable text, never
   stored in the cluster or its backups, and `init` does not complete until the
-  operator proves it round-trips. Shamir splitting and rotation are reserved
+  operator proves it round-trips. (As implemented in M1, `init` proves the
+  bundle round-trips with the in-memory secret and owes the bundle durably
+  until it is emitted. Interactive passphrase re-entry is open for the M6
+  setup flow.) Shamir splitting and rotation are reserved
   bundle-v2 seams. Losing both the passphrase and every cluster disk loses the
   data, by design. Details: `docs/m1-phase-1-decisions.md`.
 - **Vault**: content keys wrapped by an Argon2id passphrase-derived key the
@@ -876,7 +891,7 @@ usage per partition). Plain HTTP, streaming bodies, curl-able. No gRPC.
 | HNSW | **in-repo implementation** | persistence, deletes/tombstones, crash recovery, mmap snapshots, and measured recall are core learning and product goals. Owning the engine means owning its format and failure behavior; it is an intentional schedule cost. |
 | distance kernels | simsimd or stable architecture intrinsics; optional nightly `std::simd` experiments | the hot loop; stable builds do not depend on experimental portable SIMD |
 | index persistence | custom binary snapshots + memmap2; CRC-checksummed WAL segments | recovery and compaction are first-class |
-| metadata | SQLite (rusqlite/sqlx) + Litestream | single writer within the measured v1 envelope, ops simplicity, Postgres escape hatch |
+| metadata | SQLite (rusqlite) with `VACUUM INTO` snapshots to the backup target | single writer within the measured v1 envelope, ops simplicity, Postgres escape hatch; Litestream is an optional later addition |
 | hashing / crypto | BLAKE3; XChaCha20-Poly1305, Argon2id (RustCrypto) | as v1 |
 | tailscale | LocalAPI over Unix socket (WhoIs, certs) | §3 |
 | embeddings | provider trait → TEI/Ollama (local) or OpenAI-compatible (api) | §7 |
@@ -903,25 +918,25 @@ a calendar rather than in the abstract.
 1. **Blob plane + recovery foundation** (~2–3 months) — agent + chunk store +
    volumes/quotas; then portal-core commit state machine, placement, write
    quorum, delete, scrub/reconcile/move. Add offsite encrypted-object backup,
-   independent master-key recovery, Litestream restore, and an
+   independent master-key recovery, `VACUUM INTO` snapshot restore, and an
    empty-infrastructure drill. Torture tests green on 3 local processes. This
    remains first because everything above it—snapshots, WALs, and source
    documents—stands on it. distr-hnsw may not hold the only copy of a file until
    this recovery gate passes.
 
-   Current implementation status: passes 1 and 2 plus compatibility hardening
-   provide the RF2 upload spine, logical deletion without agent DELETE, strict
-   object inventories, canonical SQLite v3 migration, live pre-commit replica
-   validation, and explicit plan/apply recovery with recovery-only repair. M1
-   remains in progress; reconciliation, lifecycle/GC, backup/key recovery, and
-   the empty-infrastructure restore gate are still open.
+   Status: implemented (schema v9). Accepted 2026-09-30 and reopened
+   2026-10-25 by the hardening audit; see
+   [docs/roadmap.md](docs/roadmap.md) and
+   [docs/hardening-2026-10.md](docs/hardening-2026-10.md).
 2. **Tailscale auth + sessions + API keys** (~2–4 weeks) — WhoIs provider,
    certs, bind discipline, ACL docs.
 3. **Single-partition vector engine** (~1–2 months) — HNSW
    build/query/persist, int8 scalar quantization with exact rescoring, WAL,
    snapshot/restore, tombstones + compaction, filtered-query execution
    (masked traversal + brute-force cutover, §6.6), recall benchmarks vs.
-   brute force on standard datasets — unfiltered and filtered.
+   brute force on standard datasets — unfiltered and filtered. Status: seven
+   passes implemented; acceptance waits on the hardening pass and canonical
+   benchmark re-runs ([docs/roadmap.md](docs/roadmap.md)).
 4. **Distributed vector plane** (~2–3 months) — partitions, routing table, WAL
    replication + quorum, epochs/fencing/promotion, scatter-gather query merge,
    partition movement protocol, the balancer (budgets, joins, splits). Failure

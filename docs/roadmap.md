@@ -11,9 +11,9 @@ design first and then bring this document back into alignment.
 | Milestone | State | Exit gate |
 |---|---|---|
 | M0 — Semantic validation | **Accepted** | Larger representative bake-off produces a documented go decision and locks the default local model and dimensions |
-| M1 — Blob plane and recovery foundation | **Accepted** (2026-09-30, with recorded limitations) | Blob durability and an empty-infrastructure restore drill pass |
-| M2 — Tailscale identity and authorization | Ready to start | Network identity, sessions, grants, and API-key boundaries pass adversarial tests |
-| M3 — Single-partition vector engine | **Exit review passed** (2026-10-01; acceptance proposed with one limitation) | Persistence, recovery, recall, filtering, and compaction gates pass against brute force |
+| M1 — Blob plane and recovery foundation | **Reopened** (2026-10-25; accepted 2026-09-30) | Blob durability and an empty-infrastructure restore drill pass |
+| M2 — Tailscale identity and authorization | Not started (follows the hardening pass) | Network identity, sessions, grants, and API-key boundaries pass adversarial tests |
+| M3 — Single-partition vector engine | **In progress** (seven passes done; exit review reopened 2026-10-25) | Persistence, recovery, recall, filtering, and compaction gates pass against brute force |
 | M4 — Distributed vector plane | Not started | Quorum, fencing, promotion, movement, and balancing survive failure injection |
 | M5 — File extraction and semantic retrieval | Not started | Files flow safely from extraction through reproducible hybrid search |
 | M6 — Dashboard and operations | Not started | User and operator workflows are complete, truthful, and accessible |
@@ -29,12 +29,22 @@ to the best eligible dimension. M0 is accepted and M1 is unblocked. See
 [phase-0-validation.md](phase-0-validation.md) and
 [next-steps.md](next-steps.md).
 
-M1 is **Accepted** as of 2026-09-30. The blob plane provides the RF2
+**Hardening pass (2026-10-25).** A code and documentation audit found
+defects that invalidate accepted M1 criteria (garbage collection after a
+stale metadata restore, retirement and backup after GC, and recovery
+convergence after a retried delete) and M3 criteria (WAL corruption read as
+a torn tail, unreachable inserts after mass deletion). M1 is reopened and
+M3's exit review is withdrawn until the required items in
+[hardening-2026-10.md](hardening-2026-10.md) are fixed and re-verified from a
+clean revision. M2 starts after that pass.
+
+M1 was **Accepted** on 2026-09-30 and **Reopened** on 2026-10-25. The blob plane provides the RF2
 commit spine, durable logical deletion, recovery from immutable objects,
 agent incarnations and complete-scan observations, copy-first scrub and
 repair, drain and retirement, capacity admission, proof-based garbage
 collection, master-key recovery bundles, and backup set v1 with directory and
-S3-compatible targets. Evidence: the test suite (72 tests), the power-loss
+S3-compatible targets. Evidence: the test suite (the S3 tests run only
+against MinIO through `scripts/minio-test.sh`), the power-loss
 drill ([m1-filesystem-qualification.md](m1-filesystem-qualification.md)), the
 capacity drill ([m1-capacity-drill.md](m1-capacity-drill.md)), the lifecycle
 matrix ([m1-lifecycle-matrix.md](m1-lifecycle-matrix.md)), and the
@@ -49,11 +59,17 @@ unqualified; offsite retention and expiry are enforced by the target's
 lifecycle and Object Lock configuration, not by the portal; the S3 run used
 MinIO on the same host, so every real deployment must repeat the restore
 drill against its own offsite bucket before it may be called recovery
-ready. See [m1-implementation-plan.md](m1-implementation-plan.md),
+ready. Until M2, any local process can also call an agent's `DELETE`; the
+portal deletes only through applied GC proofs. See
+[m1-implementation-plan.md](m1-implementation-plan.md),
 [m1-filesystem-qualification.md](m1-filesystem-qualification.md), and the
-proposed decisions in [m1-phase-1-decisions.md](m1-phase-1-decisions.md).
+ratified decisions in [m1-phase-1-decisions.md](m1-phase-1-decisions.md).
 
-M3's exit review was completed on 2026-10-01 after seven passes
+M3's exit review was completed on 2026-10-01 after seven passes and withdrawn
+on 2026-10-25 (see the hardening pass above; the review also found that
+benchmark reports carry no usable source revision, that p95 latency is not
+published, and that the 1M × 512 build-throughput threshold is likely to be
+missed at M=32 without a recorded decision). The original review
 ([m3-implementation-plan.md](m3-implementation-plan.md)). Every acceptance
 criterion below carries evidence from the engine test suite
 (`crates/distr-hnsw-index`), the blob-plane archive test
@@ -265,26 +281,30 @@ closed only when its listed tests and drills pass.
 
 - [x] Delete makes a file unreadable only after its deletion marker is durable;
   a stale SQLite restore or returning stale node cannot resurrect it.
-- [x] Repair, rebalance, quota changes, and garbage collection never remove an
+- [ ] Repair, rebalance, quota changes, and garbage collection never remove an
   old copy before a replacement is durable and confirmed.
   Evidence: copy-first repair, drain, and retire (`tests/lifecycle_gc.rs`, [m1-lifecycle-matrix.md](m1-lifecycle-matrix.md)); GC deletes only through an applied proof.
+  Reopened 2026-10-25: GC could delete an acknowledged file's chunks after a stale metadata restore (H1). Fixed in `tests/hardening.rs`; the lifecycle matrix must be re-run with GC-after-restore and GC-then-retire orders.
 - [x] Bit flips are detected by ciphertext hash verification and repaired from
   a valid replica without serving corrupt plaintext.
   Evidence: 24 injected flips, truncations, and removals detected and repaired with every sampled download intact ([m1-lifecycle-matrix.md](m1-lifecycle-matrix.md)).
-- [x] Staging garbage and unreferenced chunks are collected only after the
+- [ ] Staging garbage and unreferenced chunks are collected only after the
   documented grace, reference, observation, and node-retirement gates.
-  Evidence: `portal gc` proofs: observation after deletion, retention or grace, no pending movement, deferral when an agent is unreachable (`tests/lifecycle_gc.rs`, [m1-lifecycle-matrix.md](m1-lifecycle-matrix.md)).
+  Evidence: `portal gc` proofs: observation after deletion, retention or grace, no pending movement, deferral when an agent is unreachable, no control object unknown to the metadata, backup coverage of deleted generations, no pending recovery (`tests/lifecycle_gc.rs`, `tests/hardening.rs`, [m1-lifecycle-matrix.md](m1-lifecycle-matrix.md)).
+  Reopened 2026-10-25 (H1, H2): fixed in the working tree; awaiting the matrix re-run.
 - [x] ENOSPC and global budget exhaustion produce admission-control errors and
   actionable health state without violating the replica floor.
   Evidence: agent HTTP 507 and portal exit 3 with the floor intact; real `ENOSPC` on a loop device ([m1-capacity-drill.md](m1-capacity-drill.md)).
 
 #### Recovery
 
-- [x] A portal crash at every boundary in the commit and delete protocols
+- [ ] A portal crash at every boundary in the commit and delete protocols
   recovers to either one complete committed state or harmless collectible
   garbage—never a visible partial file.
-- [x] Core file records newer than an older SQLite restore point can be
+  Reopened 2026-10-25: a delete abandoned at a boundary and retried under a new key minted a second marker, and recovery then never converged (H3, H4). A recovered upload's same-key retry collided with the recovered file. Fixed in `tests/hardening.rs`.
+- [ ] Core file records newer than an older SQLite restore point can be
   reconstructed from manifests, deletion markers, and inventories.
+  Reopened 2026-10-25 with the item above; awaiting the restore-drill re-run.
 - [x] The master key can be recovered without relying on any surviving cluster
   machine, and wrong or missing key material fails closed.
   Evidence: recovery bundle v1 and `portal key`; wrong key, wrong passphrase, tampering, and out-of-range KDF parameters fail closed (`tests/commit_spine_process.rs`).
@@ -292,9 +312,10 @@ closed only when its listed tests and drills pass.
   versioned offsite objects, SQLite history, and independent key material;
   regular-file bytes match their original hashes.
   Evidence: [m1-restore-drill.md](m1-restore-drill.md): 64 files, ~250 MB, directory and S3 (MinIO, Object Lock) targets; 7.7 s and 4.2 s recovery time.
-- [x] Backup lag, last integrity verification, RPO/RTO targets, retention, and
+- [ ] Backup lag, last integrity verification, RPO/RTO targets, retention, and
   last restore-drill result are externally observable.
-  Evidence: `portal health` backup status (lag, verified and pending objects, last snapshot, last integrity sample, `recovery_ready`); declared vs. actual RPO/RTO in the drill report. Accepted limitation: retention is enforced by the target's lifecycle and Object Lock rules, not by the portal.
+  Evidence: `portal health` backup status (lag, verified and pending objects, last snapshot, last integrity sample, last recorded restore drill with declared and actual RPO/RTO, and a derived `recovery_ready`); `portal drill record`. Accepted limitation: retention is enforced by the target's lifecycle and Object Lock rules, not by the portal.
+  Reopened 2026-10-25: `recovery_ready` was hard-coded false and drill results were not recorded. Implemented in the working tree (`tests/hardening.rs`); awaiting a recorded drill.
 - [x] Master-key custody, backup defaults, and globally-over-budget admission
   behavior are documented decisions with tested recovery/failure behavior.
   Evidence: ratified in DESIGN §10, §11.1, §15 with tests listed in [m1-phase-1-decisions.md](m1-phase-1-decisions.md).
@@ -410,30 +431,33 @@ quality, and resource model before adding replication and distributed routing.
 
 ### Acceptance criteria
 
-- [x] Exact and ANN query results obey the configured distance metric,
+- [ ] Exact and ANN query results obey the configured distance metric,
   deterministic tie rules, upsert semantics, and tombstones.
-  Evidence: oracle tie-rule and kernel property tests; HNSW model-based tests against the oracle with interleaved insert, upsert, delete, and query ([m3-engine-contract.md](m3-engine-contract.md) §1–§3); oracle recall 1.0 on every pinned set.
+  Evidence: oracle tie-rule and kernel property tests; HNSW model-based tests against the oracle with interleaved insert, upsert, delete, and query ([m3-engine-contract.md](m3-engine-contract.md) §1–§3); oracle recall 1.0 on every pinned set. Non-finite queries are rejected on every metric; `k` and `ef` are bounded.
+  Reopened 2026-10-25: inserts made after mass deletion were unreachable because construction never routed through tombstones (H6), and a parallel-build race could leave a live record without in-links. Both fixed with tests (delete-all then upsert; 99% tombstoned; every node has an in-link).
 - [x] Unfiltered and filtered recall meet documented thresholds against brute
   force on fixed public datasets and representative project data.
-  Evidence: sift 0.987 at M = 16 / ef = 100, nytimes 0.975 and glove 0.985 at M = 32 ([bench/README.md](bench/README.md)); filtered recall 0.983 to 1.000 from 0.1% to 50% selectivity on both routes. Proposed limitation: the project dataset (`project-nomic-512`) is pending the shared GPU; thresholds are fixed in the plan.
+  Evidence: sift 0.987 at M = 16 / ef = 100, nytimes 0.975 at M = 32 / ef = 400, and glove 0.985 at M = 32 / ef = 800 ([bench/README.md](bench/README.md)); filtered recall 0.983 to 1.000 from 0.1% to 50% selectivity on both routes. Open decision: the cosine default ef = 400 gives glove 0.966, below the 0.97 target. The defaults now live in code (`HnswParams::for_metric`). Proposed limitation: the project dataset (`project-nomic-512`) is pending the shared GPU; thresholds are fixed in the plan. All published figures predate the hardening pass and wait on canonical (`--canonical`, clean commit) re-runs.
 - [x] Int8 retrieval plus exact rescoring meets its documented recall/latency
   budget and never returns a score computed from the wrong vector/version.
   Evidence: int8 recall within 0.0005 of f32 on every set at about twice the throughput; rescoring reads the f32 original of the current slot only, and upsert tombstones the old slot before the new one is searchable (contract §3, §7).
 - [x] Acknowledged WAL entries survive process/host restart and replay exactly
   once in sequence.
-  Evidence: failpoint tests at every append, sync, and apply boundary; torn-tail truncation; idempotency replay (`partition.rs` tests); 1,000-entry tail replayed on sift and glove with byte-identical results.
+  Evidence: failpoint tests at every append, sync, and apply boundary; torn-tail truncation; idempotency replay (`partition.rs` tests); 1,000-entry tail replayed on sift and glove with byte-identical results. The writer refuses appends after any failed write, sync, or rotation, and partition, `wal/`, and `snap/` directories are created with parent syncs. Limitation: the crash evidence is in-process; a subprocess kill harness and a power-loss run for the engine are still owed.
 - [x] Snapshot plus WAL-tail restore reproduces logical records, tombstones,
   idempotency state, and the committed high-water mark.
   Evidence: section-by-section round-trip tests; recovery 1.8 s on sift 1M and 5.4 s on glove 1.18M with identical search results; `index restore` through RF2 loopback agents reproduces the state and high-water mark.
-- [x] Truncated, reordered, or checksum-invalid WAL/snapshot data fails closed
+- [ ] Truncated, reordered, or checksum-invalid WAL/snapshot data fails closed
   with a recoverable diagnosis.
-  Evidence: corrupt header, mid-segment entry, sequence gap, snapshot header CRC, section BLAKE3, footer, wrong partition id, and missing-history tests; the newest verifiable snapshot is used and a damaged one is reported in the recovery report.
-- [x] Compaction under concurrent reads/writes neither loses acknowledged
+  Evidence: corrupt header, mid-segment entry, sequence gap, snapshot header CRC, section BLAKE3, footer, wrong partition id, and missing-history tests; the newest verifiable snapshot is used and a damaged one is reported in the recovery report. Added: every bit of every non-final length field, zero-filled tails, damage in sealed segments, a WAL that stops short of the snapshot, and a bulk-loaded partition whose base snapshot is missing.
+  Reopened 2026-10-25: a corrupt length field was read as a torn tail, so acknowledged entries were truncated silently (H5); repair could truncate a sealed segment; a bulk-loaded partition opened without its snapshot. Fixed with the tests above; awaiting acceptance review.
+- [ ] Compaction under concurrent reads/writes neither loses acknowledged
   operations nor makes deleted records visible.
-  Evidence: two-phase compaction test with writes between `begin` and `finish`, deletes before compaction, and the `CompactionBeforeSwap` crash point; compaction benchmark on sift 1M with 20% deleted and 1,000 concurrent upserts returns zero deleted keys ([bench/README.md](bench/README.md)).
+  Evidence: two-phase compaction (a short capture step, then a rebuild that owns its input) with a multithreaded test in which writers run during the rebuild; deletes before compaction; the `CompactionBeforeSwap` crash point. The bench now writes during the rebuild.
+  Reopened 2026-10-25: the earlier API could not run writers beside the rebuild and the published "concurrent" figures were sequential. Fixed in code; the sift 1M compaction figures must be re-measured.
 - [x] Hard RAM/disk limits reject or defer work before recovery/compaction
   headroom would be consumed.
-  Evidence: RAM budget admission test (upserts refused with `OverBudget` at `budget − headroom`, deletes admitted); the hot-set formula is measured, not estimated (contract §11). Disk admission for archive copies is the M1 portal's (507 / exit 3).
+  Evidence: RAM budget admission test (upserts refused with `OverBudget` at `budget − headroom`, deletes admitted); the hot-set formula is measured, not estimated (contract §11: `graph(M) = 54 + 8·M` bytes, 910 B per vector at 512 dims and M = 32). Snapshots now serve the f32 originals from the file just written, so resident bytes match before and after a reopen. Disk admission for archive copies is the M1 portal's (507 / exit 3). Limitation: compaction itself is not yet admitted against the RAM budget.
 
 ### Verification and evidence
 
