@@ -191,6 +191,11 @@ impl DurableStore {
         Ok(true)
     }
 
+    /// The volume directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Load the immutable incarnation identity of this volume, creating it
     /// durably on first use. Reusing an agent name on a fresh volume yields a
     /// new incarnation; a malformed identity fails closed.
@@ -441,6 +446,36 @@ pub(crate) fn sync_regular_file(file: &File) -> io::Result<()> {
         }
     }
     file.sync_all()
+}
+
+/// Replace `dir/name` with `bytes` durably: a synced temporary file, rename,
+/// and a synced directory. Readers see the old or the new file, never a mix.
+pub(crate) fn replace_file_durably(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let temporary = dir.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        sync_regular_file(&file)?;
+        drop(file);
+        fs::rename(&temporary, dir.join(name))?;
+        sync_directory(dir)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Remove `dir/name` if present and sync the directory.
+pub(crate) fn remove_file_durably(dir: &Path, name: &str) -> io::Result<()> {
+    match fs::remove_file(dir.join(name)) {
+        Ok(()) => sync_directory(dir),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {

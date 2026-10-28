@@ -53,6 +53,11 @@ step() {
     '{step:$n, started:($s|tonumber), finished:($f|tonumber), seconds:(($f|tonumber)-($s|tonumber)), detail:$d}' >> "$STEPS"
 }
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
+# Agent routes need a grant, so readiness is the listening port, not /v1/health.
+wait_port() {
+  for _ in $(seq 1 100); do (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && return 0; sleep 0.05; done
+  return 1
+}
 
 PIDS=()
 cleanup() {
@@ -68,24 +73,30 @@ SOURCE_REV="$(git -C "$REPO" describe --always --dirty --abbrev=40 2>/dev/null |
 step build "$t0" "$(now)" "$SOURCE_REV"
 
 start_agents() {
-  # $1 = root dir for volumes, $2 = name of array variable to fill with targets
-  local root="$1"; local -n out="$2"; out=()
+  # $1 = root dir for volumes, $2 = name of array variable to fill with targets,
+  # $3/$4 = portal database and master key that issue the join tokens.
+  # Each agent starts with a single-use token and is joined before use; the
+  # token stays in the environment, never in a file or log.
+  local root="$1"; local -n out="$2"; local db="$3" key="$4"; out=()
   for i in $(seq 1 "$AGENT_COUNT"); do
-    local id="agent-$i" domain="host-$i" port volume
+    local id="agent-$i" domain="host-$i" port volume token target
     port="$(free_port)"; volume="$root/$id"; mkdir -p "$volume"
-    "$BIN" agent --id "$id" --failure-domain "$domain" --bind "127.0.0.1:$port" --insecure-loopback --volume "$volume" \
-      >"$root/$id.log" 2>&1 &
+    token="$("$BIN" portal agent token --database "$db" --master-key "$key" --agent-id "$id")"
+    DISTR_HNSW_JOIN_TOKEN="$token" "$BIN" agent --id "$id" --failure-domain "$domain" --bind "127.0.0.1:$port" \
+      --insecure-loopback --volume "$volume" >"$root/$id.log" 2>&1 &
     PIDS+=("$!")
-    for _ in $(seq 1 100); do curl -sf "http://127.0.0.1:$port/v1/health" >/dev/null && break; sleep 0.05; done
-    out+=("$id,$domain,http://127.0.0.1:$port")
+    wait_port "$port" || { log "agent $id did not start: $(tail -3 "$root/$id.log")"; exit 1; }
+    target="$id,$domain,http://127.0.0.1:$port"
+    DISTR_HNSW_JOIN_TOKEN="$token" "$BIN" portal agent join --database "$db" --master-key "$key" \
+      --agent "$target" >"$root/$id.join.json"
+    out+=("$target")
   done
 }
 agent_args() { local a=(); for t in "$@"; do a+=(--agent "$t"); done; printf '%s\n' "${a[@]}"; }
 
 # ---- 1. Cluster and key ceremony -------------------------------------------
+# Init comes first: it creates the grant-signing key that join tokens need.
 t="$(now)"
-declare -a AGENTS
-start_agents "$CLUSTER" AGENTS
 DB="$CLUSTER/portal.sqlite"; KEY="$CLUSTER/master.key"
 PASSPHRASE="$(head -c 24 /dev/urandom | base32 | tr -d '=')"
 INIT_OUT="$WORK/init.out"
@@ -94,6 +105,8 @@ printf '%s\n' "$PASSPHRASE" | "$BIN" portal init --passphrase-stdin --database "
 sed -n '/-----BEGIN DISTR-HNSW RECOVERY BUNDLE-----/,/-----END DISTR-HNSW RECOVERY BUNDLE-----/p' "$INIT_OUT" >"$WORK/bundle.txt"
 printf '%s\n' "$PASSPHRASE" >"$WORK/passphrase.txt"; chmod 600 "$WORK/passphrase.txt"
 KEY_ID="$("$BIN" portal key show-id --master-key "$KEY")"
+declare -a AGENTS
+start_agents "$CLUSTER" AGENTS "$DB" "$KEY"
 step init "$t" "$(now)" "key id $KEY_ID"
 
 # ---- 2. Commit and delete files --------------------------------------------
@@ -123,10 +136,10 @@ step commit "$t" "$LAST_COMMIT_AT" "$FILES files, $TOTAL_BYTES bytes, every 8th 
 
 # ---- 3. Scrub and backup ---------------------------------------------------
 t="$(now)"
-"$BIN" portal scrub --database "$DB" "${AGENT_ARGS[@]}" >"$WORK/scrub-before.json"
+"$BIN" portal scrub --database "$DB" --master-key "$KEY" "${AGENT_ARGS[@]}" >"$WORK/scrub-before.json"
 BACKUP1="$WORK/backup-1.json"; BACKUP2="$WORK/backup-2.json"
-"$BIN" portal backup --database "$DB" "${AGENT_ARGS[@]}" --target "$TARGET" >"$BACKUP1"
-"$BIN" portal backup --database "$DB" "${AGENT_ARGS[@]}" --target "$TARGET" >"$BACKUP2"
+"$BIN" portal backup --database "$DB" --master-key "$KEY" "${AGENT_ARGS[@]}" --target "$TARGET" >"$BACKUP1"
+"$BIN" portal backup --database "$DB" --master-key "$KEY" "${AGENT_ARGS[@]}" --target "$TARGET" >"$BACKUP2"
 BACKUP_DONE_AT="$(now)"
 "$BIN" portal health --database "$DB" >"$WORK/health-before.json"
 step backup "$t" "$BACKUP_DONE_AT" "$(jq -c '.totals' "$BACKUP1")"
@@ -151,11 +164,16 @@ step key-restore "$t" "$(now)" "$(tail -1 "$WORK/key-restore.out")"
 t="$(now)"
 "$BIN" portal restore metadata --target "$TARGET" --database "$NEW_DB" >"$WORK/restore-metadata.json"
 step restore-metadata "$t" "$(now)" "$(jq -r '.snapshot.name' "$WORK/restore-metadata.json")"
+# Fresh volumes hold no trust: tokens come from the restored database, and
+# joining an agent id it already knows raises the grant epoch.
 t="$(now)"
 declare -a NEW_AGENTS
-start_agents "$RESTORED" NEW_AGENTS
+start_agents "$RESTORED" NEW_AGENTS "$NEW_DB" "$NEW_KEY"
 mapfile -t NEW_AGENT_ARGS < <(agent_args "${NEW_AGENTS[@]}")
-"$BIN" portal restore objects --target "$TARGET" "${NEW_AGENT_ARGS[@]}" >"$WORK/restore-objects.json"
+step join-agents "$t" "$(now)" "$(jq -sc 'map({agent_id, rejoined})' "$RESTORED"/agent-*.join.json)"
+t="$(now)"
+"$BIN" portal restore objects --target "$TARGET" --database "$NEW_DB" --master-key "$NEW_KEY" "${NEW_AGENT_ARGS[@]}" \
+  >"$WORK/restore-objects.json"
 step restore-objects "$t" "$(now)" "$(jq -c '{objects,placed,failed}' "$WORK/restore-objects.json")"
 t="$(now)"
 "$BIN" portal recover --database "$NEW_DB" --master-key "$NEW_KEY" "${NEW_AGENT_ARGS[@]}" --apply >"$WORK/recover.json"
@@ -166,7 +184,7 @@ ACTUAL_RTO="$(python3 -c "print(round($RESTORED_AT - $LOSS_AT, 3))")"
 # Restore placed the floor (two domains); desired placement across every
 # configured agent is restored by scrub repair, copy-first.
 t="$(now)"
-"$BIN" portal scrub --repair --database "$NEW_DB" "${NEW_AGENT_ARGS[@]}" >"$WORK/scrub-repair.json" || true
+"$BIN" portal scrub --repair --database "$NEW_DB" --master-key "$NEW_KEY" "${NEW_AGENT_ARGS[@]}" >"$WORK/scrub-repair.json" || true
 step scrub-repair "$t" "$(now)" "$(jq -c '{repairs_applied: .totals.repairs_applied, health}' "$WORK/scrub-repair.json")"
 
 # ---- 6. Verify ------------------------------------------------------------
@@ -190,7 +208,7 @@ while IFS=$'\t' read -r name bytes sha file_id fate; do
     fi
   fi
 done <"$MANIFEST"
-"$BIN" portal scrub --database "$NEW_DB" "${NEW_AGENT_ARGS[@]}" >"$WORK/scrub-after.json" || true
+"$BIN" portal scrub --database "$NEW_DB" --master-key "$NEW_KEY" "${NEW_AGENT_ARGS[@]}" >"$WORK/scrub-after.json" || true
 "$BIN" portal health --database "$NEW_DB" >"$WORK/health-after.json" || true
 step verify "$t" "$(now)" "$VERIFIED verified, $MISMATCH mismatched, $DELETED_OK deleted stay unreadable, $DELETED_BAD resurrected"
 cleanup; PIDS=()

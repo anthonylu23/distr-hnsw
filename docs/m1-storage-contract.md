@@ -157,7 +157,8 @@ or chunks.
 
 ## Backup set v1
 
-`portal backup --target dir:<path>` needs no master key. It copies every
+`portal backup --target dir:<path>` decrypts nothing; it needs the master key
+only to unseal the key that signs agent grants (M2). It copies every
 immutable object any generation in history references (manifests, chunks,
 deletion markers) and that garbage collection has not collected, so deleted
 generations stay in the set until offsite retention expires. GC does not
@@ -226,9 +227,11 @@ hash prefix in its name and against the newest catalog that names it, and
 marks the database *recovery pending*. A snapshot that does not open is
 removed so the restore can be retried. While recovery is pending, GC, drain,
 and retire refuse to run: a restored projection can be older than the
-agents. `portal restore objects --target … --agent
-…` copies every backed-up object into the agents until two distinct failure
-domains hold read-back-verified copies; it needs neither key nor database.
+agents. `portal restore objects --target … --database <new> --master-key …
+--agent …` copies every backed-up object into the agents until two distinct
+failure domains hold read-back-verified copies; it reads no file records, and
+uses the restored database and key only to sign agent grants, so the
+replacement agents must be joined first with tokens from that database.
 `portal recover --apply` then rebinds placements to the new incarnations,
 converges file records, and clears the recovery-pending flag. The light local drill (`commit_spine_process.rs`)
 destroys agents, volumes, database, and key file, then rebuilds from the
@@ -375,7 +378,8 @@ to the offsite backup set, which keeps its own history.
 
 ## Scrub and durability health
 
-`portal scrub` needs no master key. It verifies each configured agent's
+`portal scrub` decrypts nothing; it needs the master key only to unseal the
+key that signs agent grants (M2). It verifies each configured agent's
 identity and incarnation, then lists every namespace with strict paginated
 inventories. A namespace is observed only when every page arrived in
 hash-sorted order and the final page carried no cursor; each observation is

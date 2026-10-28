@@ -20,7 +20,10 @@ use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 
+use axum::body::Bytes;
+
 use crate::{
+    agent_client::AgentClient,
     durability::{InventoryPage, MAX_INVENTORY_PAGE},
     metadata::{
         Database, HistoryObject, IncarnationStatus, JobStatus, MetadataError, NewGcProof,
@@ -60,16 +63,12 @@ struct RemoteHealth {
 async fn verify_agents(
     database: &mut Database,
     agents: &[AgentTarget],
-    client: &reqwest::Client,
+    client: &AgentClient,
     issues: &mut Vec<String>,
 ) -> Result<Vec<LiveAgent>, LifecycleError> {
     let mut live = Vec::new();
     for agent in agents {
-        let response = match client
-            .get(format!("{}/v1/health", agent.base_url))
-            .send()
-            .await
-        {
+        let response = match client.health(agent).await {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
                 issues.push(format!(
@@ -114,20 +113,17 @@ fn refuse_while_recovery_pending(database: &Database) -> Result<(), LifecycleErr
 /// Every hash in one namespace of an agent, or why the listing proves
 /// nothing.
 async fn list_hashes(
-    client: &reqwest::Client,
+    client: &AgentClient,
     agent: &AgentTarget,
     kind: ObjectKind,
 ) -> Result<Vec<String>, String> {
     let mut hashes = Vec::new();
     let mut after: Option<ObjectHash> = None;
     loop {
-        let mut request = client
-            .get(format!("{}/v1/inventory/{}", agent.base_url, kind.as_str()))
-            .query(&[("limit", MAX_INVENTORY_PAGE.to_string())]);
-        if let Some(cursor) = &after {
-            request = request.query(&[("after", cursor.as_str())]);
-        }
-        let response = request.send().await.map_err(|error| error.to_string())?;
+        let response = client
+            .inventory(agent, kind, after.as_ref(), MAX_INVENTORY_PAGE)
+            .await
+            .map_err(|error| error.to_string())?;
         if !response.status().is_success() {
             return Err(format!("inventory returned HTTP {}", response.status()));
         }
@@ -142,13 +138,12 @@ async fn list_hashes(
 }
 
 async fn fetch_valid(
-    client: &reqwest::Client,
+    client: &AgentClient,
     agent: &AgentTarget,
     kind: ObjectKind,
     hash: &ObjectHash,
 ) -> Option<Vec<u8>> {
-    let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
-    match client.get(url).send().await {
+    match client.get(agent, kind, hash).await {
         Ok(response) if response.status().is_success() => response
             .bytes()
             .await
@@ -162,21 +157,17 @@ async fn fetch_valid(
 /// Copy-first placement: PUT, read back, confirm. Returns true on success.
 async fn place_copy(
     database: &mut Database,
-    client: &reqwest::Client,
+    client: &AgentClient,
     agent: &LiveAgent,
     kind: ObjectKind,
     hash: &ObjectHash,
     bytes: &[u8],
     job_id: Uuid,
 ) -> bool {
-    let url = format!(
-        "{}/v1/objects/{}/{}",
-        agent.target.base_url,
-        kind.as_str(),
-        hash
-    );
     let accepted = matches!(
-        client.put(url).body(bytes.to_vec()).send().await,
+        client
+            .put(&agent.target, kind, hash, Bytes::copy_from_slice(bytes))
+            .await,
         Ok(response) if response.status().is_success()
     );
     if !accepted {
@@ -245,7 +236,7 @@ impl DrainReportV1 {
 pub async fn drain(
     database: &mut Database,
     agents: &[AgentTarget],
-    client: &reqwest::Client,
+    client: &AgentClient,
     agent_id: &str,
     dry_run: bool,
 ) -> Result<DrainReportV1, LifecycleError> {
@@ -270,7 +261,7 @@ pub async fn drain(
 async fn run_drain(
     database: &mut Database,
     agents: &[AgentTarget],
-    client: &reqwest::Client,
+    client: &AgentClient,
     agent_id: &str,
     dry_run: bool,
     job_id: Uuid,
@@ -409,7 +400,7 @@ impl RetireReportV1 {
 pub async fn retire(
     database: &mut Database,
     agents: &[AgentTarget],
-    client: &reqwest::Client,
+    client: &AgentClient,
     agent_id: &str,
 ) -> Result<RetireReportV1, LifecycleError> {
     refuse_while_recovery_pending(database)?;
@@ -585,7 +576,7 @@ fn proof_context(database: &Database, now: i64) -> Result<ProofContext, Lifecycl
 async fn control_object_blockers(
     database: &Database,
     live: &[LiveAgent],
-    client: &reqwest::Client,
+    client: &AgentClient,
 ) -> Result<Vec<String>, LifecycleError> {
     let known = database.known_control_objects()?;
     let mut blockers = Vec::new();
@@ -705,7 +696,7 @@ fn evaluate(
 pub async fn gc(
     database: &mut Database,
     agents: &[AgentTarget],
-    client: &reqwest::Client,
+    client: &AgentClient,
     options: GcOptions,
 ) -> Result<GcReportV1, LifecycleError> {
     let now = i64::try_from(
@@ -842,13 +833,7 @@ pub async fn gc(
             } else {
                 let mut all_deleted = true;
                 for agent in &live {
-                    let url = format!(
-                        "{}/v1/objects/{}/{}",
-                        agent.target.base_url,
-                        kind.as_str(),
-                        hash
-                    );
-                    match client.delete(url).send().await {
+                    match client.delete(&agent.target, kind, &hash, proof_id).await {
                         Ok(response) if response.status().is_success() => {
                             database.delete_placement(kind, &hash, &agent.target.id)?;
                         }

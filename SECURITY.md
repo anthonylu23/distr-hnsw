@@ -5,12 +5,17 @@ use yet, and the current build has known, documented security limitations.
 
 ## Known limitations (not vulnerabilities)
 
-- Storage agents have no authentication. They bind to loopback only and
-  accept any request from the local host, including physical `DELETE`.
-  Tailscale identity and authorization are milestone M2
-  ([docs/roadmap.md](docs/roadmap.md)).
+- Storage agents accept a request only with a short-lived grant signed by
+  the portal's key, and a `DELETE` grant must name an applied
+  garbage-collection proof. On a tailnet address an agent also requires the
+  caller to be the portal node it pinned at join (Tailscale WhoIs on the
+  socket; identity headers are ignored). WhoIs names a node, not a process:
+  any process on the portal node that can read the master key can sign
+  grants.
 - The portal is a set of local commands; there is no network-facing portal
-  service yet.
+  service, browser session, or API key yet. Tailscale identity and
+  authorization are milestone M2, in progress
+  ([docs/m2-implementation-plan.md](docs/m2-implementation-plan.md)).
 
 See [docs/deployment.md](docs/deployment.md) for the full list of limitations
 a deployment must carry.

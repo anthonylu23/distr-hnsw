@@ -7,14 +7,18 @@ use std::{
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use distr_hnsw::{
+    access,
     agent::{
-        bind_and_serve_agent, AgentBind, AgentIdentity, CapacityConfig, TailnetAddressChanged,
+        bind_and_serve_agent, AgentBind, AgentIdentity, CapacityConfig, JoinToken,
+        TailnetAddressChanged,
     },
+    agent_client::{join_agent, AgentClient},
     backup::{self, BackupTargetSpec},
     crypto::MasterKey,
     durability::StoreFailpoint,
     lifecycle::{self, GcOptions},
     metadata::{Database, JobMode, KeyBinding},
+    object::{ObjectHash, ObjectKind},
     portal::{prepare_agents, AgentTarget, Failpoint, FailpointAction, Portal},
     reconcile::{health_report, scrub},
     recovery_bundle::{self, KdfParams},
@@ -56,6 +60,16 @@ enum Command {
         tailnet_poll_ms: u64,
         #[arg(long)]
         volume: PathBuf,
+        /// File holding the single-use join token from `portal agent token`
+        /// (or set DISTR_HNSW_JOIN_TOKEN). Needed only until the agent has
+        /// joined; a joined agent ignores it.
+        #[arg(long)]
+        join_token_file: Option<PathBuf>,
+        /// Forget the portal this volume trusts and wait for a new join with
+        /// the given token. For a portal rebuilt without its signing keys
+        /// (a lost database with no snapshot); needs a join token.
+        #[arg(long)]
+        reset_trust: bool,
         /// Maximum bytes this volume may hold (default: filesystem size).
         #[arg(long)]
         quota_bytes: Option<u64>,
@@ -182,11 +196,13 @@ enum PortalCommand {
         apply: bool,
     },
     /// Verify every required object on every agent and report durability
-    /// health. Needs no master key. `--repair` restores copies copy-first;
-    /// nothing is ever deleted.
+    /// health. The master key unseals the key that signs agent grants.
+    /// `--repair` restores copies copy-first; nothing is ever deleted.
     Scrub {
         #[arg(long)]
         database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
         #[arg(long = "agent", required = true)]
         agents: Vec<AgentTarget>,
         #[arg(long)]
@@ -201,10 +217,13 @@ enum PortalCommand {
         database: PathBuf,
     },
     /// Copy every historical object to a backup target, verify each copy,
-    /// ship a SQLite snapshot, and write a catalog. Needs no master key.
+    /// ship a SQLite snapshot, and write a catalog. The master key unseals
+    /// the key that signs agent grants; objects stay ciphertext.
     Backup {
         #[arg(long)]
         database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
         #[arg(long = "agent", required = true)]
         agents: Vec<AgentTarget>,
         /// Backup target: `dir:/mnt/backup` or `s3:<bucket>[/<prefix>]` (S3
@@ -218,6 +237,12 @@ enum PortalCommand {
         /// run (integrity sampling).
         #[arg(long, default_value_t = 0)]
         verify_sample: usize,
+    },
+    /// Join agents: issue single-use tokens and send joined agents the
+    /// portal's key set.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
     },
     /// Rebuild a portal from a backup set.
     Restore {
@@ -233,6 +258,8 @@ enum PortalCommand {
     Drain {
         #[arg(long)]
         database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
         #[arg(long = "agent", required = true)]
         agents: Vec<AgentTarget>,
         #[arg(long)]
@@ -244,6 +271,8 @@ enum PortalCommand {
     Retire {
         #[arg(long)]
         database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
         #[arg(long = "agent", required = true)]
         agents: Vec<AgentTarget>,
         #[arg(long)]
@@ -254,6 +283,8 @@ enum PortalCommand {
     Gc {
         #[arg(long)]
         database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
         #[arg(long = "agent", required = true)]
         agents: Vec<AgentTarget>,
         #[arg(long)]
@@ -294,17 +325,116 @@ enum RestoreCommand {
         snapshot: Option<String>,
     },
     /// Copy every backed-up object into the agents at RF2, read-back verified.
-    /// Run `portal recover --apply` afterwards to rebuild file records.
+    /// Join the new agents first; run `portal recover --apply` afterwards to
+    /// rebuild file records.
     Objects {
         #[arg(long)]
         target: BackupTargetSpec,
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
         #[arg(long = "agent", required = true)]
         agents: Vec<AgentTarget>,
     },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum AgentRequest {
+    Health,
+    Inventory,
+    Get,
+    Put,
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// Print a single-use join token for an agent id (valid 24 hours). Start
+    /// the agent with it (DISTR_HNSW_JOIN_TOKEN or --join-token-file), then
+    /// run `portal agent join`.
+    Token {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
+        #[arg(long)]
+        agent_id: String,
+    },
+    /// Send one granted request to an agent and print the HTTP status
+    /// (for drills and diagnosis). The body goes to `--out`. There is no
+    /// delete: deletes happen only through `portal gc --apply`.
+    Request {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
+        #[arg(long)]
+        agent: AgentTarget,
+        #[arg(value_enum)]
+        operation: AgentRequest,
+        #[arg(long)]
+        kind: Option<ObjectKind>,
+        #[arg(long)]
+        hash: Option<ObjectHash>,
+        /// Inventory cursor.
+        #[arg(long)]
+        after: Option<ObjectHash>,
+        /// Inventory page size.
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+        /// Body for `put`.
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        /// Write the response body here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Join an agent started with a token: send it the portal's signed key
+    /// set, record its tailnet node, and burn the token.
+    Join {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
+        #[arg(long)]
+        agent: AgentTarget,
+        /// The token from `portal agent token`.
+        #[arg(long, env = "DISTR_HNSW_JOIN_TOKEN", hide_env_values = true)]
+        token: String,
+    },
+}
+
 #[derive(Subcommand)]
 enum KeyCommand {
+    /// Print the grant-signing keys, the grant epoch, and the key-set
+    /// version.
+    ShowSigning {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
+    },
+    /// Make a new grant-signing key active. The old key keeps verifying as
+    /// `retiring`; agents receive the new key set on their next request.
+    RotateSigning {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
+    },
+    /// Drop a retiring signing key from the key set once agents use the
+    /// active key. `--revoke` also raises the grant epoch, invalidating every
+    /// outstanding grant.
+    RetireSigning {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        revoke: bool,
+    },
     /// Print the non-secret identifier of a master key.
     ShowId {
         #[arg(long)]
@@ -398,6 +528,40 @@ fn with_env_failpoint(portal: Portal) -> anyhow::Result<Portal> {
 /// `DISTR_HNSW_AGENT_FAILPOINT` so a variable meant for a portal command
 /// never reaches an agent, with the same refusal in builds without
 /// failpoints.
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Load the master key and check it against the database's bound key, so a
+/// wrong key fails before it unseals or seals a signing key.
+fn bound_master_key(database: &mut Database, path: &Path) -> anyhow::Result<MasterKey> {
+    let key = MasterKey::load(path)?;
+    database.bind_master_key_id(&key.key_id_hex())?;
+    Ok(key)
+}
+
+/// The grant-signing client for a command that contacts agents.
+fn agent_client(database: &mut Database, master_key: &Path) -> anyhow::Result<AgentClient> {
+    let key = bound_master_key(database, master_key)?;
+    Ok(AgentClient::open(database, &key)?)
+}
+
+/// The agent's join token: `--join-token-file`, else DISTR_HNSW_JOIN_TOKEN.
+fn read_join_token(file: Option<&Path>) -> anyhow::Result<Option<String>> {
+    if let Some(file) = file {
+        let token = std::fs::read_to_string(file)
+            .with_context(|| format!("reading join token {}", file.display()))?;
+        return Ok(Some(token.trim().to_owned()));
+    }
+    Ok(std::env::var("DISTR_HNSW_JOIN_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty()))
+}
+
 fn env_agent_failpoint() -> anyhow::Result<Option<StoreFailpoint>> {
     let Ok(value) = std::env::var("DISTR_HNSW_AGENT_FAILPOINT") else {
         return Ok(None);
@@ -474,6 +638,8 @@ async fn main() -> anyhow::Result<()> {
             tailnet_wait_seconds,
             tailnet_poll_ms,
             volume,
+            join_token_file,
+            reset_trust,
             quota_bytes,
             reserve_bytes,
             hard_floor_bytes,
@@ -494,6 +660,11 @@ async fn main() -> anyhow::Result<()> {
                     hard_floor_bytes,
                 },
                 env_agent_failpoint()?,
+                match (read_join_token(join_token_file.as_deref())?, reset_trust) {
+                    (Some(token), reset_trust) => Some(JoinToken { token, reset_trust }),
+                    (None, true) => anyhow::bail!("--reset-trust needs a join token"),
+                    (None, false) => None,
+                },
             )
             .await;
             if let Err(error) = &served {
@@ -564,6 +735,9 @@ async fn main() -> anyhow::Result<()> {
                 let mut db = Database::open(&database)
                     .with_context(|| format!("initializing database {}", database.display()))?;
                 let binding = db.bind_master_key_id(&key.key_id_hex())?;
+                // Create the grant-signing key now, so every metadata
+                // snapshot (and every restore from one) carries it.
+                access::GrantMaterial::load_or_create(&mut db, &key)?;
                 println!("initialized");
                 println!(
                     "master key id: {} ({})",
@@ -593,6 +767,48 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
             PortalCommand::Key { command } => match command {
+                KeyCommand::ShowSigning {
+                    database,
+                    master_key,
+                } => {
+                    let mut database = Database::open(&database)?;
+                    let key = bound_master_key(&mut database, &master_key)?;
+                    let material = access::GrantMaterial::load_or_create(&mut database, &key)?;
+                    let set = material.signed_key_set().key_set;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "epoch": set.epoch,
+                            "key_set_version": set.version,
+                            "keys": set.keys.iter().map(|k| serde_json::json!({
+                                "key_id": k.key_id.to_string(),
+                                "status": format!("{:?}", k.status).to_lowercase(),
+                            })).collect::<Vec<_>>(),
+                        }))?
+                    );
+                    Ok(())
+                }
+                KeyCommand::RotateSigning {
+                    database,
+                    master_key,
+                } => {
+                    let mut database = Database::open(&database)?;
+                    let key = bound_master_key(&mut database, &master_key)?;
+                    let key_id = access::rotate_signing_key(&mut database, &key)?;
+                    println!("{key_id}");
+                    Ok(())
+                }
+                KeyCommand::RetireSigning {
+                    database,
+                    master_key,
+                    key_id,
+                    revoke,
+                } => {
+                    let mut database = Database::open(&database)?;
+                    bound_master_key(&mut database, &master_key)?;
+                    access::end_signing_key(&mut database, &key_id, revoke)?;
+                    Ok(())
+                }
                 KeyCommand::ShowId { master_key } => {
                     let key = MasterKey::load(&master_key)?;
                     println!("{}", key.key_id_hex());
@@ -714,13 +930,14 @@ async fn main() -> anyhow::Result<()> {
             }
             PortalCommand::Scrub {
                 database,
+                master_key,
                 agents,
                 repair,
                 interval,
             } => {
                 let agents = prepare_agents(agents)?;
                 let mut database = Database::open(&database)?;
-                let client = reqwest::Client::new();
+                let client = agent_client(&mut database, &master_key)?;
                 let mode = if repair {
                     JobMode::Repair
                 } else {
@@ -771,6 +988,7 @@ async fn main() -> anyhow::Result<()> {
             }
             PortalCommand::Backup {
                 database: database_path,
+                master_key,
                 agents,
                 target,
                 interval,
@@ -778,7 +996,7 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let agents = prepare_agents(agents)?;
                 let mut database = Database::open(&database_path)?;
-                let client = reqwest::Client::new();
+                let client = agent_client(&mut database, &master_key)?;
                 loop {
                     let report = backup::backup_with_sample(
                         &mut database,
@@ -805,20 +1023,16 @@ async fn main() -> anyhow::Result<()> {
             }
             PortalCommand::Drain {
                 database,
+                master_key,
                 agents,
                 agent_id,
                 dry_run,
             } => {
                 let agents = prepare_agents(agents)?;
                 let mut database = Database::open(&database)?;
-                let report = lifecycle::drain(
-                    &mut database,
-                    &agents,
-                    &reqwest::Client::new(),
-                    &agent_id,
-                    dry_run,
-                )
-                .await?;
+                let client = agent_client(&mut database, &master_key)?;
+                let report =
+                    lifecycle::drain(&mut database, &agents, &client, &agent_id, dry_run).await?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 if report.exit_code() == 2 {
                     std::process::exit(2);
@@ -827,14 +1041,14 @@ async fn main() -> anyhow::Result<()> {
             }
             PortalCommand::Retire {
                 database,
+                master_key,
                 agents,
                 agent_id,
             } => {
                 let agents = prepare_agents(agents)?;
                 let mut database = Database::open(&database)?;
-                let report =
-                    lifecycle::retire(&mut database, &agents, &reqwest::Client::new(), &agent_id)
-                        .await?;
+                let client = agent_client(&mut database, &master_key)?;
+                let report = lifecycle::retire(&mut database, &agents, &client, &agent_id).await?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 if report.exit_code() == 2 {
                     std::process::exit(2);
@@ -843,6 +1057,7 @@ async fn main() -> anyhow::Result<()> {
             }
             PortalCommand::Gc {
                 database,
+                master_key,
                 agents,
                 apply,
                 retention_seconds,
@@ -850,10 +1065,11 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let agents = prepare_agents(agents)?;
                 let mut database = Database::open(&database)?;
+                let client = agent_client(&mut database, &master_key)?;
                 let report = lifecycle::gc(
                     &mut database,
                     &agents,
-                    &reqwest::Client::new(),
+                    &client,
                     GcOptions {
                         retention_seconds,
                         staging_grace_seconds,
@@ -867,6 +1083,92 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(())
             }
+            PortalCommand::Agent { command } => match command {
+                AgentCommand::Token {
+                    database,
+                    master_key,
+                    agent_id,
+                } => {
+                    let mut database = Database::open(&database)?;
+                    let key = bound_master_key(&mut database, &master_key)?;
+                    access::GrantMaterial::load_or_create(&mut database, &key)?;
+                    let token = access::create_join_token(&mut database, &agent_id, now_seconds())?;
+                    println!("{token}");
+                    Ok(())
+                }
+                AgentCommand::Request {
+                    database,
+                    master_key,
+                    agent,
+                    operation,
+                    kind,
+                    hash,
+                    after,
+                    limit,
+                    body_file,
+                    out,
+                } => {
+                    let mut database = Database::open(&database)?;
+                    let client = agent_client(&mut database, &master_key)?;
+                    drop(database);
+                    let object = || -> anyhow::Result<(ObjectKind, ObjectHash)> {
+                        Ok((
+                            kind.context("--kind is required")?,
+                            hash.clone().context("--hash is required")?,
+                        ))
+                    };
+                    let response = match operation {
+                        AgentRequest::Health => client.health(&agent).await?,
+                        AgentRequest::Inventory => {
+                            let kind = kind.context("--kind is required")?;
+                            client
+                                .inventory(&agent, kind, after.as_ref(), limit)
+                                .await?
+                        }
+                        AgentRequest::Get => {
+                            let (kind, hash) = object()?;
+                            client.get(&agent, kind, &hash).await?
+                        }
+                        AgentRequest::Put => {
+                            let (kind, hash) = object()?;
+                            let path = body_file.as_deref().context("--body-file is required")?;
+                            let body = std::fs::read(path)
+                                .with_context(|| format!("reading {}", path.display()))?;
+                            client.put(&agent, kind, &hash, body.into()).await?
+                        }
+                    };
+                    let status = response.status().as_u16();
+                    let body = response.bytes().await?;
+                    if let Some(out) = out {
+                        std::fs::write(&out, &body)
+                            .with_context(|| format!("writing {}", out.display()))?;
+                    }
+                    println!("{status}");
+                    Ok(())
+                }
+                AgentCommand::Join {
+                    database,
+                    master_key,
+                    agent,
+                    token,
+                } => {
+                    let mut database = Database::open(&database)?;
+                    let key = bound_master_key(&mut database, &master_key)?;
+                    let outcome =
+                        join_agent(&mut database, &key, &agent, &token, &LocalApi::from_env())
+                            .await?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "agent_id": outcome.agent_id,
+                            "agent_node": outcome.agent_node,
+                            "portal_node_pinned": outcome.portal_node_pinned,
+                            "rejoined": outcome.rejoined,
+                        }))?
+                    );
+                    Ok(())
+                }
+            },
             PortalCommand::Restore { command } => match command {
                 RestoreCommand::Metadata {
                     target,
@@ -878,10 +1180,17 @@ async fn main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                     Ok(())
                 }
-                RestoreCommand::Objects { target, agents } => {
+                RestoreCommand::Objects {
+                    target,
+                    database,
+                    master_key,
+                    agents,
+                } => {
                     let agents = prepare_agents(agents)?;
-                    let report =
-                        backup::restore_objects(&target, &agents, &reqwest::Client::new()).await?;
+                    let mut database = Database::open(&database)?;
+                    let client = agent_client(&mut database, &master_key)?;
+                    drop(database);
+                    let report = backup::restore_objects(&target, &agents, &client).await?;
                     println!("{}", serde_json::to_string_pretty(&report)?);
                     if report.exit_code() == 2 {
                         std::process::exit(2);

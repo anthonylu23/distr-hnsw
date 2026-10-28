@@ -17,7 +17,10 @@ use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 
+use axum::body::Bytes;
+
 use crate::{
+    agent_client::AgentClient,
     durability::{InventoryPage, MAX_INVENTORY_PAGE},
     metadata::{
         AgentIncarnation, Database, IncarnationObservation, JobMode, JobStatus, MetadataError,
@@ -190,7 +193,7 @@ pub fn health_report(database: &Database) -> Result<HealthReportV1, ScrubError> 
 pub async fn scrub(
     database: &mut Database,
     agents: &[AgentTarget],
-    client: &reqwest::Client,
+    client: &AgentClient,
     mode: JobMode,
 ) -> Result<ScrubReportV1, ScrubError> {
     let job_id = database.create_reconcile_job(mode)?;
@@ -227,7 +230,7 @@ impl ReachableAgent {
 async fn run_job(
     database: &mut Database,
     agents: &[AgentTarget],
-    client: &reqwest::Client,
+    client: &AgentClient,
     mode: JobMode,
     job_id: Uuid,
 ) -> Result<ScrubReportV1, ScrubError> {
@@ -496,7 +499,7 @@ impl Verification {
 #[allow(clippy::too_many_arguments)]
 async fn verify_object(
     database: &mut Database,
-    client: &reqwest::Client,
+    client: &AgentClient,
     agents: &[AgentTarget],
     reachable: &[ReachableAgent],
     complete_scans: &BTreeSet<(String, ObjectKind)>,
@@ -628,7 +631,7 @@ fn classify(
 #[allow(clippy::too_many_arguments)]
 async fn repair_object(
     database: &mut Database,
-    client: &reqwest::Client,
+    client: &AgentClient,
     reachable: &[ReachableAgent],
     object: &RequiredObject,
     bytes: &[u8],
@@ -677,13 +680,14 @@ async fn repair_object(
             target_agent: agent_id.to_owned(),
             status: "planned".to_owned(),
         };
-        let url = format!(
-            "{}/v1/objects/{}/{}",
-            agent.target.base_url,
-            object.kind.as_str(),
-            object.hash
-        );
-        let put = client.put(url).body(bytes.to_vec()).send().await;
+        let put = client
+            .put(
+                &agent.target,
+                object.kind,
+                &object.hash,
+                Bytes::copy_from_slice(bytes),
+            )
+            .await;
         let accepted = match put {
             Ok(response) if response.status().is_success() => true,
             Ok(response) => {
@@ -741,7 +745,7 @@ struct Listing {
 }
 
 async fn list_namespace(
-    client: &reqwest::Client,
+    client: &AgentClient,
     agent: &AgentTarget,
     kind: ObjectKind,
 ) -> Result<Listing, ScrubError> {
@@ -751,13 +755,9 @@ async fn list_namespace(
     let mut objects = Vec::new();
     let mut after: Option<ObjectHash> = None;
     loop {
-        let mut request = client
-            .get(format!("{}/v1/inventory/{}", agent.base_url, kind.as_str()))
-            .query(&[("limit", MAX_INVENTORY_PAGE.to_string())]);
-        if let Some(cursor) = &after {
-            request = request.query(&[("after", cursor.as_str())]);
-        }
-        let response = request.send().await?;
+        let response = client
+            .inventory(agent, kind, after.as_ref(), MAX_INVENTORY_PAGE)
+            .await?;
         if !response.status().is_success() {
             return Err(ScrubError::InventoryRejected {
                 agent: agent.id.clone(),
@@ -800,14 +800,10 @@ struct RemoteHealth {
 }
 
 async fn fetch_health(
-    client: &reqwest::Client,
+    client: &AgentClient,
     agent: &AgentTarget,
 ) -> Result<RemoteHealth, ScrubError> {
-    let response = match client
-        .get(format!("{}/v1/health", agent.base_url))
-        .send()
-        .await
-    {
+    let response = match client.health(agent).await {
         Ok(response) => response,
         Err(error) => {
             return Err(ScrubError::Unreachable {
@@ -837,13 +833,12 @@ async fn fetch_health(
 }
 
 async fn fetch_bytes(
-    client: &reqwest::Client,
+    client: &AgentClient,
     agent: &AgentTarget,
     kind: ObjectKind,
     hash: &ObjectHash,
 ) -> Option<Vec<u8>> {
-    let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
-    match client.get(url).send().await {
+    match client.get(agent, kind, hash).await {
         Ok(response) if response.status().is_success() => {
             response.bytes().await.ok().map(|bytes| bytes.to_vec())
         }

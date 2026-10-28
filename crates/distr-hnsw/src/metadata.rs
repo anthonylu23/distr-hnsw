@@ -14,7 +14,7 @@ use crate::{
     object::{ObjectHash, ObjectKind},
 };
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const MASTER_KEY_ID_META: &str = "master_key_id";
 const CONTENT_GENERATION_META: &str = "content_generation";
 /// Set when metadata was restored from a backup snapshot; cleared by the next
@@ -651,7 +651,7 @@ impl Database {
             }
             3 => migrate_v3_to_v4(&mut connection)?,
             4..=6 => migrate_to_v7(&mut connection)?,
-            7 | 8 | SCHEMA_VERSION => apply_schema(&connection)?,
+            7..=9 | SCHEMA_VERSION => apply_schema(&connection)?,
             _ => return Err(MetadataError::UnsupportedSchemaVersion(version)),
         }
         let lease = ProcessLease::acquire(path)?;
@@ -3408,9 +3408,51 @@ fn apply_schema(connection: &Connection) -> Result<(), MetadataError> {
     connection.execute_batch(GC_SCHEMA)?;
     connection.execute_batch(INDEX_ARCHIVE_SCHEMA)?;
     apply_v9(connection)?;
-    connection.execute_batch("PRAGMA user_version = 9;")?;
+    connection.execute_batch(ACCESS_SCHEMA)?;
+    connection.execute_batch("PRAGMA user_version = 10;")?;
     Ok(())
 }
+
+/// Schema v10 (additive): the portal's grant-signing keys (seeds sealed
+/// under the master key), the grant epoch and key-set version, joined
+/// agents with their pinned tailnet node, and single-use join tokens
+/// (docs/m2-implementation-plan.md, decisions 3 to 6).
+const ACCESS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS signing_keys (
+    key_id TEXT PRIMARY KEY,
+    wrap_id TEXT NOT NULL UNIQUE,
+    public_key BLOB NOT NULL CHECK(length(public_key) = 32),
+    wrapped_nonce BLOB NOT NULL,
+    wrapped_seed BLOB NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('active', 'retiring', 'revoked')),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    changed_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE UNIQUE INDEX IF NOT EXISTS signing_keys_one_active
+    ON signing_keys(status) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS grant_state (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    epoch INTEGER NOT NULL CHECK(epoch >= 1),
+    key_set_version INTEGER NOT NULL CHECK(key_set_version >= 1)
+);
+INSERT OR IGNORE INTO grant_state(singleton, epoch, key_set_version) VALUES (1, 1, 1);
+
+CREATE TABLE IF NOT EXISTS agent_joins (
+    agent_id TEXT PRIMARY KEY,
+    node_stable_id TEXT,
+    base_url TEXT NOT NULL,
+    joined_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE TABLE IF NOT EXISTS join_tokens (
+    token_hash TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    expires_at INTEGER NOT NULL,
+    used_at INTEGER
+);
+"#;
 
 /// Schema v9 (additive): job ownership leases, and a guard that every delete
 /// operation for one file generation carries the same deletion marker, so a
@@ -3870,6 +3912,307 @@ fn table_has_column(
         }
     }
     Ok(false)
+}
+
+/// Lifecycle of a grant-signing key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SigningKeyStatus {
+    Active,
+    Retiring,
+    Revoked,
+}
+
+impl SigningKeyStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Retiring => "retiring",
+            Self::Revoked => "revoked",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, MetadataError> {
+        Ok(match value {
+            "active" => Self::Active,
+            "retiring" => Self::Retiring,
+            "revoked" => Self::Revoked,
+            other => return Err(MetadataError::InvalidState(format!("signing key {other}"))),
+        })
+    }
+}
+
+/// A grant-signing key as stored: the seed is sealed under the master key.
+#[derive(Clone, Debug)]
+pub struct SigningKeyRow {
+    pub key_id: String,
+    pub wrap_id: Uuid,
+    pub public_key: [u8; 32],
+    pub wrapped_seed: WrappedKey,
+    pub status: SigningKeyStatus,
+}
+
+/// The grant epoch and key-set version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GrantState {
+    pub epoch: u64,
+    pub key_set_version: u64,
+}
+
+/// A pending or used join token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JoinTokenRow {
+    pub agent_id: String,
+    pub expires_at: i64,
+    pub used_at: Option<i64>,
+}
+
+/// An agent the portal has joined.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentJoin {
+    pub agent_id: String,
+    /// `None` for an agent joined over loopback.
+    pub node_stable_id: Option<String>,
+    pub base_url: String,
+}
+
+impl Database {
+    pub fn grant_state(&self) -> Result<GrantState, MetadataError> {
+        let (epoch, version): (i64, i64) = self.connection.query_row(
+            "SELECT epoch, key_set_version FROM grant_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(GrantState {
+            epoch: epoch as u64,
+            key_set_version: version as u64,
+        })
+    }
+
+    /// Signing keys that are still part of the key set (active and
+    /// retiring), active first.
+    pub fn signing_keys(&self) -> Result<Vec<SigningKeyRow>, MetadataError> {
+        let mut statement = self.connection.prepare(
+            "SELECT key_id, wrap_id, public_key, wrapped_nonce, wrapped_seed, status
+             FROM signing_keys WHERE status != 'revoked'
+             ORDER BY status = 'active' DESC, created_at, key_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut keys = Vec::new();
+        for row in rows {
+            let (key_id, wrap_id, public_key, nonce, seed, status) = row?;
+            keys.push(SigningKeyRow {
+                key_id,
+                wrap_id: Uuid::parse_str(&wrap_id)
+                    .map_err(|_| MetadataError::InvalidBinaryField("signing key wrap id".into()))?,
+                public_key: public_key
+                    .try_into()
+                    .map_err(|_| MetadataError::InvalidBinaryField("signing public key".into()))?,
+                wrapped_seed: WrappedKey {
+                    nonce: nonce.try_into().map_err(|_| {
+                        MetadataError::InvalidBinaryField("signing key nonce".into())
+                    })?,
+                    ciphertext: seed,
+                },
+                status: SigningKeyStatus::parse(&status)?,
+            });
+        }
+        Ok(keys)
+    }
+
+    fn insert_signing_key(
+        transaction: &Transaction<'_>,
+        row: &SigningKeyRow,
+    ) -> Result<(), MetadataError> {
+        transaction.execute(
+            "INSERT INTO signing_keys(key_id, wrap_id, public_key, wrapped_nonce, wrapped_seed, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                row.key_id,
+                row.wrap_id.to_string(),
+                row.public_key.as_slice(),
+                row.wrapped_seed.nonce.as_slice(),
+                row.wrapped_seed.ciphertext,
+                row.status.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn bump_grant_state(
+        transaction: &Transaction<'_>,
+        new_epoch: bool,
+    ) -> Result<(), MetadataError> {
+        transaction.execute(
+            "UPDATE grant_state
+             SET key_set_version = key_set_version + 1, epoch = epoch + ?1
+             WHERE singleton = 1",
+            params![i64::from(new_epoch)],
+        )?;
+        Ok(())
+    }
+
+    /// Store the first signing key. Returns false (and stores nothing) when
+    /// an active key already exists.
+    pub fn insert_first_signing_key(&mut self, row: &SigningKeyRow) -> Result<bool, MetadataError> {
+        let transaction = self.connection.transaction()?;
+        let active: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM signing_keys WHERE status = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        if active > 0 {
+            return Ok(false);
+        }
+        Self::insert_signing_key(&transaction, row)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// Make `row` the active key; the previous active key keeps verifying
+    /// as `retiring` until it is retired.
+    pub fn rotate_signing_key(&mut self, row: &SigningKeyRow) -> Result<(), MetadataError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE signing_keys SET status = 'retiring', changed_at = unixepoch()
+             WHERE status = 'active'",
+            [],
+        )?;
+        Self::insert_signing_key(&transaction, row)?;
+        Self::bump_grant_state(&transaction, false)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Drop a retiring key from the key set once agents use the active key
+    /// (`revoke = false`), or revoke any non-active key and raise the
+    /// epoch so every outstanding grant becomes stale (`revoke = true`).
+    pub fn end_signing_key(&mut self, key_id: &str, revoke: bool) -> Result<(), MetadataError> {
+        let transaction = self.connection.transaction()?;
+        let status: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM signing_keys WHERE key_id = ?1",
+                params![key_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match status.as_deref() {
+            None => {
+                return Err(MetadataError::InvalidState(format!(
+                    "no signing key {key_id}"
+                )))
+            }
+            Some("active") => {
+                return Err(MetadataError::InvalidState(
+                    "rotate before ending the active signing key".into(),
+                ))
+            }
+            Some("revoked") => return Ok(()),
+            Some(_) => {}
+        }
+        transaction.execute(
+            "UPDATE signing_keys SET status = 'revoked', changed_at = unixepoch()
+             WHERE key_id = ?1",
+            params![key_id],
+        )?;
+        Self::bump_grant_state(&transaction, revoke)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn insert_join_token(
+        &mut self,
+        token_hash: &str,
+        agent_id: &str,
+        expires_at: i64,
+    ) -> Result<(), MetadataError> {
+        self.connection.execute(
+            "INSERT INTO join_tokens(token_hash, agent_id, expires_at) VALUES (?1, ?2, ?3)",
+            params![token_hash, agent_id, expires_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn join_token(&self, token_hash: &str) -> Result<Option<JoinTokenRow>, MetadataError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT agent_id, expires_at, used_at FROM join_tokens WHERE token_hash = ?1",
+                params![token_hash],
+                |row| {
+                    Ok(JoinTokenRow {
+                        agent_id: row.get(0)?,
+                        expires_at: row.get(1)?,
+                        used_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Record a completed join and burn its token. Re-joining an agent id
+    /// the portal already knew raises the grant epoch, so no grant issued
+    /// for its earlier volume stays valid. Returns whether it was a rejoin.
+    pub fn record_agent_join(
+        &mut self,
+        join: &AgentJoin,
+        token_hash: &str,
+    ) -> Result<bool, MetadataError> {
+        let transaction = self.connection.transaction()?;
+        let burned = transaction.execute(
+            "UPDATE join_tokens SET used_at = unixepoch()
+             WHERE token_hash = ?1 AND agent_id = ?2 AND used_at IS NULL",
+            params![token_hash, join.agent_id],
+        )?;
+        if burned != 1 {
+            return Err(MetadataError::InvalidState(
+                "join token is unknown, used, or for another agent".into(),
+            ));
+        }
+        let rejoin: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_joins WHERE agent_id = ?1)",
+            params![join.agent_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO agent_joins(agent_id, node_stable_id, base_url) VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                 node_stable_id = excluded.node_stable_id,
+                 base_url = excluded.base_url,
+                 joined_at = unixepoch()",
+            params![join.agent_id, join.node_stable_id, join.base_url],
+        )?;
+        if rejoin {
+            Self::bump_grant_state(&transaction, true)?;
+        }
+        transaction.commit()?;
+        Ok(rejoin)
+    }
+
+    pub fn agent_join(&self, agent_id: &str) -> Result<Option<AgentJoin>, MetadataError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT agent_id, node_stable_id, base_url FROM agent_joins WHERE agent_id = ?1",
+                params![agent_id],
+                |row| {
+                    Ok(AgentJoin {
+                        agent_id: row.get(0)?,
+                        node_stable_id: row.get(1)?,
+                        base_url: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
 }
 
 #[derive(Debug, Error)]

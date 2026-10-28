@@ -115,14 +115,50 @@ in what order, and how each criterion will be proven.
   to serve on it, because its routes are still unauthenticated. Tests:
   `tests/tailscale_localapi.rs` (fake LocalAPI). Every drill and process
   test passes `--insecure-loopback`.
-- **Work package 2 — started.** `crates/distr-hnsw/src/grant.rs` defines
-  grant v1 and key-set v1: canonical binary encodings with domain
-  separation, Ed25519 signatures, and verification that names each
-  rejection (unknown key, bad signature, stale or newer epoch, wrong agent,
-  operation, or object, delete without a GC proof, expired, not yet valid,
-  over-long lifetime). Key sets carry signatures from every key a rotation
-  needs, so agents that know only the old key accept the new set. Not yet
-  wired into agents or the portal.
+- **Work packages 2 and 3 — done 2026-10-28.**
+  - `grant.rs`: grant v1 and key-set v1, canonical binary with domain
+    separation and Ed25519 signatures; verification names each rejection.
+    A rotated key set carries signatures from the old and new keys.
+  - `trust.rs`: the agent's trust state on its volume (join-token hash,
+    then the signed key set and the pinned portal node), replaced durably.
+  - `agent.rs`: `POST /v1/join`, `PUT /v1/trust`, and a grant check on
+    every other route; on a tailnet address the caller must be the pinned
+    portal node (WhoIs). A grant whose epoch is newer, or whose key is
+    unknown, gets 409 with `x-distr-key-set-outdated`. The tailnet-serve
+    guard from work package 1 is gone.
+  - `access.rs` and schema v10: signing keys sealed under the master key
+    (created at `portal init`), grant epoch and key-set version, joined
+    agents, join tokens (stored as BLAKE3, 24-hour lifetime, single use).
+  - `agent_client.rs`: `AgentClient` signs a grant for every portal request
+    (health, inventory, get, put, and delete with its GC proof), pushes the
+    key set on 409 and retries once; `join_agent` handles a lost join
+    reply by confirming with a granted health check. All agent calls in
+    the portal, recovery, reconcile, lifecycle, and backup code use it.
+  - CLI: `portal agent token|join`, `portal key show-signing|rotate-signing|
+    retire-signing [--revoke]`, `--master-key` on every command that
+    contacts agents, and `--join-token-file` / `DISTR_HNSW_JOIN_TOKEN` on
+    `agent`.
+  - Tests: `tests/agent_authorization.rs` (every route against missing,
+    malformed, altered, expired, wrong-agent, wrong-operation,
+    wrong-object, stale-epoch, newer-epoch, and unknown-key grants; deletes
+    without a proof; single-use tokens; rotation and revocation) and
+    `tests/tailscale_localapi.rs` (a tailnet-bound agent process serves
+    only its pinned portal node and ignores forged identity headers).
+  - `portal agent request` sends one granted health, inventory, get, or put
+    request and prints the status, for drills and diagnosis (no delete).
+  - `agent --reset-trust` forgets the trusted portal and arms a new token,
+    for a portal rebuilt without its signing keys (a lost database with no
+    snapshot). It is a local operator action on the agent's host.
+  - An agent that trusts another portal refuses its key-set push, and the
+    caller sees that refusal (403 `key_set_untrusted`).
+  - `scripts/tailnet-authorization-drill.sh` checks the same refusals on
+    the real tailnet from another node.
+  - Grants bind the agent id, not the volume incarnation: a superseded
+    volume that returns accepts the newer key set, and the portal's
+    incarnation check (M1) is what keeps it out.
+  - Retiring a key without `--revoke` does not push the smaller key set:
+    agents keep accepting the retired key until their next key-set update.
+    Use `--revoke` when a key may be compromised.
 
 ## Work packages
 

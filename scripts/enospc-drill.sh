@@ -10,6 +10,10 @@
 #      agent runs unprivileged. Agent A serves a volume on that filesystem
 #      with --reserve-bytes 8 MiB --hard-floor-bytes 1 MiB and no quota;
 #      agent B (the second failure domain RF2 needs) serves a plain directory.
+#      The portal is initialized first; each agent starts with a single-use
+#      join token and is joined before use. Direct agent requests (capacity
+#      from /v1/health, inventories, admission probes) carry a grant: they go
+#      through `portal agent request`.
 #   2. Phase 1, admission: uploads 4 MiB files with distinct idempotency keys
 #      until `portal put` exits 3. Records the capacity state trajectory, the
 #      exit code, the agent's direct HTTP 507, that scrub sees exactly two
@@ -35,7 +39,7 @@
 # unmounts, detaches the loop device, and prints leftover counts from
 # `losetup -a` and `mount`.
 #
-# Requirements: passwordless sudo, mkfs.ext4, losetup, fallocate, jq, curl,
+# Requirements: passwordless sudo, mkfs.ext4, losetup, fallocate, jq,
 # sha256sum, and target/release/distr-hnsw.
 
 set -euo pipefail
@@ -71,7 +75,7 @@ log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$RUN/drill.log"
 die() { log "FATAL: $*"; exit 1; }
 
 [ -x "$BIN" ] || die "binary not found: $BIN (run: cargo build --release -p distr-hnsw)"
-for tool in mkfs.ext4 losetup fallocate jq curl sha256sum stat findmnt; do
+for tool in mkfs.ext4 losetup fallocate jq sha256sum stat findmnt; do
     command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
 sudo -n true 2>/dev/null || die "passwordless sudo required"
@@ -109,17 +113,21 @@ cleanup() {
 trap cleanup EXIT
 
 # --- helpers ----------------------------------------------------------------
-wait_health() {
+# An unjoined agent answers only POST /v1/join, so its readiness is the
+# listening port; a joined agent is polled with a granted /v1/health.
+wait_port() {
     local port="$1" i
     for i in $(seq 1 100); do
-        if curl -fsS "http://127.0.0.1:$port/v1/health" >/dev/null 2>&1; then return 0; fi
+        if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then return 0; fi
         sleep 0.1
     done
     return 1
 }
 
 # Starts an agent in the background; the PID is left in $LAST_PID (not
-# echoed, so AGENT_PIDS is updated in this shell, not a subshell).
+# echoed, so AGENT_PIDS is updated in this shell, not a subshell). An
+# unjoined agent needs DISTR_HNSW_JOIN_TOKEN in the caller's environment (see
+# join_agent); a joined agent restarts without one.
 LAST_PID=""
 start_agent() {
     local id="$1" domain="$2" port="$3" volume="$4" logfile="$5"
@@ -129,19 +137,58 @@ start_agent() {
     AGENT_PIDS+=("$LAST_PID")
 }
 
-health_a() { curl -fsS "http://127.0.0.1:$PORT_A/v1/health"; }
+# Starts a new agent with a single-use join token (same arguments as
+# start_agent), waits for its port, and joins it. The token stays in the
+# environment, never in a file or log.
+join_agent() {
+    local id="$1" domain="$2" port="$3" logfile="$5" token
+    token="$("$BIN" portal agent token --database "$PORTAL/portal.db" --master-key "$PORTAL/master.key" --agent-id "$id")" \
+        || die "portal agent token $id failed"
+    DISTR_HNSW_JOIN_TOKEN="$token" start_agent "$@"
+    wait_port "$port" || die "agent $id did not start: $(tail -3 "$logfile")"
+    DISTR_HNSW_JOIN_TOKEN="$token" "$BIN" portal agent join --database "$PORTAL/portal.db" --master-key "$PORTAL/master.key" \
+        --agent "$id,$domain,http://127.0.0.1:$port" >>"$RUN/portal-join.log" 2>&1 \
+        || die "portal agent join $id failed: $(tail -3 "$RUN/portal-join.log")"
+}
+
+# One granted request to the agent named by target $1 (id,domain,url),
+# through `portal agent request`; prints only the HTTP status.
+agent_request() {
+    local agent="$1"; shift
+    "$BIN" portal agent request --database "$PORTAL/portal.db" --master-key "$PORTAL/master.key" \
+        --agent "$agent" "$@" </dev/null
+}
+
+wait_health() {
+    local agent="$1" i
+    for i in $(seq 1 100); do
+        if [ "$(agent_request "$agent" health 2>/dev/null)" = 200 ]; then return 0; fi
+        sleep 0.1
+    done
+    return 1
+}
+
+health_a() {
+    [ "$(agent_request "$AGENT_A" health --out "$RUN/health-a.json")" = 200 ] || return 1
+    cat "$RUN/health-a.json"
+}
 cap_a() { health_a | jq -c .capacity; }
 cap_field() { cap_a | jq -r ".$1"; }
 fs_avail_bytes() { echo $(( $(stat -f -c %a "$MNT") * $(stat -f -c %S "$MNT") )); }
 tmp_files() { find "$VOL_A" -name '.*.tmp' 2>/dev/null; }
 
-# Number of objects an agent lists in one namespace (strict pagination).
+# Number of objects an agent (target $1) lists in one namespace (strict
+# pagination).
 inv_count() {
-    local port="$1" kind="$2" after="" url page n total=0
+    local agent="$1" kind="$2" after="" code page n total=0
+    local -a cursor
     while :; do
-        url="http://127.0.0.1:$port/v1/inventory/$kind"
-        [ -n "$after" ] && url="$url?after=$after"
-        page="$(curl -fsS "$url")" || return 1
+        cursor=()
+        [ -n "$after" ] && cursor=(--after "$after")
+        code="$(agent_request "$agent" inventory --kind "$kind" "${cursor[@]}" --out "$RUN/inventory-page.json")" \
+            || return 1
+        [ "$code" = 200 ] || return 1
+        page="$(cat "$RUN/inventory-page.json")"
         n="$(jq '.objects | length' <<<"$page")"
         total=$((total + n))
         after="$(jq -r '.next_after // empty' <<<"$page")"
@@ -150,15 +197,16 @@ inv_count() {
     echo "$total"
 }
 
-# Direct agent PUT with an all-zero hash. Admission runs before the hash is
-# verified, so 507 means refused by capacity and 409 means admitted (then
-# rejected on hash mismatch before any write). Nothing is stored either way.
+# Direct (granted) agent PUT with an all-zero hash to target $1. Admission
+# runs before the hash is verified, so 507 means refused by capacity and 409
+# means admitted (then rejected on hash mismatch before any write). Nothing
+# is stored either way.
 probe_put() {
-    local port="$1" kind="$2" size="$3"
+    local agent="$1" kind="$2" size="$3"
     local zero="0000000000000000000000000000000000000000000000000000000000000000"
     head -c "$size" /dev/zero > "$RUN/probe.bin"
-    curl -s -o "$RUN/probe-$kind-body.json" -w '%{http_code}' -X PUT \
-        --data-binary @"$RUN/probe.bin" "http://127.0.0.1:$port/v1/objects/$kind/$zero"
+    agent_request "$agent" put --kind "$kind" --hash "$zero" --body-file "$RUN/probe.bin" \
+        --out "$RUN/probe-$kind-body.json"
 }
 
 PUT_RC=0; PUT_OUT=""; PUT_ERR=""
@@ -223,16 +271,15 @@ PORT_A=$PORT_BASE
 PORT_B=$((PORT_BASE + 1))
 AGENT_A="a,host-a,http://127.0.0.1:$PORT_A"
 AGENT_B="b,host-b,http://127.0.0.1:$PORT_B"
-start_agent a host-a "$PORT_A" "$VOL_A" "$RUN/agent-a.log" \
+# Init first: it creates the grant-signing key that join tokens need.
+"$BIN" portal init --no-recovery-bundle --database "$PORTAL/portal.db" --master-key "$PORTAL/master.key" >"$RUN/portal-init.log" 2>&1 \
+    || die "portal init failed: $(cat "$RUN/portal-init.log")"
+join_agent a host-a "$PORT_A" "$VOL_A" "$RUN/agent-a.log" \
     --reserve-bytes "$RESERVE_BYTES" --hard-floor-bytes "$HARD_FLOOR_BYTES"; PID_A=$LAST_PID
-start_agent b host-b "$PORT_B" "$VOL_B" "$RUN/agent-b.log"; PID_B=$LAST_PID
-wait_health "$PORT_A" || die "agent a did not become healthy: $(tail -3 "$RUN/agent-a.log")"
-wait_health "$PORT_B" || die "agent b did not become healthy"
+join_agent b host-b "$PORT_B" "$VOL_B" "$RUN/agent-b.log"; PID_B=$LAST_PID
 INCARNATION_ORIG="$(health_a | jq -r .incarnation_id)"
 CAP_INITIAL="$(cap_a)"
 log "agent a pid=$PID_A port=$PORT_A incarnation=$INCARNATION_ORIG capacity=$CAP_INITIAL"
-"$BIN" portal init --no-recovery-bundle --database "$PORTAL/portal.db" --master-key "$PORTAL/master.key" >"$RUN/portal-init.log" 2>&1 \
-    || die "portal init failed: $(cat "$RUN/portal-init.log")"
 check setup initial_capacity_state "$(bool [ "$(jq -r .state <<<"$CAP_INITIAL")" = ok ])" "ok" "$(jq -r .state <<<"$CAP_INITIAL")"
 check setup reserve_and_floor_applied \
     "$(bool [ "$(jq -r .reserve_bytes <<<"$CAP_INITIAL")" = "$RESERVE_BYTES" -a "$(jq -r .hard_floor_bytes <<<"$CAP_INITIAL")" = "$HARD_FLOOR_BYTES" ])" \
@@ -279,22 +326,22 @@ check phase1 last_refusal_at_unset_by_portal_precheck true "informational" "last
 
 # Direct agent probes: a chunk must be refused with 507; a manifest-sized
 # control object must pass admission (409 = hash mismatch after admission).
-PROBE_CHUNK="$(probe_put "$PORT_A" chunk "$CHUNK_CIPHERTEXT")"
+PROBE_CHUNK="$(probe_put "$AGENT_A" chunk "$CHUNK_CIPHERTEXT")"
 PROBE_CHUNK_BODY="$(cat "$RUN/probe-chunk-body.json")"
-PROBE_MANIFEST="$(probe_put "$PORT_A" manifest 1024)"
+PROBE_MANIFEST="$(probe_put "$AGENT_A" manifest 1024)"
 CAP_AFTER_PROBE="$(cap_a)"
 check phase1 agent_direct_chunk_put_507 "$(bool [ "$PROBE_CHUNK" = 507 ])" "507" "$PROBE_CHUNK $PROBE_CHUNK_BODY"
 check phase1 agent_507_body_code "$(bool [ "$(jq -r .code <<<"$PROBE_CHUNK_BODY" 2>/dev/null)" = insufficient_capacity ])" "insufficient_capacity" "$(jq -c '{code,limiting,volume_id}' <<<"$PROBE_CHUNK_BODY" 2>/dev/null || echo "$PROBE_CHUNK_BODY")"
 check phase1 agent_direct_manifest_put_admitted "$(bool [ "$PROBE_MANIFEST" = 409 ])" "409 (admitted via control headroom, rejected on hash)" "$PROBE_MANIFEST"
 check phase1 last_refusal_at_set_by_agent_507 "$(bool [ "$(jq -r .last_refusal_at <<<"$CAP_AFTER_PROBE")" != null ])" "non-null" "$(jq -r .last_refusal_at <<<"$CAP_AFTER_PROBE")"
 
-INV_A_CHUNK="$(inv_count "$PORT_A" chunk)"; INV_A_MANIFEST="$(inv_count "$PORT_A" manifest)"; INV_A_MARKER="$(inv_count "$PORT_A" deletion_marker)"
+INV_A_CHUNK="$(inv_count "$AGENT_A" chunk)"; INV_A_MANIFEST="$(inv_count "$AGENT_A" manifest)"; INV_A_MARKER="$(inv_count "$AGENT_A" deletion_marker)"
 TMP_P1="$(tmp_files | wc -l)"
 check phase1 agent_a_inventory "$(bool [ "$INV_A_CHUNK" = "$ADMITTED" -a "$INV_A_MANIFEST" = "$ADMITTED" -a "$INV_A_MARKER" = 0 ])" \
     "chunks=$ADMITTED manifests=$ADMITTED markers=0" "chunks=$INV_A_CHUNK manifests=$INV_A_MANIFEST markers=$INV_A_MARKER"
 check phase1 no_tmp_files_after_refusal "$(bool [ "$TMP_P1" = 0 ])" "0" "$TMP_P1"
 
-portal_run scrub-p1 scrub --database "$PORTAL/portal.db" --agent "$AGENT_A" --agent "$AGENT_B"
+portal_run scrub-p1 scrub --database "$PORTAL/portal.db" --master-key "$PORTAL/master.key" --agent "$AGENT_A" --agent "$AGENT_B"
 SCRUB_P1_REQUIRED="$(jq -r .totals.required_objects <<<"$CMD_OUT")"
 SCRUB_P1_HEALTH="$(jq -c .health <<<"$CMD_OUT")"
 check phase1 scrub_required_objects "$(bool [ "$SCRUB_P1_REQUIRED" = "$((ADMITTED * 2))" -a "$CMD_RC" = 0 ])" \
@@ -309,7 +356,7 @@ DELETED_FID="${FILE_IDS[0]}"
 portal_run delete-p1 delete --database "$PORTAL/portal.db" --master-key "$PORTAL/master.key" \
     --agent "$AGENT_A" --agent "$AGENT_B" --idempotency-key "enospc-$UTC-delete-1" "$DELETED_FID"
 DELETE_RC=$CMD_RC; MARKER_HASH="$CMD_OUT"
-INV_A_MARKER="$(inv_count "$PORT_A" deletion_marker)"
+INV_A_MARKER="$(inv_count "$AGENT_A" deletion_marker)"
 CAP_AFTER_DELETE="$(cap_a)"
 check phase1 delete_succeeds_under_paused_admission "$(bool [ "$DELETE_RC" = 0 -a "$INV_A_MARKER" = 1 ])" \
     "exit=0 markers_on_a=1" "exit=$DELETE_RC markers_on_a=$INV_A_MARKER marker=$MARKER_HASH state=$(jq -r .state <<<"$CAP_AFTER_DELETE") stderr=$(cat "$RUN/delete-p1-stderr.txt")"
@@ -340,7 +387,7 @@ log "filler=$FILLER_BYTES bytes; avail before=$AVAIL_BEFORE_FILL after=$AVAIL_AF
 PORT_A=$((PORT_BASE + 2))
 AGENT_A="a,host-a,http://127.0.0.1:$PORT_A"
 start_agent a host-a "$PORT_A" "$VOL_A" "$RUN/agent-a.log" --reserve-bytes 0 --hard-floor-bytes 0; PID_A=$LAST_PID
-wait_health "$PORT_A" || die "agent a did not restart: $(tail -3 "$RUN/agent-a.log")"
+wait_health "$AGENT_A" || die "agent a did not restart: $(tail -3 "$RUN/agent-a.log")"
 INCARNATION_P2="$(health_a | jq -r .incarnation_id)"
 CAP_P2_BEFORE="$(cap_a)"
 USED_P2_BEFORE="$(jq -r .used_bytes <<<"$CAP_P2_BEFORE")"
@@ -356,8 +403,8 @@ ENOSPC_RC=$PUT_RC; ENOSPC_ERR=$PUT_ERR
 CAP_P2_AFTER="$(cap_a)"
 TMP_P2_LIST="$(tmp_files || true)"
 TMP_P2="$(printf '%s' "$TMP_P2_LIST" | grep -c . || true)"
-INV_B_CHUNK_P2="$(inv_count "$PORT_B" chunk)"
-INV_A_CHUNK_P2="$(inv_count "$PORT_A" chunk)"
+INV_B_CHUNK_P2="$(inv_count "$AGENT_B" chunk)"
+INV_A_CHUNK_P2="$(inv_count "$AGENT_A" chunk)"
 LIMITING="$(grep -o 'limiting: [a-z_]*' <<<"$ENOSPC_ERR" | head -1 | cut -d' ' -f2 || true)"
 HTTP_SEEN="$(grep -o 'HTTP [0-9]\{3\}' <<<"$ENOSPC_ERR" | head -1 | tr -dc 0-9 || true)"
 if [ -z "$HTTP_SEEN" ] && [ "$ENOSPC_RC" = 3 ] && [ "$LIMITING" = enospc ]; then
@@ -380,10 +427,10 @@ log "phase 2 done: rc=$ENOSPC_RC limiting=${LIMITING:-none} http=$HTTP_SEEN stat
 log "phase 3: removing filler, scrub, gc --apply, retry refused keys"
 rm -f "$MNT/filler.bin"
 AVAIL_AFTER_UNFILL="$(fs_avail_bytes)"
-portal_run scrub-p3 scrub --database "$PORTAL/portal.db" --agent "$AGENT_A" --agent "$AGENT_B"
+portal_run scrub-p3 scrub --database "$PORTAL/portal.db" --master-key "$PORTAL/master.key" --agent "$AGENT_A" --agent "$AGENT_B"
 SCRUB_P3_RC=$CMD_RC
 USED_BEFORE_GC="$(cap_field used_bytes)"
-portal_run gc-p3 gc --database "$PORTAL/portal.db" --agent "$AGENT_A" --agent "$AGENT_B" \
+portal_run gc-p3 gc --database "$PORTAL/portal.db" --master-key "$PORTAL/master.key" --agent "$AGENT_A" --agent "$AGENT_B" \
     --apply --retention-seconds 0 --staging-grace-seconds 0
 GC_RC=$CMD_RC
 GC_TOTALS="$(jq -c .totals <<<"$CMD_OUT")"
@@ -411,7 +458,7 @@ for pair in "1:$RETRY1_FID:$REFUSED_SRC" "2:$RETRY2_FID:$ENOSPC_SRC"; do
         check phase3 "download_${n}_hash_matches" false "downloadable" "no file id"
     fi
 done
-portal_run scrub-final scrub --database "$PORTAL/portal.db" --agent "$AGENT_A" --agent "$AGENT_B"
+portal_run scrub-final scrub --database "$PORTAL/portal.db" --master-key "$PORTAL/master.key" --agent "$AGENT_A" --agent "$AGENT_B"
 EXPECTED_REQUIRED=$(( (ADMITTED - 1) * 2 + 1 + 4 ))
 FINAL_REQUIRED="$(jq -r .totals.required_objects <<<"$CMD_OUT")"
 check phase3 final_scrub_durable "$(bool [ "$CMD_RC" = 0 -a "$FINAL_REQUIRED" = "$EXPECTED_REQUIRED" ])" \

@@ -4,18 +4,25 @@
 //! server and the right to create buckets. Credentials come from
 //! `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` like the product code.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use aws_sdk_s3::{
     types::{BucketVersioningStatus, VersioningConfiguration},
     Client,
 };
 use distr_hnsw::{
+    access::create_join_token,
     agent::{serve_agent, AgentIdentity},
+    agent_client::{join_agent, AgentClient},
     backup::{self, s3, BackupError, BackupTargetSpec, PutOutcome, S3Target},
     crypto::MasterKey,
     metadata::Database,
     portal::{AgentTarget, Portal},
+    tailscale::LocalApi,
     CHUNK_SIZE,
 };
 use tempfile::TempDir;
@@ -75,7 +82,18 @@ impl Drop for TestAgent {
     }
 }
 
-async fn start_agent(id: &str, domain: &str) -> TestAgent {
+/// Start an agent on a fresh volume with a join token from the portal
+/// database at `database_path` (bound to the key at `key_path`) and join it
+/// there. Joining an id the database joined before raises the grant epoch.
+async fn start_agent(id: &str, domain: &str, database_path: &Path, key_path: &Path) -> TestAgent {
+    let key = MasterKey::load(key_path).unwrap();
+    let mut database = Database::open(database_path).unwrap();
+    database.bind_master_key_id(&key.key_id_hex()).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let token = create_join_token(&mut database, id, now).unwrap();
     let holder = tempfile::tempdir().unwrap();
     let volume: PathBuf = holder.path().to_owned();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -84,15 +102,28 @@ async fn start_agent(id: &str, domain: &str) -> TestAgent {
         id: id.to_owned(),
         failure_domain: domain.to_owned(),
     };
+    let agent_token = token.clone();
     let task = tokio::spawn(async move {
-        serve_agent(listener, volume, identity).await.unwrap();
+        serve_agent(listener, volume, identity, &agent_token)
+            .await
+            .unwrap();
     });
+    let target = AgentTarget {
+        id: id.to_owned(),
+        failure_domain: domain.to_owned(),
+        base_url: format!("http://{address}"),
+    };
+    join_agent(
+        &mut database,
+        &key,
+        &target,
+        &token,
+        &LocalApi::new("/nonexistent/tailscaled.sock"),
+    )
+    .await
+    .unwrap();
     TestAgent {
-        target: AgentTarget {
-            id: id.to_owned(),
-            failure_domain: domain.to_owned(),
-            base_url: format!("http://{address}"),
-        },
+        target,
         _holder: holder,
         task,
     }
@@ -251,12 +282,13 @@ async fn backup_and_restore_round_trip_through_s3() {
     let spec: BackupTargetSpec = format!("s3:{bucket}/offsite").parse().unwrap();
     assert_eq!(spec.id(), format!("s3:{bucket}/offsite"));
 
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let database_path = workspace.path().join("portal.sqlite");
+    MasterKey::create(&key_path).unwrap();
+    let agent_a = start_agent("agent-a", "host-a", &database_path, &key_path).await;
+    let agent_b = start_agent("agent-b", "host-b", &database_path, &key_path).await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let kept_source = workspace.path().join("kept.bin");
     let kept_bytes: Vec<u8> = (0..CHUNK_SIZE + 4096)
         .map(|index| ((index * 7 + 3) % 251) as u8)
@@ -265,7 +297,7 @@ async fn backup_and_restore_round_trip_through_s3() {
     let deleted_source = workspace.path().join("deleted.bin");
     fs::write(&deleted_source, vec![9_u8; 2048]).unwrap();
     let (kept_id, deleted_id) = {
-        let key = MasterKey::create(&key_path).unwrap();
+        let key = MasterKey::load(&key_path).unwrap();
         let mut portal = Portal::open(&database_path, key, agents.clone()).unwrap();
         let kept_id = portal.upload(&kept_source, "s3-kept").await.unwrap();
         let deleted_id = portal.upload(&deleted_source, "s3-deleted").await.unwrap();
@@ -273,9 +305,10 @@ async fn backup_and_restore_round_trip_through_s3() {
         (kept_id, deleted_id)
     };
 
-    let http = reqwest::Client::new();
+    let key = MasterKey::load(&key_path).unwrap();
     let mut database = Database::open(&database_path).unwrap();
-    let first = backup::backup(&mut database, &agents, &http, &spec, &database_path)
+    let grants = AgentClient::open(&mut database, &key).unwrap();
+    let first = backup::backup(&mut database, &agents, &grants, &spec, &database_path)
         .await
         .unwrap();
     assert_eq!(first.exit_code(), 0, "{first:?}");
@@ -290,7 +323,7 @@ async fn backup_and_restore_round_trip_through_s3() {
     assert!(!first.snapshot_skipped_identical);
     let snapshot = first.snapshot.clone().expect("snapshot shipped");
 
-    let second = backup::backup(&mut database, &agents, &http, &spec, &database_path)
+    let second = backup::backup(&mut database, &agents, &grants, &spec, &database_path)
         .await
         .unwrap();
     assert_eq!(second.exit_code(), 0, "{second:?}");
@@ -337,23 +370,25 @@ async fn backup_and_restore_round_trip_through_s3() {
         Err(BackupError::DestinationExists(_))
     ));
 
-    let agent_c = start_agent("agent-a", "host-a").await;
-    let agent_d = start_agent("agent-b", "host-b").await;
+    // The restored metadata carries the signing key; the fresh agents join
+    // the restored portal before any object is copied into them.
+    let agent_c = start_agent("agent-a", "host-a", &new_database, &key_path).await;
+    let agent_d = start_agent("agent-b", "host-b", &new_database, &key_path).await;
     let new_agents = vec![agent_c.target.clone(), agent_d.target.clone()];
-    let objects = backup::restore_objects(&spec, &new_agents, &http)
+    let new_grants = AgentClient::open(&mut Database::open(&new_database).unwrap(), &key).unwrap();
+    let objects = backup::restore_objects(&spec, &new_agents, &new_grants)
         .await
         .unwrap();
     assert_eq!(objects.exit_code(), 0, "{objects:?}");
     assert_eq!(objects.objects, 6);
     assert_eq!(objects.placed, 12);
     assert_eq!(objects.already_present, 0);
-    let again = backup::restore_objects(&spec, &new_agents, &http)
+    let again = backup::restore_objects(&spec, &new_agents, &new_grants)
         .await
         .unwrap();
     assert_eq!(again.placed, 0);
     assert_eq!(again.already_present, 12);
 
-    let key = MasterKey::load(&key_path).unwrap();
     let mut portal = Portal::open(&new_database, key, new_agents).unwrap();
     let recovery = portal.recover(true).await.unwrap();
     assert_eq!(recovery.exit_code(), 0, "{recovery:?}");

@@ -27,17 +27,20 @@ both planes; one SQLite database holds control-plane metadata.
 Today everything runs as one binary, `distr-hnsw`, with three command
 groups: `agent` (a storage daemon), `portal` (one-shot coordinator commands
 over the SQLite database), and `index` (moving engine state through the blob
-plane). Agents bind to loopback only until M2.
+plane). Agents bind to their node's tailnet address (or to loopback with an
+explicit insecure flag) and accept only requests that carry a grant signed
+by the portal.
 
 ## Blob plane
 
 ```text
              portal (CLI today; daemon in M2)
-             ├─ SQLite metadata (schema v9): uploads, files, generations,
-             │  placements, incarnations, scans, GC proofs, backup state
+             ├─ SQLite metadata (schema v10): uploads, files, generations,
+             │  placements, incarnations, scans, GC proofs, backup state,
+             │  grant-signing keys, joined agents, join tokens
              ├─ master key (file) ── recovery bundle (offline, passphrase)
              │
-   PUT/GET/inventory/DELETE over HTTP (loopback until M2)
+   PUT/GET/inventory/DELETE over HTTP, each with a signed grant
              │
    ┌─────────┴─────────┐
  agent A (domain 1)  agent B (domain 2)  …   immutable content-addressed
@@ -53,6 +56,15 @@ plane). Agents bind to loopback only until M2.
   atomic rename, and directory sync before acknowledging. They verify hashes
   on PUT and GET, list inventories, report capacity, and make no placement
   decisions.
+- **Agent authorization.** An agent joins once with a single-use token and
+  then trusts the portal's key set (Ed25519 verification keys and a grant
+  epoch). Every request carries a grant naming the agent, the operation,
+  the object, and an expiry of two minutes; a `DELETE` grant also names the
+  GC proof it applies. On a tailnet address the agent also checks with
+  Tailscale WhoIs that the caller is the portal node it pinned at join.
+  Key rotation and revocation reach an agent on its next request: it
+  answers 409, and the portal pushes the new key set, which the old key
+  vouches for.
 - **Commit spine.** The portal persists an idempotent upload plan, places
   every chunk and then the manifest on agents in at least two failure
   domains (RF2), re-verifies them live, and only then commits the file in

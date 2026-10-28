@@ -32,6 +32,11 @@ mkdir -p "$WORK/originals"
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 now() { date -u +%s.%N; }
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
+# Agent routes need a grant, so readiness is the listening port, not /v1/health.
+wait_port() {
+  for _ in $(seq 1 100); do (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && return 0; sleep 0.05; done
+  return 1
+}
 PIDS=(); declare -A AGENT_PID
 cleanup() { for pid in "${PIDS[@]:-}"; do [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true; done; }
 trap cleanup EXIT
@@ -44,17 +49,25 @@ DB="$WORK/portal.sqlite"; KEY="$WORK/master.key"
 "$BIN" portal init --no-recovery-bundle --database "$DB" --master-key "$KEY" >/dev/null
 
 declare -a TARGETS=()
+# Start an agent with a single-use join token and join it. The token stays in
+# the environment, never in a file or log.
 start_agent() {
-  local id="$1" domain="$2" port volume
+  local id="$1" domain="$2" port volume token target
   port="$(free_port)"; volume="$WORK/$id"; mkdir -p "$volume"
-  "$BIN" agent --id "$id" --failure-domain "$domain" --bind "127.0.0.1:$port" --insecure-loopback --volume "$volume" >"$WORK/$id.log" 2>&1 &
+  token="$("$BIN" portal agent token --database "$DB" --master-key "$KEY" --agent-id "$id")"
+  DISTR_HNSW_JOIN_TOKEN="$token" "$BIN" agent --id "$id" --failure-domain "$domain" --bind "127.0.0.1:$port" \
+    --insecure-loopback --volume "$volume" >"$WORK/$id.log" 2>&1 &
   PIDS+=("$!"); AGENT_PID["$id"]="$!"
-  for _ in $(seq 1 100); do curl -sf "http://127.0.0.1:$port/v1/health" >/dev/null && break; sleep 0.05; done
-  TARGETS+=("$id,$domain,http://127.0.0.1:$port")
+  wait_port "$port" || { log "agent $id did not start: $(tail -3 "$WORK/$id.log")"; exit 1; }
+  target="$id,$domain,http://127.0.0.1:$port"
+  DISTR_HNSW_JOIN_TOKEN="$token" "$BIN" portal agent join --database "$DB" --master-key "$KEY" \
+    --agent "$target" >"$WORK/$id.join.json"
+  TARGETS+=("$target")
 }
 args() { local a=(); for t in "${TARGETS[@]}"; do a+=(--agent "$t"); done; printf '%s\n' "${a[@]}"; }
-portal() { local cmd="$1"; shift; mapfile -t A < <(args); "$BIN" portal "$cmd" --database "$DB" "${A[@]}" "$@"; }
-kportal() { local cmd="$1"; shift; mapfile -t A < <(args); "$BIN" portal "$cmd" --database "$DB" --master-key "$KEY" "${A[@]}" "$@"; }
+# Every command that contacts agents needs the master key: it unseals the
+# key that signs agent grants.
+portal() { local cmd="$1"; shift; mapfile -t A < <(args); "$BIN" portal "$cmd" --database "$DB" --master-key "$KEY" "${A[@]}" "$@"; }
 timed() { local name="$1"; shift; local s; s="$(now)"; "$@"; local f; f="$(now)"; python3 -c "print(round($f-$s,3))" >"$WORK/t-$name"; }
 took() { cat "$WORK/t-$1"; }
 
@@ -70,7 +83,7 @@ commit_loop() {
     bytes=$(( (RANDOM * 32768 + RANDOM) % (MAX_MIB * 1048576 - 4096) + 4096 ))
     head -c "$bytes" /dev/urandom >"$WORK/originals/$name"
     sha="$(sha256sum "$WORK/originals/$name" | cut -d' ' -f1)"
-    id="$(kportal put --idempotency-key "m-$STAMP-$i" "$WORK/originals/$name")"
+    id="$(portal put --idempotency-key "m-$STAMP-$i" "$WORK/originals/$name")"
     printf '%s\t%s\t%s\t%s\n' "$name" "$bytes" "$sha" "$id" >>"$MANIFEST"
   done
 }
@@ -125,7 +138,7 @@ verify_sample() {
   local n="$1" ok=0 bad=0
   while IFS=$'\t' read -r name bytes sha id; do
     out="$WORK/get-$name"
-    if kportal get "$id" "$out" >/dev/null 2>&1 && [[ "$(sha256sum "$out" | cut -d' ' -f1)" == "$sha" ]]; then ok=$((ok+1)); else bad=$((bad+1)); fi
+    if portal get "$id" "$out" >/dev/null 2>&1 && [[ "$(sha256sum "$out" | cut -d' ' -f1)" == "$sha" ]]; then ok=$((ok+1)); else bad=$((bad+1)); fi
     rm -f "$out"
   done < <(shuf -n "$n" --random-source=<(yes) "$MANIFEST")
   echo "$ok $bad"
@@ -150,7 +163,7 @@ log "drain $DRAIN; retired $RETIRED; rebalance placed $REBALANCED; health $HEALT
 # ---- 4. Delete and garbage-collect --------------------------------------------
 DELETED=0
 while IFS=$'\t' read -r name bytes sha id; do
-  kportal delete --idempotency-key "m-$STAMP-del-$id" "$id" >/dev/null; DELETED=$((DELETED+1))
+  portal delete --idempotency-key "m-$STAMP-del-$id" "$id" >/dev/null; DELETED=$((DELETED+1))
 done < <(awk 'NR % 4 == 0' "$MANIFEST")
 USED_BEFORE=$(du -sb "$WORK/agent-1/objects" "$WORK/agent-2/objects" "$WORK/agent-4/objects" | awk '{s+=$1} END {print s}')
 timed gc-blocked portal gc --apply --retention-seconds 0 --staging-grace-seconds 0 >"$WORK/gc-0.json" || true
@@ -165,7 +178,7 @@ FINAL_HEALTH="$(jq -c '.health' "$WORK/scrub-5.json")"
 read -r S3_OK S3_BAD <<<"$(awk 'NR % 4 != 0' "$MANIFEST" > "$WORK/kept.tsv"; MANIFEST="$WORK/kept.tsv" verify_sample 24)"
 DELETED_READABLE=0
 while IFS=$'\t' read -r name bytes sha id; do
-  if kportal get "$id" "$WORK/zombie" >/dev/null 2>&1; then DELETED_READABLE=$((DELETED_READABLE+1)); rm -f "$WORK/zombie"; fi
+  if portal get "$id" "$WORK/zombie" >/dev/null 2>&1; then DELETED_READABLE=$((DELETED_READABLE+1)); rm -f "$WORK/zombie"; fi
 done < <(awk 'NR % 4 == 0' "$MANIFEST")
 log "deleted $DELETED; gc before scan blocked=$GC_BLOCKED_BEFORE_SCAN; gc $GC; bytes $USED_BEFORE -> $USED_AFTER; health $FINAL_HEALTH"
 
@@ -184,18 +197,18 @@ portal scrub --repair >"$WORK/scrub-6.json" || true
 # until recovery reconciles the metadata, and the acknowledged file survives.
 head -c 3000000 /dev/urandom >"$WORK/originals/late.bin"
 LATE_SHA="$(sha256sum "$WORK/originals/late.bin" | cut -d' ' -f1)"
-DISTR_HNSW_FAILPOINT=after_chunks_durable kportal put --idempotency-key "m-$STAMP-late" "$WORK/originals/late.bin" >/dev/null 2>&1 || true
+DISTR_HNSW_FAILPOINT=after_chunks_durable portal put --idempotency-key "m-$STAMP-late" "$WORK/originals/late.bin" >/dev/null 2>&1 || true
 python3 -c "import sqlite3,sys; sqlite3.connect(sys.argv[1]).execute('VACUUM INTO ?', (sys.argv[2],))" "$DB" "$WORK/stale.sqlite"
-LATE_ID="$(kportal put --idempotency-key "m-$STAMP-late" "$WORK/originals/late.bin")"
+LATE_ID="$(portal put --idempotency-key "m-$STAMP-late" "$WORK/originals/late.bin")"
 rm -f "$DB" "$DB-wal" "$DB-shm"; cp "$WORK/stale.sqlite" "$DB"
 portal scrub >"$WORK/scrub-7.json" || true
 portal gc --apply --retention-seconds 0 --staging-grace-seconds 0 >"$WORK/gc-stale.json" || true
 GC_STALE_APPLIED="$(jq '.totals.applied' "$WORK/gc-stale.json")"
 GC_STALE_UNKNOWN="$(jq '[.candidates[] | select(any(.blockers[]; test("unknown to the metadata")))] | length' "$WORK/gc-stale.json")"
-kportal recover --apply >"$WORK/recover-stale.json" || true
+portal recover --apply >"$WORK/recover-stale.json" || true
 RECOVER_STALE_BLOCKED="$(jq '.totals.blocked' "$WORK/recover-stale.json")"
 LATE_OK=0
-if kportal get "$LATE_ID" "$WORK/late-out.bin" >/dev/null 2>&1 \
+if portal get "$LATE_ID" "$WORK/late-out.bin" >/dev/null 2>&1 \
    && [[ "$(sha256sum "$WORK/late-out.bin" | cut -d' ' -f1)" == "$LATE_SHA" ]]; then LATE_OK=1; fi
 log "retired after gc: $RETIRED_AFTER_GC; stale-restore gc applied=$GC_STALE_APPLIED unknown-blocked=$GC_STALE_UNKNOWN; recover blocked=$RECOVER_STALE_BLOCKED; late file intact=$LATE_OK"
 cleanup; PIDS=()

@@ -11,7 +11,10 @@ use serde::Deserialize;
 use thiserror::Error;
 use uuid::Uuid;
 
+use axum::body::Bytes;
+
 use crate::{
+    agent_client::{join_agent, AgentClient, JoinOutcome},
     crypto::{
         decrypt_chunk, encrypt_chunk, random_key, random_nonce, unwrap_key, wrap_key, MasterKey,
         ENVELOPE_VERSION,
@@ -25,6 +28,7 @@ use crate::{
         NewDeleteOperation, NewUpload, UploadState,
     },
     object::{ObjectHash, ObjectKind},
+    tailscale::LocalApi,
     CHUNK_SIZE,
 };
 
@@ -44,7 +48,11 @@ impl FromStr for AgentTarget {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let fields: Vec<_> = value.splitn(3, ',').collect();
-        if fields.len() != 3 || fields.iter().any(|field| field.trim().is_empty()) {
+        // Grants carry the agent id in a length-prefixed byte (grant.rs).
+        if fields.len() != 3
+            || fields.iter().any(|field| field.trim().is_empty())
+            || fields[0].trim().len() > 255
+        {
             return Err(PortalError::InvalidAgent(value.to_owned()));
         }
         Ok(Self {
@@ -122,7 +130,7 @@ pub struct Portal {
     pub(crate) database: Database,
     pub(crate) master_key: MasterKey,
     pub(crate) agents: Vec<AgentTarget>,
-    pub(crate) client: reqwest::Client,
+    pub(crate) client: AgentClient,
     /// Incarnation each configured agent reported when last verified in this
     /// process. Placements are only recorded against a verified incarnation.
     incarnations: HashMap<String, String>,
@@ -142,15 +150,43 @@ impl Portal {
         let mut database = Database::open(database_path)?;
         // Refuse a wrong key before any object is decrypted.
         database.bind_master_key_id(&master_key.key_id_hex())?;
+        let client = AgentClient::open(&mut database, &master_key)?;
         Ok(Self {
             database,
             master_key,
             agents,
-            client: reqwest::Client::new(),
+            client,
             incarnations: HashMap::new(),
             capacities: HashMap::new(),
             failpoint: None,
         })
+    }
+
+    /// Create a single-use join token for `agent_id`, returned once; start
+    /// the agent with it, then call [`Portal::join_agent`].
+    pub fn create_join_token(&mut self, agent_id: &str) -> Result<String, PortalError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| PortalError::SystemClockBeforeEpoch)?
+            .as_secs() as i64;
+        Ok(crate::access::create_join_token(
+            &mut self.database,
+            agent_id,
+            now,
+        )?)
+    }
+
+    /// Join an agent that was started with `token`. A rejoin raises the
+    /// grant epoch, so the signing state is reloaded afterwards.
+    pub async fn join_agent(
+        &mut self,
+        agent: &AgentTarget,
+        token: &str,
+        api: &LocalApi,
+    ) -> Result<JoinOutcome, PortalError> {
+        let outcome = join_agent(&mut self.database, &self.master_key, agent, token, api).await?;
+        self.client = AgentClient::open(&mut self.database, &self.master_key)?;
+        Ok(outcome)
     }
 
     pub fn with_failpoint(mut self, failpoint: Failpoint, action: FailpointAction) -> Self {
@@ -540,8 +576,11 @@ impl Portal {
                     &incarnation_id,
                 )?;
             }
-            let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
-            let response = match self.client.put(url).body(bytes.to_vec()).send().await {
+            let response = match self
+                .client
+                .put(&agent, kind, hash, Bytes::copy_from_slice(bytes))
+                .await
+            {
                 Ok(response) => response,
                 Err(error) => {
                     last_failure = Some(PortalError::Http(error));
@@ -650,8 +689,7 @@ impl Portal {
             let Some(agent) = agent_map.get(agent_id.as_str()) else {
                 continue;
             };
-            let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
-            match self.client.get(url).send().await {
+            match self.client.get(agent, kind, hash).await {
                 Ok(response) if response.status().is_success() => match response.bytes().await {
                     Ok(bytes) if ObjectHash::digest(&bytes) == *hash => {
                         live_domains.insert(agent.failure_domain.as_str());
@@ -696,8 +734,7 @@ impl Portal {
             let Some(agent) = agent_map.get(agent_id.as_str()) else {
                 continue;
             };
-            let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
-            match self.client.get(url).send().await {
+            match self.client.get(agent, kind, hash).await {
                 Ok(response) if response.status().is_success() => match response.bytes().await {
                     Ok(bytes) if ObjectHash::digest(&bytes) == *hash => return Ok(bytes.to_vec()),
                     Ok(_) => last_error = Some("portal hash verification failed".to_owned()),
@@ -723,12 +760,7 @@ impl Portal {
         let mut live_domains = HashSet::new();
         let mut last_failure = None;
         for agent in self.agents.clone() {
-            let response = match self
-                .client
-                .get(format!("{}/v1/health", agent.base_url))
-                .send()
-                .await
-            {
+            let response = match self.client.health(&agent).await {
                 Ok(response) => response,
                 Err(error) => {
                     last_failure = Some(PortalError::Http(error));
@@ -1058,6 +1090,10 @@ pub enum PortalError {
     Format(#[from] crate::format::FormatError),
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    #[error(transparent)]
+    Access(#[from] crate::access::AccessError),
+    #[error(transparent)]
+    Join(#[from] crate::agent_client::JoinError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

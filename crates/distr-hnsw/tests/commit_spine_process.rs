@@ -6,10 +6,13 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use distr_hnsw::{
+    access::GrantMaterial,
+    crypto::MasterKey,
+    grant::{Operation, Scope, GRANT_SCHEME},
     metadata::Database,
     object::{ObjectHash, ObjectKind},
     portal::Failpoint,
@@ -33,20 +36,61 @@ fn free_address() -> SocketAddr {
     listener.local_addr().unwrap()
 }
 
-fn start_agent(binary: &Path, id: &str, domain: &str, volume: &Path) -> (AgentProcess, String) {
-    start_agent_with_env(binary, id, domain, volume, &[])
+/// `portal init` without a recovery bundle; it also creates the portal's
+/// grant-signing key, so agents can be joined right after.
+fn init_portal(binary: &Path, database: &Path, master_key: &Path) {
+    let init = Command::new(binary)
+        .args(["portal", "init", "--no-recovery-bundle", "--database"])
+        .arg(database)
+        .arg("--master-key")
+        .arg(master_key)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
 }
 
-fn start_agent_with_env(
+/// A single-use join token for `id` from `portal agent token`.
+fn join_token(binary: &Path, database: &Path, master_key: &Path, id: &str) -> String {
+    let output = Command::new(binary)
+        .args(["portal", "agent", "token", "--database"])
+        .arg(database)
+        .arg("--master-key")
+        .arg(master_key)
+        .args(["--agent-id", id])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+/// Spawn a loopback agent and wait for its port. An unjoined agent needs
+/// `token`; a joined agent keeps its trust on the volume and restarts
+/// without one.
+fn spawn_agent(
     binary: &Path,
     id: &str,
     domain: &str,
     volume: &Path,
+    token: Option<&str>,
     env: &[(&str, &str)],
 ) -> (AgentProcess, String) {
     let address = free_address();
-    let child = Command::new(binary)
-        .envs(env.iter().copied())
+    let mut command = Command::new(binary);
+    command
+        .env_remove("DISTR_HNSW_JOIN_TOKEN")
+        .envs(env.iter().copied());
+    if let Some(token) = token {
+        command.env("DISTR_HNSW_JOIN_TOKEN", token);
+    }
+    let child = command
         .args([
             "agent",
             "--id",
@@ -76,6 +120,59 @@ fn start_agent_with_env(
     )
 }
 
+/// `portal agent join` for a running agent; returns the join report.
+fn join_agent(
+    binary: &Path,
+    database: &Path,
+    master_key: &Path,
+    target: &str,
+    token: &str,
+) -> serde_json::Value {
+    let output = Command::new(binary)
+        .args(["portal", "agent", "join", "--database"])
+        .arg(database)
+        .arg("--master-key")
+        .arg(master_key)
+        .args(["--agent", target])
+        .env("DISTR_HNSW_JOIN_TOKEN", token)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "join {target}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// Start an agent with a fresh join token and join it to the portal.
+fn start_agent(
+    binary: &Path,
+    database: &Path,
+    master_key: &Path,
+    id: &str,
+    domain: &str,
+    volume: &Path,
+) -> (AgentProcess, String) {
+    start_agent_with_env(binary, database, master_key, id, domain, volume, &[])
+}
+
+fn start_agent_with_env(
+    binary: &Path,
+    database: &Path,
+    master_key: &Path,
+    id: &str,
+    domain: &str,
+    volume: &Path,
+    env: &[(&str, &str)],
+) -> (AgentProcess, String) {
+    let token = join_token(binary, database, master_key, id);
+    let (agent, target) = spawn_agent(binary, id, domain, volume, Some(&token), env);
+    let joined = join_agent(binary, database, master_key, &target, &token);
+    assert_eq!(joined["agent_id"], id);
+    (agent, target)
+}
+
 fn portal_command(
     binary: &Path,
     operation: &str,
@@ -95,23 +192,41 @@ fn portal_command(
     command
 }
 
+/// Each case gets its own portal and its own agents: an agent trusts only
+/// the portal that joined it.
+fn case_cluster(binary: &Path, case: &Path) -> (PathBuf, PathBuf, [AgentProcess; 2], Vec<String>) {
+    fs::create_dir_all(case).unwrap();
+    let database = case.join("portal.sqlite");
+    let master_key = case.join("master.key");
+    init_portal(binary, &database, &master_key);
+    let (agent_a, target_a) = start_agent(
+        binary,
+        &database,
+        &master_key,
+        "agent-a",
+        "host-a",
+        &case.join("agent-a"),
+    );
+    let (agent_b, target_b) = start_agent(
+        binary,
+        &database,
+        &master_key,
+        "agent-b",
+        "host-b",
+        &case.join("agent-b"),
+    );
+    (
+        database,
+        master_key,
+        [agent_a, agent_b],
+        vec![target_a, target_b],
+    )
+}
+
 #[test]
 fn abrupt_portal_exit_at_every_boundary_recovers() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_distr-hnsw"));
     let workspace = tempfile::tempdir().unwrap();
-    let (_agent_a, target_a) = start_agent(
-        &binary,
-        "agent-a",
-        "host-a",
-        &workspace.path().join("agent-a"),
-    );
-    let (_agent_b, target_b) = start_agent(
-        &binary,
-        "agent-b",
-        "host-b",
-        &workspace.path().join("agent-b"),
-    );
-    let agents = vec![target_a, target_b];
     let source = workspace.path().join("source.bin");
     let expected: Vec<_> = (0..CHUNK_SIZE + 19)
         .map(|index| ((index * 13 + 5) % 253) as u8)
@@ -130,21 +245,7 @@ fn abrupt_portal_exit_at_every_boundary_recovers() {
 
     for failpoint in failpoints {
         let case = workspace.path().join(failpoint.as_str());
-        fs::create_dir_all(&case).unwrap();
-        let database = case.join("portal.sqlite");
-        let master_key = case.join("master.key");
-        let init = Command::new(&binary)
-            .args(["portal", "init", "--no-recovery-bundle", "--database"])
-            .arg(&database)
-            .arg("--master-key")
-            .arg(&master_key)
-            .output()
-            .unwrap();
-        assert!(
-            init.status.success(),
-            "{}",
-            String::from_utf8_lossy(&init.stderr)
-        );
+        let (database, master_key, _processes, agents) = case_cluster(&binary, &case);
 
         let idempotency_key = format!("process-{}", failpoint.as_str());
         let crashed = portal_command(&binary, "put", &database, &master_key, &agents)
@@ -213,19 +314,6 @@ fn abrupt_portal_exit_at_every_boundary_recovers() {
 fn abrupt_delete_exit_at_every_boundary_recovers_with_the_same_key() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_distr-hnsw"));
     let workspace = tempfile::tempdir().unwrap();
-    let (_agent_a, target_a) = start_agent(
-        &binary,
-        "agent-a",
-        "host-a",
-        &workspace.path().join("delete-agent-a"),
-    );
-    let (_agent_b, target_b) = start_agent(
-        &binary,
-        "agent-b",
-        "host-b",
-        &workspace.path().join("delete-agent-b"),
-    );
-    let agents = vec![target_a, target_b];
     let source = workspace.path().join("empty.bin");
     fs::write(&source, []).unwrap();
 
@@ -237,17 +325,7 @@ fn abrupt_delete_exit_at_every_boundary_recovers_with_the_same_key() {
         Failpoint::AfterDeleteCommit,
     ] {
         let case = workspace.path().join(failpoint.as_str());
-        fs::create_dir_all(&case).unwrap();
-        let database = case.join("portal.sqlite");
-        let master_key = case.join("master.key");
-        assert!(Command::new(&binary)
-            .args(["portal", "init", "--no-recovery-bundle", "--database"])
-            .arg(&database)
-            .arg("--master-key")
-            .arg(&master_key)
-            .status()
-            .unwrap()
-            .success());
+        let (database, master_key, _processes, agents) = case_cluster(&binary, &case);
         let uploaded = portal_command(&binary, "put", &database, &master_key, &agents)
             .arg("--idempotency-key")
             .arg(format!("upload-{}", failpoint.as_str()))
@@ -317,19 +395,26 @@ fn scrub_and_health_commands_report_a_durable_cluster() {
     let volume_b = workspace.path().join("agent-b");
     fs::create_dir_all(&volume_a).unwrap();
     fs::create_dir_all(&volume_b).unwrap();
-    let (_agent_a, target_a) = start_agent(binary, "agent-a", "host-a", &volume_a);
-    let (_agent_b, target_b) = start_agent(binary, "agent-b", "host-b", &volume_b);
-    let agents = vec![target_a, target_b];
     let database = workspace.path().join("portal.sqlite");
     let master_key = workspace.path().join("master.key");
-    let status = Command::new(binary)
-        .args(["portal", "init", "--no-recovery-bundle", "--database"])
-        .arg(&database)
-        .arg("--master-key")
-        .arg(&master_key)
-        .status()
-        .unwrap();
-    assert!(status.success());
+    init_portal(binary, &database, &master_key);
+    let (_agent_a, target_a) = start_agent(
+        binary,
+        &database,
+        &master_key,
+        "agent-a",
+        "host-a",
+        &volume_a,
+    );
+    let (_agent_b, target_b) = start_agent(
+        binary,
+        &database,
+        &master_key,
+        "agent-b",
+        "host-b",
+        &volume_b,
+    );
+    let agents = vec![target_a, target_b];
     let source = workspace.path().join("source.bin");
     fs::write(&source, vec![7_u8; CHUNK_SIZE / 2]).unwrap();
     let put = portal_command(binary, "put", &database, &master_key, &agents)
@@ -343,10 +428,7 @@ fn scrub_and_health_commands_report_a_durable_cluster() {
         String::from_utf8_lossy(&put.stderr)
     );
 
-    let scrub = Command::new(binary)
-        .args(["portal", "scrub", "--database"])
-        .arg(&database)
-        .args(agents.iter().flat_map(|agent| ["--agent", agent.as_str()]))
+    let scrub = portal_command(binary, "scrub", &database, &master_key, &agents)
         .output()
         .unwrap();
     assert!(
@@ -388,17 +470,12 @@ fn scrub_and_health_commands_report_a_durable_cluster() {
         .unwrap()
         .object_path(chunk.kind, &chunk.hash);
     fs::write(&path, b"flipped").unwrap();
-    let scrub = Command::new(binary)
-        .args(["portal", "scrub", "--database"])
-        .arg(&database)
-        .args(agents.iter().flat_map(|agent| ["--agent", agent.as_str()]))
+    let scrub = portal_command(binary, "scrub", &database, &master_key, &agents)
         .output()
         .unwrap();
     assert_eq!(scrub.status.code(), Some(2));
-    let repair = Command::new(binary)
-        .args(["portal", "scrub", "--repair", "--database"])
-        .arg(&database)
-        .args(agents.iter().flat_map(|agent| ["--agent", agent.as_str()]))
+    let repair = portal_command(binary, "scrub", &database, &master_key, &agents)
+        .arg("--repair")
         .output()
         .unwrap();
     assert!(
@@ -421,9 +498,6 @@ fn recovery_bundle_ceremony_restores_the_key_and_refuses_the_wrong_one() {
     let volume_b = workspace.path().join("agent-b");
     fs::create_dir_all(&volume_a).unwrap();
     fs::create_dir_all(&volume_b).unwrap();
-    let (_agent_a, target_a) = start_agent(binary, "agent-a", "host-a", &volume_a);
-    let (_agent_b, target_b) = start_agent(binary, "agent-b", "host-b", &volume_b);
-    let agents = vec![target_a, target_b];
     let database = workspace.path().join("portal.sqlite");
     let master_key = workspace.path().join("master.key");
     let floor = [
@@ -467,6 +541,23 @@ fn recovery_bundle_ceremony_restores_the_key_and_refuses_the_wrong_one() {
         "supplied passphrase is never echoed"
     );
 
+    let (_agent_a, target_a) = start_agent(
+        binary,
+        &database,
+        &master_key,
+        "agent-a",
+        "host-a",
+        &volume_a,
+    );
+    let (_agent_b, target_b) = start_agent(
+        binary,
+        &database,
+        &master_key,
+        "agent-b",
+        "host-b",
+        &volume_b,
+    );
+    let agents = vec![target_a, target_b];
     let source = workspace.path().join("source.bin");
     fs::write(&source, vec![3_u8; 4096]).unwrap();
     let put = portal_command(binary, "put", &database, &master_key, &agents)
@@ -621,9 +712,6 @@ fn empty_infrastructure_restore_drill_rebuilds_files_from_backup_alone() {
     let volume_b = cluster.join("agent-b");
     fs::create_dir_all(&volume_a).unwrap();
     fs::create_dir_all(&volume_b).unwrap();
-    let (agent_a, target_a) = start_agent(binary, "agent-a", "host-a", &volume_a);
-    let (agent_b, target_b) = start_agent(binary, "agent-b", "host-b", &volume_b);
-    let agents = vec![target_a, target_b];
     let database = cluster.join("portal.sqlite");
     let master_key = cluster.join("master.key");
     let backup_dir = workspace.path().join("offsite");
@@ -665,6 +753,24 @@ fn empty_infrastructure_restore_drill_rebuilds_files_from_backup_alone() {
     let bundle_path = workspace.path().join("bundle.txt");
     fs::write(&bundle_path, &stdout[begin..end]).unwrap();
 
+    let (agent_a, target_a) = start_agent(
+        binary,
+        &database,
+        &master_key,
+        "agent-a",
+        "host-a",
+        &volume_a,
+    );
+    let (agent_b, target_b) = start_agent(
+        binary,
+        &database,
+        &master_key,
+        "agent-b",
+        "host-b",
+        &volume_b,
+    );
+    let agents = vec![target_a, target_b];
+
     let kept_source = workspace.path().join("kept.bin");
     let kept_bytes: Vec<u8> = (0..CHUNK_SIZE + 4096)
         .map(|index| ((index * 7 + 3) % 251) as u8)
@@ -699,10 +805,7 @@ fn empty_infrastructure_restore_drill_rebuilds_files_from_backup_alone() {
     );
 
     let run_backup = || {
-        let output = Command::new(binary)
-            .args(["portal", "backup", "--database"])
-            .arg(&database)
-            .args(agents.iter().flat_map(|agent| ["--agent", agent.as_str()]))
+        let output = portal_command(binary, "backup", &database, &master_key, &agents)
             .args(["--target", &target])
             .output()
             .unwrap();
@@ -813,15 +916,37 @@ fn empty_infrastructure_restore_drill_rebuilds_files_from_backup_alone() {
     );
 
     // 3. Objects into fresh agents on fresh volumes (new incarnations).
+    // Fresh volumes hold no trust: each agent starts with a token from the
+    // restored database and is joined again, which raises the grant epoch.
     let volume_c = restored.join("agent-a");
     let volume_d = restored.join("agent-b");
     fs::create_dir_all(&volume_c).unwrap();
     fs::create_dir_all(&volume_d).unwrap();
-    let (_agent_c, target_c) = start_agent(binary, "agent-a", "host-a", &volume_c);
-    let (_agent_d, target_d) = start_agent(binary, "agent-b", "host-b", &volume_d);
-    let new_agents = vec![target_c, target_d];
+    let mut processes = Vec::new();
+    let mut new_agents = Vec::new();
+    for (id, domain, volume) in [
+        ("agent-a", "host-a", &volume_c),
+        ("agent-b", "host-b", &volume_d),
+    ] {
+        let token = join_token(binary, &new_database, &new_key, id);
+        let (process, target) = spawn_agent(binary, id, domain, volume, Some(&token), &[]);
+        let joined = join_agent(binary, &new_database, &new_key, &target, &token);
+        assert_eq!(joined["rejoined"], true, "{joined}");
+        processes.push(process);
+        new_agents.push(target);
+    }
     let objects = Command::new(binary)
-        .args(["portal", "restore", "objects", "--target", &target])
+        .args([
+            "portal",
+            "restore",
+            "objects",
+            "--target",
+            &target,
+            "--database",
+        ])
+        .arg(&new_database)
+        .arg("--master-key")
+        .arg(&new_key)
         .args(
             new_agents
                 .iter()
@@ -872,14 +997,7 @@ fn empty_infrastructure_restore_drill_rebuilds_files_from_backup_alone() {
         .output()
         .unwrap();
     assert!(!denied.status.success());
-    let scrub = Command::new(binary)
-        .args(["portal", "scrub", "--database"])
-        .arg(&new_database)
-        .args(
-            new_agents
-                .iter()
-                .flat_map(|agent| ["--agent", agent.as_str()]),
-        )
+    let scrub = portal_command(binary, "scrub", &new_database, &new_key, &new_agents)
         .output()
         .unwrap();
     assert!(
@@ -913,14 +1031,41 @@ fn empty_infrastructure_restore_drill_rebuilds_files_from_backup_alone() {
     assert!(verify.wait().unwrap().success());
 }
 
+/// An `Authorization` value carrying a fresh grant to PUT `hash` as a
+/// chunk on `agent_id`, signed with the portal's active key.
+fn put_grant(database: &Path, master_key: &Path, agent_id: &str, hash: &ObjectHash) -> String {
+    let material = GrantMaterial::load(
+        &Database::open(database).unwrap(),
+        &MasterKey::load(master_key).unwrap(),
+    )
+    .unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let token = material
+        .active()
+        .issue(
+            material.epoch(),
+            agent_id,
+            Operation::Put,
+            Scope::Object(ObjectKind::Chunk, hash.clone()),
+            None,
+            now,
+        )
+        .unwrap();
+    format!("{GRANT_SCHEME} {token}")
+}
+
 /// Send one raw HTTP/1.1 PUT and return the status code, or `None` when the
 /// agent closed the connection without answering.
-fn raw_put(target: &str, path: &str, body: &[u8]) -> Option<u16> {
+fn raw_put(target: &str, path: &str, authorization: &str, body: &[u8]) -> Option<u16> {
     use std::io::{Read as _, Write as _};
     let address = target.rsplit("http://").next().unwrap();
     let mut stream = TcpStream::connect(address).unwrap();
     let head = format!(
-        "PUT {path} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "PUT {path} HTTP/1.1\r\nHost: {address}\r\nAuthorization: {authorization}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).ok()?;
@@ -949,19 +1094,28 @@ fn agent_exit_after_put_rename_is_unacknowledged_and_retry_succeeds() {
         .join(&hash.as_str()[2..4])
         .join(hash.as_str());
 
+    let database = workspace.path().join("portal.sqlite");
+    let master_key = workspace.path().join("master.key");
+    init_portal(binary, &database, &master_key);
+
     let (mut crashing, target) = start_agent_with_env(
         binary,
+        &database,
+        &master_key,
         "agent-a",
         "host-a",
         &volume,
         &[("DISTR_HNSW_AGENT_FAILPOINT", "put_after_rename")],
     );
-    assert_eq!(raw_put(&target, &path, &body), None);
+    let grant = put_grant(&database, &master_key, "agent-a", &hash);
+    assert_eq!(raw_put(&target, &path, &grant, &body), None);
     assert_eq!(crashing.child.wait().unwrap().code(), Some(86));
     assert_eq!(fs::read(&object).unwrap(), body, "the rename happened");
 
-    let (_agent, target) = start_agent(binary, "agent-a", "host-a", &volume);
-    assert_eq!(raw_put(&target, &path, &body), Some(204));
+    // The joined agent restarts without a token and keeps its trust.
+    let (_agent, target) = spawn_agent(binary, "agent-a", "host-a", &volume, None, &[]);
+    let grant = put_grant(&database, &master_key, "agent-a", &hash);
+    assert_eq!(raw_put(&target, &path, &grant, &body), Some(204));
     assert_eq!(fs::read(&object).unwrap(), body);
 }
 

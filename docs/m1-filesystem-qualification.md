@@ -271,10 +271,12 @@ mkfs.btrfs /dev/mapper/dhq            # repeat with mkfs.ext4 / mkfs.xfs
 dmsetup message dhq 0 mark mkfs
 mount /dev/mapper/dhq /mnt/dhq
 
-# 2. Run an agent on the volume; after each acknowledged portal put, record
-#    the manifest/chunk hashes and insert a mark named after the upload.
-distr-hnsw agent --id a --failure-domain host-a --bind 127.0.0.1:7101 --insecure-loopback \
-  --volume /mnt/dhq/agent-a &
+# 2. Run an agent on the volume (with grants, M2: start it with a token from
+#    `portal agent token`, then `portal agent join` it); after each
+#    acknowledged portal put, record the manifest/chunk hashes and insert a
+#    mark named after the upload.
+DISTR_HNSW_JOIN_TOKEN=$TOKEN distr-hnsw agent --id a --failure-domain host-a \
+  --bind 127.0.0.1:7101 --insecure-loopback --volume /mnt/dhq/agent-a &
 #    (distr-hnsw portal put ...; dmsetup message dhq 0 mark <upload-id>)
 
 # 3. Tear down without unmounting cleanly, replay to each mark, restart the
@@ -332,6 +334,9 @@ Where the implementation departs from the outline, deliberately:
 - Done 2026-10-28: the drill covers the master-key write and a re-PUT after
   a crash between rename and directory sync (9/9 marks on each filesystem
   from `10d7ed4`).
+- Re-run the drill with M2 grants: agents now join with tokens, and the
+  inventory snapshots, per-object `GET` checks, re-PUT, and incarnation
+  reads go through `portal agent request`. The results above predate M2.
 - Re-run the drill after every kernel update on the reference host and record the
   kernel in this document; the btrfs rating in particular is kernel-specific.
 - Extend the drill beyond a single sequential writer: several concurrent

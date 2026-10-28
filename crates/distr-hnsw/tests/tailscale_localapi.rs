@@ -275,7 +275,7 @@ async fn the_watcher_fires_on_an_address_change_but_not_while_tailscaled_restart
 }
 
 #[test]
-fn the_agent_binary_refuses_wildcard_unflagged_loopback_and_unguarded_tailnet_binds() {
+fn the_agent_binary_refuses_wildcard_and_unflagged_loopback_binds() {
     let dir = tempfile::tempdir().unwrap();
     let run = |bind: &str, extra: &[&str]| {
         let output = Command::new(env!("CARGO_BIN_EXE_distr-hnsw"))
@@ -296,6 +296,7 @@ fn the_agent_binary_refuses_wildcard_unflagged_loopback_and_unguarded_tailnet_bi
                 "DISTR_HNSW_TAILSCALE_SOCKET",
                 dir.path().join("absent.sock"),
             )
+            .env("DISTR_HNSW_JOIN_TOKEN", "unused")
             .output()
             .unwrap();
         assert!(!output.status.success(), "{bind} must not serve");
@@ -307,30 +308,130 @@ fn the_agent_binary_refuses_wildcard_unflagged_loopback_and_unguarded_tailnet_bi
 }
 
 #[test]
-fn the_agent_binary_does_not_serve_tailnet_traffic_before_grants_exist() {
+fn an_unjoined_agent_without_a_join_token_refuses_to_start() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = socket_in(&dir);
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    // The fake reports a loopback address as this node's tailnet address so
-    // the bind itself can succeed on any machine.
-    let _context = runtime.enter();
-    let _server = start_fake(&socket, Fake::new(&["127.0.0.1"]));
     let output = Command::new(env!("CARGO_BIN_EXE_distr-hnsw"))
-        .args([
-            "agent",
-            "--id",
-            "a",
-            "--failure-domain",
-            "d",
-            "--bind",
-            "tailnet:0",
-        ])
-        .arg("--volume")
+        .args(["agent", "--id", "a", "--failure-domain", "d"])
+        .args(["--bind", "127.0.0.1:0", "--insecure-loopback", "--volume"])
         .arg(dir.path().join("volume"))
-        .env("DISTR_HNSW_TAILSCALE_SOCKET", &socket)
+        .env_remove("DISTR_HNSW_JOIN_TOKEN")
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("capability grants"), "{stderr}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not joined"));
+}
+
+struct Child(std::process::Child);
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A tailnet-bound agent serves only the node it pinned at join, resolved
+/// with WhoIs on the socket address; identity headers change nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tailnet_agent_serves_only_the_pinned_portal_node() {
+    use distr_hnsw::{
+        access,
+        agent_client::{join_agent, AgentClient},
+        crypto::MasterKey,
+        metadata::Database,
+        portal::AgentTarget,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = socket_in(&dir);
+    // Loopback stands in for this node's tailnet address, and WhoIs on it
+    // names whichever node the test chooses.
+    let fake = Fake::new(&["127.0.0.1"]);
+    let as_node = |stable_id: &str| {
+        let stable_id = stable_id.to_owned();
+        move |s: &mut FakeState| {
+            s.peers.insert(
+                "127.0.0.1".into(),
+                (
+                    stable_id,
+                    format!("{}.example.ts.net.", "node"),
+                    "owner@example.com".into(),
+                ),
+            );
+        }
+    };
+    fake.set(as_node("nPORTAL"));
+    let _server = start_fake(&socket, fake.clone());
+
+    let key = MasterKey::from_bytes([4; 32]);
+    let database_path = dir.path().join("portal.sqlite");
+    let mut database = Database::open(&database_path).unwrap();
+    database.bind_master_key_id(&key.key_id_hex()).unwrap();
+    let token = access::create_join_token(
+        &mut database,
+        "a1",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
+    )
+    .unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let _agent = Child(
+        Command::new(env!("CARGO_BIN_EXE_distr-hnsw"))
+            .args(["agent", "--id", "a1", "--failure-domain", "d1"])
+            .args(["--bind", &format!("tailnet:{port}"), "--volume"])
+            .arg(dir.path().join("volume"))
+            .env("DISTR_HNSW_TAILSCALE_SOCKET", &socket)
+            .env("DISTR_HNSW_JOIN_TOKEN", &token)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .is_err()
+    {
+        assert!(std::time::Instant::now() < deadline, "agent did not start");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let agent = AgentTarget {
+        id: "a1".into(),
+        failure_domain: "d1".into(),
+        base_url: format!("http://127.0.0.1:{port}"),
+    };
+    let outcome = join_agent(&mut database, &key, &agent, &token, &LocalApi::new(&socket))
+        .await
+        .unwrap();
+    assert!(
+        outcome.portal_node_pinned,
+        "the agent pinned the joining node"
+    );
+
+    let client = AgentClient::open(&mut database, &key).unwrap();
+    let health = client.health(&agent).await.unwrap();
+    assert!(health.status().is_success());
+    let body: serde_json::Value = health.json().await.unwrap();
+    assert_eq!(body["bind_mode"], "tailnet");
+
+    // Another node with a valid grant and forged identity headers.
+    fake.set(as_node("nINTRUDER"));
+    let response = client.health(&agent).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let forged = reqwest::Client::new()
+        .get(format!("{}/v1/health", agent.base_url))
+        .header("Tailscale-User-Login", "owner@example.com")
+        .header("Tailscale-User-Name", "Owner")
+        .header("X-Forwarded-For", "100.64.0.1")
+        .send()
+        .await
+        .unwrap();
+    assert!(!forged.status().is_success());
+
+    fake.set(as_node("nPORTAL"));
+    assert!(client.health(&agent).await.unwrap().status().is_success());
 }

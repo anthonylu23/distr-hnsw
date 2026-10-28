@@ -1,4 +1,6 @@
+pub mod access;
 pub mod agent;
+pub mod agent_client;
 pub mod backup;
 pub mod crypto;
 pub mod durability;
@@ -13,6 +15,7 @@ pub mod reconcile;
 pub mod recovery;
 pub mod recovery_bundle;
 pub mod tailscale;
+pub mod trust;
 
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 

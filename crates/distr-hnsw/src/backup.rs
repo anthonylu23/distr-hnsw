@@ -11,7 +11,8 @@
 //!
 //! Objects are self-verifying by content address, so the catalog is advisory;
 //! authenticity of the set rests on the target's versioning and immutability.
-//! The backup job needs no master key: it copies ciphertext.
+//! The backup job copies ciphertext and decrypts nothing; it needs the master
+//! key only to unseal the key that signs its agent grants.
 //!
 //! Targets: a versioned directory (`dir:<path>`) and an S3-compatible bucket
 //! (`s3:<bucket>[/<prefix>]`, see [`s3`]). Both are dispatched through
@@ -34,7 +35,10 @@ pub mod s3;
 
 pub use s3::S3Target;
 
+use axum::body::Bytes;
+
 use crate::{
+    agent_client::AgentClient,
     durability::{ensure_directory, sync_directory, sync_regular_file},
     metadata::{Database, HistoryObject, JobStatus, MetadataError, ReconcileJob},
     object::{ObjectHash, ObjectKind},
@@ -412,7 +416,7 @@ impl BackupReportV1 {
 pub async fn backup(
     database: &mut Database,
     agents: &[AgentTarget],
-    client: &reqwest::Client,
+    client: &AgentClient,
     spec: &BackupTargetSpec,
     snapshot_path_hint: &Path,
 ) -> Result<BackupReportV1, BackupError> {
@@ -426,7 +430,7 @@ pub async fn backup(
 pub async fn backup_with_sample(
     database: &mut Database,
     agents: &[AgentTarget],
-    client: &reqwest::Client,
+    client: &AgentClient,
     spec: &BackupTargetSpec,
     snapshot_path_hint: &Path,
     sample: usize,
@@ -463,7 +467,7 @@ pub async fn backup_with_sample(
 async fn run_backup(
     database: &mut Database,
     agents: &[AgentTarget],
-    client: &reqwest::Client,
+    client: &AgentClient,
     target: &BackupTargetKind,
     target_id: &str,
     job_id: Uuid,
@@ -675,7 +679,7 @@ async fn run_backup(
 
 async fn fetch_from_agents(
     database: &Database,
-    client: &reqwest::Client,
+    client: &AgentClient,
     agents: &[AgentTarget],
     object: &HistoryObject,
 ) -> Option<Vec<u8>> {
@@ -687,13 +691,7 @@ async fn fetch_from_agents(
         .filter(|agent| confirmed.contains(&agent.id))
         .chain(agents.iter().filter(|agent| !confirmed.contains(&agent.id)));
     for agent in ordered {
-        let url = format!(
-            "{}/v1/objects/{}/{}",
-            agent.base_url,
-            object.kind.as_str(),
-            object.hash
-        );
-        if let Ok(response) = client.get(url).send().await {
+        if let Ok(response) = client.get(agent, object.kind, &object.hash).await {
             if response.status().is_success() {
                 if let Ok(bytes) = response.bytes().await {
                     if ObjectHash::digest(&bytes) == object.hash
@@ -1073,7 +1071,7 @@ impl RestoreObjectsReport {
 pub async fn restore_objects(
     spec: &BackupTargetSpec,
     agents: &[AgentTarget],
-    client: &reqwest::Client,
+    client: &AgentClient,
 ) -> Result<RestoreObjectsReport, BackupError> {
     let target = spec.open().await?;
     let mut report = RestoreObjectsReport {
@@ -1118,8 +1116,7 @@ pub async fn restore_objects(
             if domains.contains(&agent.failure_domain) {
                 continue;
             }
-            let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
-            let present = match client.get(&url).send().await {
+            let present = match client.get(agent, kind, &hash).await {
                 Ok(response) if response.status().is_success() => response
                     .bytes()
                     .await
@@ -1132,11 +1129,13 @@ pub async fn restore_objects(
                 continue;
             }
             let accepted = matches!(
-                client.put(&url).body(bytes.clone()).send().await,
+                client
+                    .put(agent, kind, &hash, Bytes::copy_from_slice(&bytes))
+                    .await,
                 Ok(response) if response.status().is_success()
             );
             let read_back = accepted
-                && match client.get(&url).send().await {
+                && match client.get(agent, kind, &hash).await {
                     Ok(response) if response.status().is_success() => response
                         .bytes()
                         .await

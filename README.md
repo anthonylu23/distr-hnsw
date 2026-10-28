@@ -56,8 +56,8 @@ are in [scripts/](scripts/README.md) and run on a dedicated host
 
 ## Security
 
-See [SECURITY.md](SECURITY.md). In the current build, agents are
-unauthenticated and loopback-only.
+See [SECURITY.md](SECURITY.md). In the current build, agents require a
+portal-signed grant on every request, and the portal is local commands only.
 
 ## License
 

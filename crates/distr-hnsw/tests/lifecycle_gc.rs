@@ -2,10 +2,16 @@
 //! collection. Physical deletion happens only through an applied proof, and
 //! every gate in `docs/m1-lifecycle-contract.md` has a negative test here.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use distr_hnsw::{
+    access::create_join_token,
     agent::{serve_agent_with_capacity, AgentIdentity, CapacityConfig},
+    agent_client::{join_agent, AgentClient},
     crypto::MasterKey,
     durability::DurableStore,
     lifecycle::{drain, gc, retire, GcOptions},
@@ -13,6 +19,7 @@ use distr_hnsw::{
     object::ObjectKind,
     portal::{AgentTarget, Portal, PortalError},
     reconcile::scrub,
+    tailscale::LocalApi,
     CHUNK_SIZE,
 };
 use tempfile::TempDir;
@@ -31,12 +38,15 @@ impl Drop for TestAgent {
     }
 }
 
-async fn start_agent_with(
+/// Serve an agent on `volume`. `token` arms the join of a fresh volume; an
+/// agent restarted on a joined volume keeps its trust and ignores it.
+async fn spawn_agent(
     id: &str,
     domain: &str,
     volume: PathBuf,
     holder: Option<TempDir>,
     capacity: CapacityConfig,
+    token: &str,
 ) -> TestAgent {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -45,8 +55,9 @@ async fn start_agent_with(
         failure_domain: domain.to_owned(),
     };
     let volume_path = volume.clone();
+    let token = token.to_owned();
     let task = tokio::spawn(async move {
-        serve_agent_with_capacity(listener, volume_path, identity, capacity)
+        serve_agent_with_capacity(listener, volume_path, identity, capacity, &token)
             .await
             .unwrap();
     });
@@ -62,12 +73,6 @@ async fn start_agent_with(
     }
 }
 
-async fn start_agent(id: &str, domain: &str) -> TestAgent {
-    let holder = tempfile::tempdir().unwrap();
-    let volume = holder.path().to_owned();
-    start_agent_with(id, domain, volume, Some(holder), CapacityConfig::default()).await
-}
-
 struct Cluster {
     workspace: TempDir,
     key_path: PathBuf,
@@ -76,6 +81,57 @@ struct Cluster {
 }
 
 impl Cluster {
+    fn new() -> Self {
+        let workspace = tempfile::tempdir().unwrap();
+        let key_path = workspace.path().join("master.key");
+        MasterKey::create(&key_path).unwrap();
+        Self {
+            database_path: workspace.path().join("portal.sqlite"),
+            key_path,
+            workspace,
+            agents: Vec::new(),
+        }
+    }
+
+    /// Start an agent with a fresh join token and join it. Joining an id
+    /// that was joined before raises the grant epoch, so clients built
+    /// earlier go stale.
+    async fn start_agent_with(
+        &mut self,
+        id: &str,
+        domain: &str,
+        volume: PathBuf,
+        holder: Option<TempDir>,
+        capacity: CapacityConfig,
+    ) {
+        let key = self.key();
+        let mut database = self.database();
+        database.bind_master_key_id(&key.key_id_hex()).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let token = create_join_token(&mut database, id, now).unwrap();
+        let agent = spawn_agent(id, domain, volume, holder, capacity, &token).await;
+        join_agent(
+            &mut database,
+            &key,
+            &agent.target,
+            &token,
+            &LocalApi::new("/nonexistent/tailscaled.sock"),
+        )
+        .await
+        .unwrap();
+        self.agents.push(agent);
+    }
+
+    async fn start_agent(&mut self, id: &str, domain: &str) {
+        let holder = tempfile::tempdir().unwrap();
+        let volume = holder.path().to_owned();
+        self.start_agent_with(id, domain, volume, Some(holder), CapacityConfig::default())
+            .await;
+    }
+
     fn targets(&self) -> Vec<AgentTarget> {
         self.agents
             .iter()
@@ -83,17 +139,20 @@ impl Cluster {
             .collect()
     }
 
+    fn key(&self) -> MasterKey {
+        MasterKey::load(&self.key_path).unwrap()
+    }
+
     fn portal(&self) -> Portal {
-        Portal::open(
-            &self.database_path,
-            MasterKey::load(&self.key_path).unwrap(),
-            self.targets(),
-        )
-        .unwrap()
+        Portal::open(&self.database_path, self.key(), self.targets()).unwrap()
     }
 
     fn database(&self) -> Database {
         Database::open(&self.database_path).unwrap()
+    }
+
+    fn client(&self) -> AgentClient {
+        AgentClient::open(&mut self.database(), &self.key()).unwrap()
     }
 
     async fn scrub(&self) {
@@ -101,7 +160,7 @@ impl Cluster {
         let report = scrub(
             &mut database,
             &self.targets(),
-            &reqwest::Client::new(),
+            &self.client(),
             JobMode::Verify,
         )
         .await
@@ -127,19 +186,11 @@ impl Cluster {
 }
 
 async fn three_agent_cluster() -> Cluster {
-    let workspace = tempfile::tempdir().unwrap();
-    let key_path = workspace.path().join("master.key");
-    MasterKey::create(&key_path).unwrap();
-    Cluster {
-        database_path: workspace.path().join("portal.sqlite"),
-        key_path,
-        workspace,
-        agents: vec![
-            start_agent("agent-a", "host-a").await,
-            start_agent("agent-b", "host-b").await,
-            start_agent("agent-c", "host-c").await,
-        ],
-    }
+    let mut cluster = Cluster::new();
+    cluster.start_agent("agent-a", "host-a").await;
+    cluster.start_agent("agent-b", "host-b").await;
+    cluster.start_agent("agent-c", "host-c").await;
+    cluster
 }
 
 fn placement(
@@ -167,7 +218,7 @@ async fn drain_moves_copies_first_and_only_then_orphans_the_source() {
     assert_eq!(required.len(), 3);
     // Uploads replicate to every configured agent, so drain a, then prove
     // the interesting case: only two copies remain and one must move.
-    let client = reqwest::Client::new();
+    let client = cluster.client();
     let mut database = cluster.database();
     let dry = drain(&mut database, &cluster.targets(), &client, "agent-a", true)
         .await
@@ -255,15 +306,9 @@ async fn drain_blocks_when_no_other_failure_domain_can_take_the_copy() {
         )
         .unwrap();
     }
-    let report = drain(
-        &mut database,
-        &two,
-        &reqwest::Client::new(),
-        "agent-a",
-        false,
-    )
-    .await
-    .unwrap();
+    let report = drain(&mut database, &two, &cluster.client(), "agent-a", false)
+        .await
+        .unwrap();
     assert_eq!(report.exit_code(), 2);
     assert_eq!(report.totals.blocked, required.len());
     assert_eq!(report.totals.orphaned, 0);
@@ -281,7 +326,7 @@ async fn retire_refuses_until_the_floor_holds_without_the_agent_and_then_locks_i
     cluster.upload("file.bin", 4096, "retire-file").await;
     let required = cluster.database().required_objects().unwrap();
     let mut database = cluster.database();
-    let client = reqwest::Client::new();
+    let client = cluster.client();
     // Every agent holds every object after upload, so retirement of a is
     // immediately safe. Damage c first to prove the refusal path.
     let chunk = required
@@ -340,9 +385,6 @@ async fn retire_refuses_until_the_floor_holds_without_the_agent_and_then_locks_i
 
 #[tokio::test]
 async fn capacity_admission_refuses_chunks_keeps_deletes_and_converges_after_growth() {
-    let workspace = tempfile::tempdir().unwrap();
-    let key_path = workspace.path().join("master.key");
-    MasterKey::create(&key_path).unwrap();
     let tiny = CapacityConfig {
         quota_bytes: Some(64 * 1024),
         reserve_bytes: Some(8 * 1024),
@@ -350,15 +392,11 @@ async fn capacity_admission_refuses_chunks_keeps_deletes_and_converges_after_gro
     };
     let holder_b = tempfile::tempdir().unwrap();
     let volume_b = holder_b.path().to_owned();
-    let mut cluster = Cluster {
-        database_path: workspace.path().join("portal.sqlite"),
-        key_path,
-        workspace,
-        agents: vec![
-            start_agent("agent-a", "host-a").await,
-            start_agent_with("agent-b", "host-b", volume_b.clone(), Some(holder_b), tiny).await,
-        ],
-    };
+    let mut cluster = Cluster::new();
+    cluster.start_agent("agent-a", "host-a").await;
+    cluster
+        .start_agent_with("agent-b", "host-b", volume_b.clone(), Some(holder_b), tiny)
+        .await;
     // A small file fits under the quota and reserve.
     let small = cluster.upload("small.bin", 4096, "cap-small").await;
     // A large one cannot be admitted: only host-a can hold it.
@@ -393,14 +431,14 @@ async fn capacity_admission_refuses_chunks_keeps_deletes_and_converges_after_gro
     let deleted = cluster.portal().delete(small, "cap-delete").await.unwrap();
     assert!(cluster.holds(1, ObjectKind::DeletionMarker, &deleted.marker_hash));
 
-    // Raise the quota by restarting b on the same volume (same incarnation);
-    // the same idempotency key then converges.
+    // Raise the quota by restarting b on the same volume (same incarnation,
+    // same trust: no new join); the same idempotency key then converges.
     let mut old_b = cluster.agents.pop().unwrap();
     let _keep = old_b._holder.take();
     drop(old_b);
     let mut grown = cluster;
     grown.agents.push(
-        start_agent_with(
+        spawn_agent(
             "agent-b",
             "host-b",
             volume_b.clone(),
@@ -410,6 +448,7 @@ async fn capacity_admission_refuses_chunks_keeps_deletes_and_converges_after_gro
                 reserve_bytes: Some(8 * 1024),
                 hard_floor_bytes: Some(1024),
             },
+            "ignored-once-joined",
         )
         .await,
     );
@@ -454,7 +493,7 @@ async fn deleted_file_cluster() -> (
 #[tokio::test]
 async fn gc_requires_observation_after_deletion_and_retention_then_deletes_only_proven_objects() {
     let (cluster, old, marker) = deleted_file_cluster().await;
-    let client = reqwest::Client::new();
+    let client = cluster.client();
     let options = |apply: bool, retention: i64| GcOptions {
         retention_seconds: retention,
         staging_grace_seconds: 0,
@@ -553,7 +592,7 @@ async fn gc_requires_observation_after_deletion_and_retention_then_deletes_only_
 #[tokio::test]
 async fn gc_proof_goes_stale_when_membership_or_content_changes_before_apply() {
     let (mut cluster, old, _) = deleted_file_cluster().await;
-    let client = reqwest::Client::new();
+    let client = cluster.client();
     cluster.scrub().await;
     let options = GcOptions {
         retention_seconds: 0,
@@ -572,21 +611,22 @@ async fn gc_proof_goes_stale_when_membership_or_content_changes_before_apply() {
         .collect();
 
     // A wiped volume returns under the same name: new incarnation, no
-    // observation from it yet, so every proof is stale and blocked.
+    // observation from it yet, so every proof is stale and blocked. The
+    // wiped agent joins again, which raises the grant epoch.
     let old_c = cluster.agents.pop().unwrap();
     drop(old_c);
     let fresh = tempfile::tempdir().unwrap();
     let path = fresh.path().to_owned();
-    cluster.agents.push(
-        start_agent_with(
+    cluster
+        .start_agent_with(
             "agent-c",
             "host-c",
             path,
             Some(fresh),
             CapacityConfig::default(),
         )
-        .await,
-    );
+        .await;
+    let client = cluster.client();
     let replan = gc(
         &mut database,
         &cluster.targets(),
@@ -651,7 +691,7 @@ async fn gc_proof_goes_stale_when_membership_or_content_changes_before_apply() {
 async fn gc_defers_when_an_agent_is_unreachable_and_never_deletes_live_objects() {
     let (cluster, old, _) = deleted_file_cluster().await;
     let live = cluster.upload("live.bin", 1024, "gc-live").await;
-    let client = reqwest::Client::new();
+    let client = cluster.client();
     cluster.scrub().await;
     let mut database = cluster.database();
     cluster.agents[2].task.abort();
@@ -690,7 +730,7 @@ async fn expired_staging_uploads_become_candidates_only_after_the_grace_period()
     assert!(portal.upload(&source, "abandoned").await.is_err());
     drop(portal);
     cluster.scrub().await;
-    let client = reqwest::Client::new();
+    let client = cluster.client();
     let mut database = cluster.database();
     let fresh = gc(
         &mut database,

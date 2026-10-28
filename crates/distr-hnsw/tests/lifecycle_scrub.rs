@@ -2,10 +2,17 @@
 //! and copy-first repair. Nothing here ever deletes an object, and every
 //! conclusion about absence requires a complete scan of an active incarnation.
 
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use distr_hnsw::{
+    access::create_join_token,
     agent::{serve_agent, AgentIdentity},
+    agent_client::{join_agent, AgentClient},
     crypto::MasterKey,
     durability::DurableStore,
     metadata::{
@@ -15,6 +22,7 @@ use distr_hnsw::{
     object::ObjectKind,
     portal::{AgentTarget, Portal},
     reconcile::{health_report, scrub, ScanSummary, ScrubError, ScrubReportV1},
+    tailscale::LocalApi,
     CHUNK_SIZE,
 };
 use tempfile::TempDir;
@@ -57,11 +65,14 @@ impl Drop for TestAgent {
     }
 }
 
-async fn start_agent_on(
+/// Serve an agent on `volume`. `token` arms the join of a fresh volume; an
+/// agent restarted on a joined volume keeps its trust and ignores it.
+async fn spawn_agent(
     id: &str,
     domain: &str,
     volume: PathBuf,
     holder: Option<TempDir>,
+    token: &str,
 ) -> TestAgent {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -70,8 +81,11 @@ async fn start_agent_on(
         failure_domain: domain.to_owned(),
     };
     let volume_path = volume.clone();
+    let token = token.to_owned();
     let task = tokio::spawn(async move {
-        serve_agent(listener, volume_path, identity).await.unwrap();
+        serve_agent(listener, volume_path, identity, &token)
+            .await
+            .unwrap();
     });
     TestAgent {
         target: AgentTarget {
@@ -85,12 +99,6 @@ async fn start_agent_on(
     }
 }
 
-async fn start_agent(id: &str, domain: &str) -> TestAgent {
-    let holder = tempfile::tempdir().unwrap();
-    let volume = holder.path().to_owned();
-    start_agent_on(id, domain, volume, Some(holder)).await
-}
-
 struct Cluster {
     workspace: TempDir,
     key_path: PathBuf,
@@ -99,6 +107,54 @@ struct Cluster {
 }
 
 impl Cluster {
+    fn new() -> Self {
+        let workspace = tempfile::tempdir().unwrap();
+        let key_path = workspace.path().join("master.key");
+        MasterKey::create(&key_path).unwrap();
+        Self {
+            database_path: workspace.path().join("portal.sqlite"),
+            key_path,
+            workspace,
+            agents: Vec::new(),
+        }
+    }
+
+    /// Start an agent with a fresh join token and join it. Joining an id
+    /// that was joined before raises the grant epoch.
+    async fn start_agent_on(
+        &mut self,
+        id: &str,
+        domain: &str,
+        volume: PathBuf,
+        holder: Option<TempDir>,
+    ) {
+        let key = MasterKey::load(&self.key_path).unwrap();
+        let mut database = self.database();
+        database.bind_master_key_id(&key.key_id_hex()).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let token = create_join_token(&mut database, id, now).unwrap();
+        let agent = spawn_agent(id, domain, volume, holder, &token).await;
+        join_agent(
+            &mut database,
+            &key,
+            &agent.target,
+            &token,
+            &LocalApi::new("/nonexistent/tailscaled.sock"),
+        )
+        .await
+        .unwrap();
+        self.agents.push(agent);
+    }
+
+    async fn start_agent(&mut self, id: &str, domain: &str) {
+        let holder = tempfile::tempdir().unwrap();
+        let volume = holder.path().to_owned();
+        self.start_agent_on(id, domain, volume, Some(holder)).await;
+    }
+
     fn targets(&self) -> Vec<AgentTarget> {
         self.agents
             .iter()
@@ -115,16 +171,20 @@ impl Cluster {
         Database::open(&self.database_path).unwrap()
     }
 
+    fn client(&self) -> AgentClient {
+        let key = MasterKey::load(&self.key_path).unwrap();
+        AgentClient::open(&mut self.database(), &key).unwrap()
+    }
+
     async fn scrub(&self, mode: JobMode) -> ScrubReportV1 {
+        self.scrub_with(&self.client(), mode).await
+    }
+
+    async fn scrub_with(&self, client: &AgentClient, mode: JobMode) -> ScrubReportV1 {
         let mut database = self.database();
-        scrub(
-            &mut database,
-            &self.targets(),
-            &reqwest::Client::new(),
-            mode,
-        )
-        .await
-        .unwrap()
+        scrub(&mut database, &self.targets(), client, mode)
+            .await
+            .unwrap()
     }
 
     fn object_path(&self, agent_index: usize, object: &RequiredObject) -> PathBuf {
@@ -135,18 +195,9 @@ impl Cluster {
 }
 
 async fn committed_cluster() -> (Cluster, uuid::Uuid) {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let workspace = tempfile::tempdir().unwrap();
-    let key_path = workspace.path().join("master.key");
-    MasterKey::create(&key_path).unwrap();
-    let database_path = workspace.path().join("portal.sqlite");
-    let cluster = Cluster {
-        workspace,
-        key_path,
-        database_path,
-        agents: vec![agent_a, agent_b],
-    };
+    let mut cluster = Cluster::new();
+    cluster.start_agent("agent-a", "host-a").await;
+    cluster.start_agent("agent-b", "host-b").await;
     let source = cluster.workspace.path().join("source.bin");
     let bytes: Vec<u8> = (0..CHUNK_SIZE + 4096)
         .map(|index| ((index * 13 + 5) % 251) as u8)
@@ -342,11 +393,12 @@ async fn wiped_volume_supersedes_the_incarnation_and_old_copies_stop_counting() 
     let old_volume = old_b.volume.clone();
     let old_holder = old_b._holder.take();
     drop(old_b);
+    // The wiped agent joins again, which raises the grant epoch.
     let fresh = tempfile::tempdir().unwrap();
     let fresh_volume = fresh.path().to_owned();
     cluster
-        .agents
-        .push(start_agent_on("agent-b", "host-b", fresh_volume, Some(fresh)).await);
+        .start_agent_on("agent-b", "host-b", fresh_volume, Some(fresh))
+        .await;
 
     let report = cluster.scrub(JobMode::Verify).await;
     assert_eq!(report.exit_code(), 2);
@@ -401,19 +453,16 @@ async fn wiped_volume_supersedes_the_incarnation_and_old_copies_stop_counting() 
     }
 
     // The superseded incarnation returning under the same name fails closed.
+    // Its volume still trusts the portal's key and is brought up to the new
+    // epoch on first contact, so the incarnation check is what refuses it.
     let _keep = old_holder;
-    let returned = start_agent_on("agent-b", "host-b", old_volume, None).await;
+    let returned = spawn_agent("agent-b", "host-b", old_volume, None, "ignored-once-joined").await;
     let mut targets = cluster.targets();
     targets[1] = returned.target.clone();
     let mut database = cluster.database();
-    let error = scrub(
-        &mut database,
-        &targets,
-        &reqwest::Client::new(),
-        JobMode::Repair,
-    )
-    .await
-    .unwrap_err();
+    let error = scrub(&mut database, &targets, &cluster.client(), JobMode::Repair)
+        .await
+        .unwrap_err();
     assert!(
         matches!(
             error,
@@ -470,8 +519,8 @@ async fn failed_inventory_proves_nothing_and_defers_repair() {
     assert_eq!(snapshot(&cluster.agents[0].volume), before);
     assert_eq!(
         snapshot(&cluster.agents[1].volume).len(),
-        4,
-        "incarnation plus three objects"
+        5,
+        "incarnation, trusted key set, and three objects"
     );
 
     fs::remove_dir(&malformed).unwrap();
@@ -540,7 +589,10 @@ async fn deleted_files_require_only_their_marker() {
 #[tokio::test]
 async fn scrub_does_not_need_the_master_key() {
     let (cluster, _) = committed_cluster().await;
+    // Grants are signed with a key sealed under the master key, so the
+    // client unseals it first; scrub itself never reads the master key.
+    let client = cluster.client();
     fs::remove_file(&cluster.key_path).unwrap();
-    let report = cluster.scrub(JobMode::Verify).await;
+    let report = cluster.scrub_with(&client, JobMode::Verify).await;
     assert_eq!(report.exit_code(), 0);
 }

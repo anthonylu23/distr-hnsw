@@ -4,7 +4,10 @@ use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 
+use axum::body::Bytes;
+
 use crate::{
+    agent_client::AgentClient,
     crypto::MasterKey,
     durability::{InventoryPage, MAX_INVENTORY_PAGE},
     format::{decode_deletion_marker, decode_manifest, DecodedManifest, DeletionMarker},
@@ -125,7 +128,7 @@ pub async fn recover(
     database: &mut Database,
     master_key: &MasterKey,
     agents: &[AgentTarget],
-    client: &reqwest::Client,
+    client: &AgentClient,
     mode: RecoveryMode,
 ) -> Result<RecoveryReportV1, RecoveryError> {
     let mut inventory_hasher = blake3::Hasher::new();
@@ -150,13 +153,9 @@ pub async fn recover(
         for kind in ObjectKind::ALL {
             let mut after: Option<ObjectHash> = None;
             loop {
-                let mut request = client
-                    .get(format!("{}/v1/inventory/{}", agent.base_url, kind.as_str()))
-                    .query(&[("limit", MAX_INVENTORY_PAGE.to_string())]);
-                if let Some(cursor) = &after {
-                    request = request.query(&[("after", cursor.as_str())]);
-                }
-                let response = request.send().await?;
+                let response = client
+                    .inventory(agent, kind, after.as_ref(), MAX_INVENTORY_PAGE)
+                    .await?;
                 if !response.status().is_success() {
                     return Err(RecoveryError::InventoryRejected {
                         agent: agent.id.clone(),
@@ -228,15 +227,7 @@ pub async fn recover(
             let agent = agent_map
                 .get(agent_id)
                 .ok_or_else(|| RecoveryError::MalformedInventory(agent_id.clone()))?;
-            let response = client
-                .get(format!(
-                    "{}/v1/objects/{}/{}",
-                    agent.base_url,
-                    kind.as_str(),
-                    hash
-                ))
-                .send()
-                .await?;
+            let response = client.get(agent, kind, &hash).await?;
             let valid = if response.status().is_success() {
                 let bytes = response.bytes().await?;
                 ObjectHash::digest(&bytes) == hash && bytes.len() as u64 == *expected_size && {
@@ -550,7 +541,7 @@ pub async fn recover(
 
 struct RepairContext<'a> {
     database: &'a mut Database,
-    client: &'a reqwest::Client,
+    client: &'a AgentClient,
     agents: &'a [AgentTarget],
     incarnations: &'a BTreeMap<String, String>,
     replicas: &'a mut BTreeMap<(String, String), ReplicaSet>,
@@ -623,14 +614,7 @@ impl RepairContext<'_> {
                 };
                 let response = match self
                     .client
-                    .put(format!(
-                        "{}/v1/objects/{}/{}",
-                        target.base_url,
-                        kind.as_str(),
-                        hash
-                    ))
-                    .body(bytes)
-                    .send()
+                    .put(target, kind, hash, Bytes::from(bytes))
                     .await
                 {
                     Ok(response) => response,
@@ -702,15 +686,14 @@ impl RepairContext<'_> {
 
 /// Read a hash-verified copy of an object from any of `holders`.
 async fn fetch_from(
-    client: &reqwest::Client,
+    client: &AgentClient,
     agents: &[AgentTarget],
     holders: &BTreeSet<String>,
     kind: ObjectKind,
     hash: &ObjectHash,
 ) -> Option<Vec<u8>> {
     for agent in agents.iter().filter(|agent| holders.contains(&agent.id)) {
-        let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
-        if let Ok(response) = client.get(url).send().await {
+        if let Ok(response) = client.get(agent, kind, hash).await {
             if response.status().is_success() {
                 if let Ok(bytes) = response.bytes().await {
                     if ObjectHash::digest(&bytes) == *hash {
@@ -724,13 +707,12 @@ async fn fetch_from(
 }
 
 async fn read_back_matches(
-    client: &reqwest::Client,
+    client: &AgentClient,
     agent: &AgentTarget,
     kind: ObjectKind,
     hash: &ObjectHash,
 ) -> bool {
-    let url = format!("{}/v1/objects/{}/{}", agent.base_url, kind.as_str(), hash);
-    match client.get(url).send().await {
+    match client.get(agent, kind, hash).await {
         Ok(response) if response.status().is_success() => match response.bytes().await {
             Ok(bytes) => ObjectHash::digest(&bytes) == *hash,
             Err(_) => false,
@@ -739,20 +721,14 @@ async fn read_back_matches(
     }
 }
 
-async fn verify_agent(
-    client: &reqwest::Client,
-    agent: &AgentTarget,
-) -> Result<String, RecoveryError> {
+async fn verify_agent(client: &AgentClient, agent: &AgentTarget) -> Result<String, RecoveryError> {
     #[derive(serde::Deserialize)]
     struct Identity {
         id: String,
         failure_domain: String,
         incarnation_id: String,
     }
-    let response = client
-        .get(format!("{}/v1/health", agent.base_url))
-        .send()
-        .await?;
+    let response = client.health(agent).await?;
     if !response.status().is_success() {
         return Err(RecoveryError::InventoryRejected {
             agent: agent.id.clone(),

@@ -2,10 +2,16 @@
 //! reopened M1 (`docs/hardening-2026-10.md`). Each test reproduces the
 //! original failure sequence and asserts the corrected behavior.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use distr_hnsw::{
+    access::create_join_token,
     agent::{serve_agent_with_capacity, AgentIdentity, CapacityConfig},
+    agent_client::{join_agent, AgentClient},
     backup::{self, BackupTargetSpec},
     crypto::MasterKey,
     durability::DurableStore,
@@ -15,6 +21,7 @@ use distr_hnsw::{
     object::{ObjectHash, ObjectKind},
     portal::{AgentTarget, Failpoint, FailpointAction, Portal},
     reconcile::scrub,
+    tailscale::LocalApi,
     CHUNK_SIZE,
 };
 use tempfile::TempDir;
@@ -33,33 +40,6 @@ impl Drop for TestAgent {
     }
 }
 
-async fn start_agent(id: &str, domain: &str) -> TestAgent {
-    let holder = tempfile::tempdir().unwrap();
-    let volume = holder.path().to_owned();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let identity = AgentIdentity {
-        id: id.to_owned(),
-        failure_domain: domain.to_owned(),
-    };
-    let volume_path = volume.clone();
-    let task = tokio::spawn(async move {
-        serve_agent_with_capacity(listener, volume_path, identity, CapacityConfig::default())
-            .await
-            .unwrap();
-    });
-    TestAgent {
-        target: AgentTarget {
-            id: id.to_owned(),
-            failure_domain: domain.to_owned(),
-            base_url: format!("http://{address}"),
-        },
-        volume,
-        _holder: holder,
-        task,
-    }
-}
-
 struct Cluster {
     workspace: TempDir,
     key_path: PathBuf,
@@ -72,7 +52,12 @@ impl Cluster {
         let workspace = tempfile::tempdir().unwrap();
         let key_path = workspace.path().join("master.key");
         MasterKey::create(&key_path).unwrap();
-        let mut agents = Vec::new();
+        let mut cluster = Self {
+            database_path: workspace.path().join("portal.sqlite"),
+            key_path,
+            workspace,
+            agents: Vec::new(),
+        };
         for (id, domain) in [
             ("agent-a", "host-a"),
             ("agent-b", "host-b"),
@@ -81,14 +66,61 @@ impl Cluster {
         .into_iter()
         .take(count)
         {
-            agents.push(start_agent(id, domain).await);
+            cluster.start_agent(id, domain).await;
         }
-        Self {
-            database_path: workspace.path().join("portal.sqlite"),
-            key_path,
-            workspace,
-            agents,
-        }
+        cluster
+    }
+
+    /// Start an agent on a fresh volume with a fresh join token and join it.
+    async fn start_agent(&mut self, id: &str, domain: &str) {
+        let holder = tempfile::tempdir().unwrap();
+        let volume = holder.path().to_owned();
+        let key = self.key();
+        let mut database = self.database();
+        database.bind_master_key_id(&key.key_id_hex()).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let token = create_join_token(&mut database, id, now).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let identity = AgentIdentity {
+            id: id.to_owned(),
+            failure_domain: domain.to_owned(),
+        };
+        let (volume_path, agent_token) = (volume.clone(), token.clone());
+        let task = tokio::spawn(async move {
+            serve_agent_with_capacity(
+                listener,
+                volume_path,
+                identity,
+                CapacityConfig::default(),
+                &agent_token,
+            )
+            .await
+            .unwrap();
+        });
+        let agent = TestAgent {
+            target: AgentTarget {
+                id: id.to_owned(),
+                failure_domain: domain.to_owned(),
+                base_url: format!("http://{address}"),
+            },
+            volume,
+            _holder: holder,
+            task,
+        };
+        join_agent(
+            &mut database,
+            &key,
+            &agent.target,
+            &token,
+            &LocalApi::new("/nonexistent/tailscaled.sock"),
+        )
+        .await
+        .unwrap();
+        self.agents.push(agent);
     }
 
     fn targets(&self) -> Vec<AgentTarget> {
@@ -110,6 +142,10 @@ impl Cluster {
         Database::open(&self.database_path).unwrap()
     }
 
+    fn client(&self) -> AgentClient {
+        AgentClient::open(&mut self.database(), &self.key()).unwrap()
+    }
+
     fn source(&self, name: &str, size: usize) -> PathBuf {
         let path = self.workspace.path().join(name);
         let bytes: Vec<u8> = (0..size)
@@ -123,7 +159,7 @@ impl Cluster {
         let report = scrub(
             &mut self.database(),
             &self.targets(),
-            &reqwest::Client::new(),
+            &self.client(),
             JobMode::Verify,
         )
         .await
@@ -135,7 +171,7 @@ impl Cluster {
         gc(
             &mut self.database(),
             &self.targets(),
-            &reqwest::Client::new(),
+            &self.client(),
             GcOptions {
                 retention_seconds: 0,
                 staging_grace_seconds: 0,
@@ -252,7 +288,15 @@ async fn redundant_deletion_markers_recover_deterministically() {
         .unwrap();
     assert!(!decision.notes.is_empty(), "{decision:?}");
 
+    // Joined agents accept grants only from the portal's signing key, which
+    // is sealed in the database, so the blank database starts with it.
+    let signing_keys = cluster.database().signing_keys().unwrap();
+    assert_eq!(signing_keys.len(), 1);
     fs::remove_file(&cluster.database_path).unwrap();
+    cluster
+        .database()
+        .insert_first_signing_key(&signing_keys[0])
+        .unwrap();
     let blank = cluster.portal().recover(true).await.unwrap();
     assert_eq!(blank.exit_code(), 0, "{blank:?}");
     assert_eq!(
@@ -310,7 +354,7 @@ async fn retirement_ignores_collected_objects() {
     let report = retire(
         &mut cluster.database(),
         &cluster.targets(),
-        &reqwest::Client::new(),
+        &cluster.client(),
         "agent-c",
     )
     .await
@@ -332,7 +376,7 @@ async fn backup_after_gc_skips_collected_objects() {
         let report = backup::backup(
             &mut database,
             &cluster.targets(),
-            &reqwest::Client::new(),
+            &cluster.client(),
             &spec,
             &cluster.database_path,
         )
@@ -351,7 +395,7 @@ async fn backup_after_gc_skips_collected_objects() {
 async fn gc_waits_for_backup_coverage_of_deleted_generations() {
     let cluster = Cluster::new(3).await;
     let spec = BackupTargetSpec::Directory(cluster.workspace.path().join("offsite"));
-    let client = reqwest::Client::new();
+    let client = cluster.client();
     let run_backup = || async {
         backup::backup(
             &mut cluster.database(),
@@ -440,7 +484,7 @@ async fn restored_metadata_blocks_lifecycle_until_recovered() {
     backup::backup(
         &mut cluster.database(),
         &cluster.targets(),
-        &reqwest::Client::new(),
+        &cluster.client(),
         &spec,
         &cluster.database_path,
     )
@@ -456,7 +500,7 @@ async fn restored_metadata_blocks_lifecycle_until_recovered() {
     let refused = gc(
         &mut database,
         &cluster.targets(),
-        &reqwest::Client::new(),
+        &cluster.client(),
         GcOptions {
             retention_seconds: 0,
             staging_grace_seconds: 0,
@@ -468,7 +512,7 @@ async fn restored_metadata_blocks_lifecycle_until_recovered() {
     let refused = retire(
         &mut database,
         &cluster.targets(),
-        &reqwest::Client::new(),
+        &cluster.client(),
         "agent-c",
     )
     .await;
@@ -520,7 +564,7 @@ async fn backup_lag_is_reported_when_the_target_refuses_writes() {
     let report = backup::backup(
         &mut database,
         &cluster.targets(),
-        &reqwest::Client::new(),
+        &cluster.client(),
         &BackupTargetSpec::Directory(target_dir),
         &cluster.database_path,
     )
@@ -588,7 +632,7 @@ async fn recovery_ready_follows_the_recorded_restore_drill() {
     backup::backup(
         &mut database,
         &cluster.targets(),
-        &reqwest::Client::new(),
+        &cluster.client(),
         &spec,
         &cluster.database_path,
     )

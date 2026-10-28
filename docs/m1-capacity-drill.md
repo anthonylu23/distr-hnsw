@@ -107,13 +107,18 @@ No durability or admission bug was found. Two labelling observations:
 ## Rerun
 
 On the reference host (passwordless sudo, `mkfs.ext4`, `losetup`, `fallocate`,
-`jq`, `curl`):
+`jq`):
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --release -p distr-hnsw
 scripts/enospc-drill.sh            # add --keep to retain the image
 ```
+
+Since M2 the script initializes the portal first, starts each agent with a
+join token and joins it, and sends its capacity reads, inventory counts, and
+admission probes as granted requests through `portal agent request`. The
+run above predates M2.
 
 The script only touches the loop device attached to the image it created
 (checked with `losetup -j` before every privileged call), mounts at

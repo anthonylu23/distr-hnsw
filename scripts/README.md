@@ -2,6 +2,16 @@
 
 Operational scripts that are not part of the product binary.
 
+Agents require capability grants (M2). Every drill initializes the portal
+first, starts each new agent with a single-use token from `portal agent
+token` (passed in `DISTR_HNSW_JOIN_TOKEN`, never written to a file or log),
+waits for the agent's port, and joins it with `portal agent join`. A
+restarted agent keeps its trust on its volume and needs no token. Agent
+routes, `/v1/health` included, refuse requests without a grant, so the
+drills send direct agent requests (health, inventory, object `GET` and
+`PUT`) through `portal agent request`, which signs one and prints the HTTP
+status. Every `portal` command that contacts agents passes `--master-key`.
+
 ## power-loss-drill.sh
 
 Filesystem power-loss qualification for the agent object store, using
@@ -18,7 +28,7 @@ scripts/power-loss-drill.sh ext4 --files 16 --keep   # more marks; keep images
 
 Requirements (all present on the reference host): passwordless `sudo`, the
 `dm-log-writes` module, `mkfs.<fs>`, `dmsetup`, `losetup`, `blkdiscard`,
-`jq`, `curl`, `gcc`, and network access on first run to shallow-clone
+`jq`, `gcc`, and network access on first run to shallow-clone
 xfstests for `replay-log` (compiled into `$HOME/distr-hnsw-drill/replay-log`).
 The binary must be built with `--features failpoints`: the re-PUT phase
 stops an agent between a PUT's rename and its directory sync through
@@ -30,9 +40,10 @@ What it does:
 1. Creates two 4 GiB sparse images under `$HOME/distr-hnsw-drill/run-<fs>-<utc>/`,
    attaches them as loop devices, stacks `dm-log-writes` (`dhq-<fs>-<pid>`) on
    the data device, runs `mkfs.<fs>`, marks `mkfs`, mounts with default options.
-2. Starts one agent on the dm-backed volume and a second on a plain directory
-   (RF2 needs two failure domains; only the first is under test), inits a
-   portal database outside the mount, and uploads 8 files (3 KiB to 6 MiB).
+2. Inits a portal database outside the mount (master key on the mount,
+   mark `master-key`), then starts and joins one agent on the dm-backed
+   volume and a second on a plain directory (RF2 needs two failure domains;
+   only the first is under test), and uploads 8 files (3 KiB to 6 MiB).
    After each acknowledged `portal put` it inserts mark `put-<i>` and
    snapshots the agent's `/v1/inventory/*`.
 3. Writes a 1 MiB file with no `fsync` and marks `unsynced-control`, then
@@ -57,6 +68,12 @@ detaches the loops, deletes the images (unless `--keep`), and prints the
 leftover count from `losetup -a` and `dmsetup ls`. Nothing outside
 `$HOME/distr-hnsw-drill/` is touched.
 
+Agent requests use the portal database, which lives outside the mount,
+and a copy of the master key made off the volume after `portal init`, so
+they work while the drilled volume is unmounted for replays. The agents
+join before the first `put-<i>` mark, so every replay that starts an agent
+includes its durably written trust files.
+
 Do not run this on the laptop; it needs root and a Linux block layer. It
 takes about 10 seconds per filesystem on the reference host.
 
@@ -75,7 +92,9 @@ scripts/restore-drill.sh --target s3:bucket/prefix          # offsite target
 ```
 
 Needs no root. Writes `$HOME/distr-hnsw-drill/restore-report-<utc>.json`
-and exits 0 only on a `pass` verdict. A deployment becomes recovery ready
+and exits 0 only on a `pass` verdict. The replacement agents start on empty
+volumes with tokens issued from the restored database and are joined before
+`portal restore objects`; the report records this as the `join-agents` step. A deployment becomes recovery ready
 only after a passing drill against its own backup target (same bucket, or
 same directory) is recorded into its database:
 
@@ -97,12 +116,45 @@ upload. Results: [docs/m1-lifecycle-matrix.md](../docs/m1-lifecycle-matrix.md).
 
 ```sh
 scripts/lifecycle-matrix.sh --files 160 --max-mib 24 --flip 24
+scripts/lifecycle-matrix.sh --files 32 --max-mib 4 --flip 12    # quick check
 ```
+
+GC compares whole-second timestamps. On a very small corpus (for example
+8 files of 1 MiB) the replacement scrub and the deletions can land in the
+same second, GC then counts that scrub as an observation after the
+deletions, and the "blocked before a new observation" check fails. The
+pre-M2 binary behaves the same; use the quick-check size or larger.
 
 ## enospc-drill.sh
 
 Capacity and real-`ENOSPC` failure injection on a small ext4 loop device
 (needs sudo). Results: [docs/m1-capacity-drill.md](../docs/m1-capacity-drill.md).
+Capacity reads, inventory counts, and the direct admission probes (507 for
+a chunk, 409 for a manifest) are granted requests through `portal agent
+request`.
+
+## tailnet-authorization-drill.sh
+
+Real-tailnet authorization drill for M2. Starts two agents on this node's
+tailnet address, joins them, round-trips a file through the portal, and then
+requires every agent route (health, inventory, get, put, delete, and join)
+to refuse requests from another tailnet node, with and without forged
+`Tailscale-User-*` headers, and a local request without a grant to get 401.
+The stored object must survive the refused deletes. It changes no tailnet
+setting.
+
+```sh
+REMOTE=user@other-node scripts/tailnet-authorization-drill.sh
+REMOTE=user@other-node OPEN_FIREWALL=1 scripts/tailnet-authorization-drill.sh
+```
+
+`REMOTE` is the SSH destination of another node on the same tailnet. If the
+host firewall admits only some ports on `tailscale0`, the other node's
+requests never reach the agent; `OPEN_FIREWALL=1` (sudo, firewalld) adds a
+runtime-only rule for the two drill ports with a 300 s timeout, removes it
+on exit, and records that the zone was restored. Writes
+`$HOME/distr-hnsw-drill/tailnet-authz-report-<utc>.json` and exits 0 only on
+a `pass` verdict.
 
 ## minio-test.sh
 

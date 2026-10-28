@@ -1,7 +1,13 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use distr_hnsw::{
+    access::create_join_token,
     agent::{serve_agent, AgentIdentity},
+    agent_client::join_agent,
     crypto::{
         encrypt_chunk, random_key, random_nonce, unwrap_key, wrap_key, MasterKey, ENVELOPE_VERSION,
     },
@@ -12,6 +18,8 @@ use distr_hnsw::{
     metadata::{Database, FileState},
     object::{ObjectHash, ObjectKind},
     portal::{AgentTarget, Failpoint, FailpointAction, Portal, PortalError},
+    recovery::RecoveryError,
+    tailscale::LocalApi,
 };
 use rusqlite::{params, Connection};
 use tempfile::TempDir;
@@ -29,7 +37,18 @@ impl Drop for TestAgent {
     }
 }
 
-async fn start_agent(id: &str, domain: &str) -> TestAgent {
+/// Start an agent with a fresh join token from the portal database at
+/// `database_path` (bound to the key at `key_path`) and join it there. An
+/// agent accepts grants only from the portal that joined it.
+async fn start_agent(id: &str, domain: &str, database_path: &Path, key_path: &Path) -> TestAgent {
+    let key = MasterKey::load(key_path).unwrap();
+    let mut database = Database::open(database_path).unwrap();
+    database.bind_master_key_id(&key.key_id_hex()).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let token = create_join_token(&mut database, id, now).unwrap();
     let volume = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -38,15 +57,28 @@ async fn start_agent(id: &str, domain: &str) -> TestAgent {
         failure_domain: domain.to_owned(),
     };
     let volume_path = volume.path().to_owned();
+    let agent_token = token.clone();
     let task = tokio::spawn(async move {
-        serve_agent(listener, volume_path, identity).await.unwrap();
+        serve_agent(listener, volume_path, identity, &agent_token)
+            .await
+            .unwrap();
     });
+    let target = AgentTarget {
+        id: id.to_owned(),
+        failure_domain: domain.to_owned(),
+        base_url: format!("http://{address}"),
+    };
+    join_agent(
+        &mut database,
+        &key,
+        &target,
+        &token,
+        &LocalApi::new("/nonexistent/tailscaled.sock"),
+    )
+    .await
+    .unwrap();
     TestAgent {
-        target: AgentTarget {
-            id: id.to_owned(),
-            failure_domain: domain.to_owned(),
-            base_url: format!("http://{address}"),
-        },
+        target,
         volume,
         task,
     }
@@ -56,11 +88,20 @@ fn create_key(path: &Path) {
     MasterKey::create(path).unwrap();
 }
 
+/// Agent ids and failure domains for the legacy-schema tests, which record
+/// placements before the agents can be joined to the migrated database.
+const AGENTS: [(&str, &str); 2] = [("agent-a", "host-a"), ("agent-b", "host-b")];
+
+/// Snapshot the portal database at `from` into `to`, as a metadata backup
+/// does. Taken after the agents joined but before any upload, the copy holds
+/// the signing key they trust and no file records: a stale SQLite that
+/// recovery must rebuild from the agents (DESIGN §11).
+fn stale_snapshot(from: &Path, to: &Path) {
+    Database::open(from).unwrap().snapshot_into(to).unwrap();
+}
+
 #[tokio::test]
 async fn every_delete_boundary_is_retryable_and_never_removes_objects() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     create_key(&key_path);
@@ -77,6 +118,11 @@ async fn every_delete_boundary_is_retryable_and_never_removes_objects() {
         let database_path = workspace
             .path()
             .join(format!("{}.sqlite", failpoint.as_str()));
+        // Each failpoint gets a fresh portal database, and agents trust only
+        // the portal that joined them, so each also gets a fresh pair.
+        let agent_a = start_agent("agent-a", "host-a", &database_path, &key_path).await;
+        let agent_b = start_agent("agent-b", "host-b", &database_path, &key_path).await;
+        let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
         let mut portal = Portal::open(
             &database_path,
             MasterKey::load(&key_path).unwrap(),
@@ -157,15 +203,15 @@ async fn every_delete_boundary_is_retryable_and_never_removes_objects() {
 
 #[tokio::test]
 async fn delete_refuses_to_commit_when_confirmed_marker_replicas_are_gone() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let database_path = workspace.path().join("portal.sqlite");
     let source = workspace.path().join("source.bin");
     fs::write(&source, b"delete durability").unwrap();
     create_key(&key_path);
+    let agent_a = start_agent("agent-a", "host-a", &database_path, &key_path).await;
+    let agent_b = start_agent("agent-b", "host-b", &database_path, &key_path).await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
 
     let mut portal = Portal::open(
         &database_path,
@@ -241,9 +287,6 @@ async fn delete_refuses_to_commit_when_confirmed_marker_replicas_are_gone() {
 
 #[tokio::test]
 async fn recovery_plans_then_repairs_one_copy_and_rebuilds_stale_sqlite() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let original_db = workspace.path().join("original.sqlite");
@@ -251,6 +294,10 @@ async fn recovery_plans_then_repairs_one_copy_and_rebuilds_stale_sqlite() {
     let source = workspace.path().join("empty.bin");
     fs::write(&source, []).unwrap();
     create_key(&key_path);
+    let agent_a = start_agent("agent-a", "host-a", &original_db, &key_path).await;
+    let agent_b = start_agent("agent-b", "host-b", &original_db, &key_path).await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
+    stale_snapshot(&original_db, &recovered_db);
 
     let mut portal = Portal::open(
         &original_db,
@@ -307,16 +354,21 @@ async fn recovery_plans_then_repairs_one_copy_and_rebuilds_stale_sqlite() {
 
 #[tokio::test]
 async fn recovery_keeps_marker_only_tombstones_unreadable_and_blocks_conflicts() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let original_db = workspace.path().join("original.sqlite");
     let recovered_db = workspace.path().join("recovered.sqlite");
+    let conflict_db = workspace.path().join("conflict.sqlite");
+    let blank_db = workspace.path().join("blank.sqlite");
     let source = workspace.path().join("empty.bin");
     fs::write(&source, []).unwrap();
     create_key(&key_path);
+    let agent_a = start_agent("agent-a", "host-a", &original_db, &key_path).await;
+    let agent_b = start_agent("agent-b", "host-b", &original_db, &key_path).await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
+    for database in [&recovered_db, &conflict_db, &blank_db] {
+        stale_snapshot(&original_db, database);
+    }
 
     let mut portal = Portal::open(
         &original_db,
@@ -344,7 +396,6 @@ async fn recovery_keeps_marker_only_tombstones_unreadable_and_blocks_conflicts()
     assert_eq!(projection.state, FileState::Deleted);
     assert!(!recovery.is_visible(deleted_file).unwrap());
 
-    let conflict_db = workspace.path().join("conflict.sqlite");
     let mut original = Portal::open(
         &conflict_db,
         MasterKey::load(&key_path).unwrap(),
@@ -367,7 +418,6 @@ async fn recovery_keeps_marker_only_tombstones_unreadable_and_blocks_conflicts()
             .put(ObjectKind::DeletionMarker, &hash, &bytes)
             .unwrap();
     }
-    let blank_db = workspace.path().join("blank.sqlite");
     let mut conflict_recovery =
         Portal::open(&blank_db, MasterKey::load(&key_path).unwrap(), agents).unwrap();
     let report = conflict_recovery.recover(true).await.unwrap();
@@ -377,33 +427,54 @@ async fn recovery_keeps_marker_only_tombstones_unreadable_and_blocks_conflicts()
 
 #[tokio::test]
 async fn wrong_master_key_aborts_recovery_without_mutation() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
     let workspace = tempfile::tempdir().unwrap();
     let right_path = workspace.path().join("right.key");
     let wrong_path = workspace.path().join("wrong.key");
+    let source_db = workspace.path().join("source.sqlite");
+    let destination_db = workspace.path().join("destination.sqlite");
     let source = workspace.path().join("empty.bin");
     fs::write(&source, []).unwrap();
     create_key(&right_path);
     create_key(&wrong_path);
+    let agent_a = start_agent("agent-a", "host-a", &source_db, &right_path).await;
+    let agent_b = start_agent("agent-b", "host-b", &source_db, &right_path).await;
     let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
-    let mut portal = Portal::open(
-        &workspace.path().join("source.sqlite"),
-        MasterKey::load(&right_path).unwrap(),
-        agents.clone(),
-    )
-    .unwrap();
-    portal.upload(&source, "wrong-key-source").await.unwrap();
+    let mut portal =
+        Portal::open(&source_db, MasterKey::load(&right_path).unwrap(), agents).unwrap();
+    let file_id = portal.upload(&source, "wrong-key-source").await.unwrap();
     drop(portal);
+    let manifest_hash = Database::open(&source_db)
+        .unwrap()
+        .file_projection(file_id)
+        .unwrap()
+        .unwrap()
+        .manifest_hash
+        .unwrap();
 
-    let destination_db = workspace.path().join("destination.sqlite");
+    // Agents refuse grants from a portal that did not join them, which would
+    // fail recovery before it reads any evidence. Give the wrong-key portal
+    // agents of its own holding the same objects, as `restore objects` would,
+    // so recovery must fail on the evidence itself.
+    let recovering_a = start_agent("agent-a", "host-a", &destination_db, &wrong_path).await;
+    let recovering_b = start_agent("agent-b", "host-b", &destination_db, &wrong_path).await;
+    for (from, to) in [(&agent_a, &recovering_a), (&agent_b, &recovering_b)] {
+        let bytes = DurableStore::open(from.volume.path())
+            .unwrap()
+            .get(ObjectKind::Manifest, &manifest_hash)
+            .unwrap();
+        DurableStore::open(to.volume.path())
+            .unwrap()
+            .put(ObjectKind::Manifest, &manifest_hash, &bytes)
+            .unwrap();
+    }
     let mut recovery = Portal::open(
         &destination_db,
         MasterKey::load(&wrong_path).unwrap(),
-        agents,
+        vec![recovering_a.target.clone(), recovering_b.target.clone()],
     )
     .unwrap();
-    assert!(recovery.recover(true).await.is_err());
+    let result = recovery.recover(true).await;
+    assert!(matches!(result, Err(RecoveryError::Trust(_))), "{result:?}");
     assert!(Database::open(&destination_db)
         .unwrap()
         .all_file_projections()
@@ -413,9 +484,6 @@ async fn wrong_master_key_aborts_recovery_without_mutation() {
 
 #[tokio::test]
 async fn recovery_applies_safe_files_while_missing_chunks_block_only_their_file() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let source_db = workspace.path().join("source.sqlite");
@@ -425,6 +493,10 @@ async fn recovery_applies_safe_files_while_missing_chunks_block_only_their_file(
     fs::write(&good_source, []).unwrap();
     fs::write(&blocked_source, b"required chunk").unwrap();
     create_key(&key_path);
+    let agent_a = start_agent("agent-a", "host-a", &source_db, &key_path).await;
+    let agent_b = start_agent("agent-b", "host-b", &source_db, &key_path).await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
+    stale_snapshot(&source_db, &recovered_db);
 
     let mut portal = Portal::open(
         &source_db,
@@ -473,12 +545,12 @@ async fn recovery_applies_safe_files_while_missing_chunks_block_only_their_file(
 
 #[tokio::test]
 async fn malformed_or_unavailable_agent_inventory_aborts_without_mutation() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let database_path = workspace.path().join("portal.sqlite");
     create_key(&key_path);
+    let agent_a = start_agent("agent-a", "host-a", &database_path, &key_path).await;
+    let agent_b = start_agent("agent-b", "host-b", &database_path, &key_path).await;
     DurableStore::open(agent_a.volume.path()).unwrap();
     fs::create_dir(
         agent_a
@@ -525,15 +597,15 @@ async fn malformed_or_unavailable_agent_inventory_aborts_without_mutation() {
 
 #[tokio::test]
 async fn newer_manifest_wins_over_stale_sqlite_and_remains_downloadable() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let database_path = workspace.path().join("stale.sqlite");
     let source = workspace.path().join("empty.bin");
     fs::write(&source, []).unwrap();
     create_key(&key_path);
+    let agent_a = start_agent("agent-a", "host-a", &database_path, &key_path).await;
+    let agent_b = start_agent("agent-b", "host-b", &database_path, &key_path).await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
 
     let mut portal = Portal::open(
         &database_path,
@@ -598,9 +670,6 @@ async fn newer_manifest_wins_over_stale_sqlite_and_remains_downloadable() {
 
 #[tokio::test]
 async fn migrated_v1_upload_remains_downloadable_and_idempotent() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let database_path = workspace.path().join("legacy.sqlite");
@@ -622,12 +691,6 @@ async fn migrated_v1_upload_remains_downloadable_and_idempotent() {
     };
     let manifest_bytes = encode_manifest(&master, file_id, 1, &payload).unwrap();
     let manifest_hash = ObjectHash::digest(&manifest_bytes);
-    for agent in [&agent_a, &agent_b] {
-        DurableStore::open(agent.volume.path())
-            .unwrap()
-            .put(ObjectKind::Manifest, &manifest_hash, &manifest_bytes)
-            .unwrap();
-    }
 
     let connection = Connection::open(&database_path).unwrap();
     connection
@@ -684,19 +747,26 @@ async fn migrated_v1_upload_remains_downloadable_and_idempotent() {
             ],
         )
         .unwrap();
-    for agent in [&agent_a, &agent_b] {
+    for (agent_id, domain) in AGENTS {
         connection
             .execute(
                 "INSERT INTO placements VALUES ('manifest', ?1, ?2, ?3, 'confirmed', unixepoch())",
-                params![
-                    manifest_hash.as_str(),
-                    agent.target.id,
-                    agent.target.failure_domain
-                ],
+                params![manifest_hash.as_str(), agent_id, domain],
             )
             .unwrap();
     }
     drop(connection);
+
+    // Joining opens, and so migrates, the legacy database.
+    let agent_a = start_agent(AGENTS[0].0, AGENTS[0].1, &database_path, &key_path).await;
+    let agent_b = start_agent(AGENTS[1].0, AGENTS[1].1, &database_path, &key_path).await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
+    for agent in [&agent_a, &agent_b] {
+        DurableStore::open(agent.volume.path())
+            .unwrap()
+            .put(ObjectKind::Manifest, &manifest_hash, &manifest_bytes)
+            .unwrap();
+    }
 
     let mut portal =
         Portal::open(&database_path, MasterKey::load(&key_path).unwrap(), agents).unwrap();
@@ -708,9 +778,6 @@ async fn migrated_v1_upload_remains_downloadable_and_idempotent() {
 
 #[tokio::test]
 async fn audited_v2_chunk_remains_downloadable_after_v3_migration() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let database_path = workspace.path().join("audited-v2.sqlite");
@@ -749,15 +816,6 @@ async fn audited_v2_chunk_remains_downloadable_after_v3_migration() {
     };
     let manifest_bytes = encode_manifest(&master, file_id, 1, &payload).unwrap();
     let manifest_hash = ObjectHash::digest(&manifest_bytes);
-    for agent in [&agent_a, &agent_b] {
-        let store = DurableStore::open(agent.volume.path()).unwrap();
-        store
-            .put(ObjectKind::Chunk, &chunk_hash, &ciphertext)
-            .unwrap();
-        store
-            .put(ObjectKind::Manifest, &manifest_hash, &manifest_bytes)
-            .unwrap();
-    }
 
     let connection = Connection::open(&database_path).unwrap();
     connection
@@ -845,7 +903,7 @@ async fn audited_v2_chunk_remains_downloadable_after_v3_migration() {
             ],
         )
         .unwrap();
-    for agent in [&agent_a, &agent_b] {
+    for (agent_id, domain) in AGENTS {
         for (kind, hash) in [
             (ObjectKind::Chunk, &chunk_hash),
             (ObjectKind::Manifest, &manifest_hash),
@@ -855,17 +913,26 @@ async fn audited_v2_chunk_remains_downloadable_after_v3_migration() {
                     "INSERT INTO placements
                      (object_kind, object_hash, agent_id, failure_domain, state, confirmed_at)
                      VALUES (?1, ?2, ?3, ?4, 'confirmed', unixepoch())",
-                    params![
-                        kind.as_str(),
-                        hash.as_str(),
-                        agent.target.id,
-                        agent.target.failure_domain,
-                    ],
+                    params![kind.as_str(), hash.as_str(), agent_id, domain],
                 )
                 .unwrap();
         }
     }
     drop(connection);
+
+    // Joining opens, and so migrates, the legacy database.
+    let agent_a = start_agent(AGENTS[0].0, AGENTS[0].1, &database_path, &key_path).await;
+    let agent_b = start_agent(AGENTS[1].0, AGENTS[1].1, &database_path, &key_path).await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
+    for agent in [&agent_a, &agent_b] {
+        let store = DurableStore::open(agent.volume.path()).unwrap();
+        store
+            .put(ObjectKind::Chunk, &chunk_hash, &ciphertext)
+            .unwrap();
+        store
+            .put(ObjectKind::Manifest, &manifest_hash, &manifest_bytes)
+            .unwrap();
+    }
 
     let mut portal =
         Portal::open(&database_path, MasterKey::load(&key_path).unwrap(), agents).unwrap();

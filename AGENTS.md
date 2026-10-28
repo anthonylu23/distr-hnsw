@@ -138,10 +138,14 @@ The blob plane (`crates/distr-hnsw/`) provides the RF2 commit spine, logical
 deletion, recovery, incarnations and observations, scrub/repair, drain,
 retire, capacity admission, proof-based GC, master-key recovery bundles, and
 backup set v1 with directory and S3 targets (`portal init|put|get|delete|
-recover|scrub|health|key|backup|restore|drill|drain|retire|gc`). SQLite schema
-is v9. Drills and their
+recover|scrub|health|key|backup|restore|drill|drain|retire|gc|agent`). SQLite
+schema is v10 (v10 adds grant-signing keys, joined agents, and join tokens).
+Drills and their
 evidence: `scripts/` and `docs/m1-*-drill.md`, `docs/m1-lifecycle-matrix.md`,
-`docs/m1-filesystem-qualification.md`. Agents stay loopback-only until M2.
+`docs/m1-filesystem-qualification.md`. Since M2 work packages 1 to 3,
+agents require a portal-signed grant on every request and a join token
+until joined (`portal agent token|join`); loopback needs
+`--insecure-loopback`. Commands that contact agents take `--master-key`.
 Tests use `TMPDIR=target/` via `.cargo/config.toml` so they run on a real
 filesystem; `aws-lc-sys` needs a C compiler. The S3 tests are `#[ignore]`d
 and run against MinIO with `scripts/minio-test.sh`. Process tests rely on

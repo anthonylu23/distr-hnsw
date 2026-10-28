@@ -2,11 +2,20 @@
 //! segments round-trip through the blob plane and recover to the same
 //! logical state on another machine.
 
+use std::{
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use distr_hnsw::{
+    access::create_join_token,
     agent::{serve_agent, AgentIdentity},
+    agent_client::join_agent,
     crypto::MasterKey,
     index_archive::{archive, restore, ArchivePart, IndexArchiveError},
+    metadata::Database,
     portal::{AgentTarget, Portal},
+    tailscale::LocalApi,
 };
 use distr_hnsw_index::{
     hnsw::HnswParams,
@@ -29,7 +38,22 @@ impl Drop for TestAgent {
     }
 }
 
-async fn start_agent(id: &str, failure_domain: &str) -> TestAgent {
+/// Start an agent with a fresh join token from the portal database at
+/// `database_path` (bound to the key at `key_path`) and join it there.
+async fn start_agent(
+    id: &str,
+    failure_domain: &str,
+    database_path: &Path,
+    key_path: &Path,
+) -> TestAgent {
+    let key = MasterKey::load(key_path).unwrap();
+    let mut database = Database::open(database_path).unwrap();
+    database.bind_master_key_id(&key.key_id_hex()).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let token = create_join_token(&mut database, id, now).unwrap();
     let volume = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -38,15 +62,28 @@ async fn start_agent(id: &str, failure_domain: &str) -> TestAgent {
         failure_domain: failure_domain.to_owned(),
     };
     let volume_path = volume.path().to_owned();
+    let agent_token = token.clone();
     let task = tokio::spawn(async move {
-        serve_agent(listener, volume_path, identity).await.unwrap();
+        serve_agent(listener, volume_path, identity, &agent_token)
+            .await
+            .unwrap();
     });
+    let target = AgentTarget {
+        id: id.to_owned(),
+        failure_domain: failure_domain.to_owned(),
+        base_url: format!("http://{address}"),
+    };
+    join_agent(
+        &mut database,
+        &key,
+        &target,
+        &token,
+        &LocalApi::new("/nonexistent/tailscaled.sock"),
+    )
+    .await
+    .unwrap();
     TestAgent {
-        target: AgentTarget {
-            id: id.to_owned(),
-            failure_domain: failure_domain.to_owned(),
-            base_url: format!("http://{address}"),
-        },
+        target,
         _volume: volume,
         task,
     }
@@ -79,13 +116,13 @@ fn state(partition: &Partition, dims: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 #[tokio::test]
 async fn partition_state_round_trips_through_the_blob_plane() {
-    let agent_a = start_agent("agent-a", "domain-a").await;
-    let agent_b = start_agent("agent-b", "domain-b").await;
-    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     MasterKey::create(&key_path).unwrap();
     let database_path = workspace.path().join("portal.sqlite");
+    let agent_a = start_agent("agent-a", "domain-a", &database_path, &key_path).await;
+    let agent_b = start_agent("agent-b", "domain-b", &database_path, &key_path).await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
 
     let dims = 16;
     let partition_dir = workspace.path().join("partition");
@@ -204,18 +241,15 @@ fn split_segment(partition_dir: &std::path::Path, id: Uuid, sealed: usize) {
 
 #[tokio::test]
 async fn archive_is_offline_only_reuploads_lost_parts_and_restore_stages() {
-    let agent_a = start_agent("agent-a", "domain-a").await;
-    let agent_b = start_agent("agent-b", "domain-b").await;
-    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     MasterKey::create(&key_path).unwrap();
-    let mut portal = Portal::open(
-        &workspace.path().join("portal.sqlite"),
-        MasterKey::load(&key_path).unwrap(),
-        agents,
-    )
-    .unwrap();
+    let database_path = workspace.path().join("portal.sqlite");
+    let agent_a = start_agent("agent-a", "domain-a", &database_path, &key_path).await;
+    let agent_b = start_agent("agent-b", "domain-b", &database_path, &key_path).await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
+    let mut portal =
+        Portal::open(&database_path, MasterKey::load(&key_path).unwrap(), agents).unwrap();
 
     let dims = 8;
     let partition_dir = workspace.path().join("partition");

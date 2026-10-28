@@ -1,13 +1,20 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{extract::DefaultBodyLimit, http::StatusCode, routing::get, Json, Router};
 use distr_hnsw::{
+    access::create_join_token,
     agent::{serve_agent, AgentHealth, AgentIdentity},
+    agent_client::join_agent,
     crypto::MasterKey,
     durability::DurableStore,
     metadata::Database,
     object::ObjectKind,
     portal::{AgentTarget, Failpoint, FailpointAction, Portal, PortalError},
+    tailscale::LocalApi,
     CHUNK_SIZE,
 };
 use tempfile::TempDir;
@@ -25,7 +32,23 @@ impl Drop for TestAgent {
     }
 }
 
-async fn start_agent(id: &str, failure_domain: &str) -> TestAgent {
+/// Start an agent with a fresh join token from the portal database at
+/// `database_path` (bound to the key at `key_path`) and join it there. An
+/// agent accepts grants only from the portal that joined it.
+async fn start_agent(
+    id: &str,
+    failure_domain: &str,
+    database_path: &Path,
+    key_path: &Path,
+) -> TestAgent {
+    let key = MasterKey::load(key_path).unwrap();
+    let mut database = Database::open(database_path).unwrap();
+    database.bind_master_key_id(&key.key_id_hex()).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let token = create_join_token(&mut database, id, now).unwrap();
     let volume = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -34,15 +57,28 @@ async fn start_agent(id: &str, failure_domain: &str) -> TestAgent {
         failure_domain: failure_domain.to_owned(),
     };
     let volume_path = volume.path().to_owned();
+    let agent_token = token.clone();
     let task = tokio::spawn(async move {
-        serve_agent(listener, volume_path, identity).await.unwrap();
+        serve_agent(listener, volume_path, identity, &agent_token)
+            .await
+            .unwrap();
     });
+    let target = AgentTarget {
+        id: id.to_owned(),
+        failure_domain: failure_domain.to_owned(),
+        base_url: format!("http://{address}"),
+    };
+    join_agent(
+        &mut database,
+        &key,
+        &target,
+        &token,
+        &LocalApi::new("/nonexistent/tailscaled.sock"),
+    )
+    .await
+    .unwrap();
     TestAgent {
-        target: AgentTarget {
-            id: id.to_owned(),
-            failure_domain: failure_domain.to_owned(),
-            base_url: format!("http://{address}"),
-        },
+        target,
         volume,
         task,
     }
@@ -94,9 +130,6 @@ fn write_source(path: &Path) -> Vec<u8> {
 
 #[tokio::test]
 async fn every_commit_failpoint_retries_to_one_visible_file() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     MasterKey::create(&key_path).unwrap();
@@ -117,6 +150,11 @@ async fn every_commit_failpoint_retries_to_one_visible_file() {
         let database_path = workspace
             .path()
             .join(format!("{}.sqlite", failpoint.as_str()));
+        // Each failpoint gets a fresh portal database, and agents trust only
+        // the portal that joined them, so each also gets a fresh pair.
+        let agent_a = start_agent("agent-a", "host-a", &database_path, &key_path).await;
+        let agent_b = start_agent("agent-b", "host-b", &database_path, &key_path).await;
+        let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
         let key = MasterKey::load(&key_path).unwrap();
         let mut portal = Portal::open(&database_path, key, agents.clone())
             .unwrap()
@@ -158,13 +196,13 @@ async fn every_commit_failpoint_retries_to_one_visible_file() {
 
 #[tokio::test]
 async fn conflicting_idempotency_and_corrupt_replicas_fail_closed() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let database_path = workspace.path().join("portal.sqlite");
     MasterKey::create(&key_path).unwrap();
+    let agent_a = start_agent("agent-a", "host-a", &database_path, &key_path).await;
+    let agent_b = start_agent("agent-b", "host-b", &database_path, &key_path).await;
+    let agents = vec![agent_a.target.clone(), agent_b.target.clone()];
     let source = workspace.path().join("source.bin");
     let expected = write_source(&source);
 
@@ -220,12 +258,12 @@ async fn conflicting_idempotency_and_corrupt_replicas_fail_closed() {
 
 #[tokio::test]
 async fn rf2_never_commits_when_the_second_agent_rejects_writes() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let (agent_b, rejecting_task) = start_rejecting_agent("agent-b", "host-b").await;
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let database_path = workspace.path().join("portal.sqlite");
     MasterKey::create(&key_path).unwrap();
+    let agent_a = start_agent("agent-a", "host-a", &database_path, &key_path).await;
+    let (agent_b, rejecting_task) = start_rejecting_agent("agent-b", "host-b").await;
     let source = workspace.path().join("source.bin");
     write_source(&source);
 
@@ -250,14 +288,14 @@ async fn rf2_never_commits_when_the_second_agent_rejects_writes() {
 
 #[tokio::test]
 async fn empty_file_commits_as_a_manifest_without_chunks() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let database_path = workspace.path().join("portal.sqlite");
     let source = workspace.path().join("empty.bin");
     fs::write(&source, []).unwrap();
     MasterKey::create(&key_path).unwrap();
+    let agent_a = start_agent("agent-a", "host-a", &database_path, &key_path).await;
+    let agent_b = start_agent("agent-b", "host-b", &database_path, &key_path).await;
 
     let key = MasterKey::load(&key_path).unwrap();
     let mut portal = Portal::open(
@@ -274,14 +312,14 @@ async fn empty_file_commits_as_a_manifest_without_chunks() {
 
 #[tokio::test]
 async fn committed_retry_does_not_require_agents_or_source() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let database_path = workspace.path().join("portal.sqlite");
     let source = workspace.path().join("source.bin");
     write_source(&source);
     MasterKey::create(&key_path).unwrap();
+    let agent_a = start_agent("agent-a", "host-a", &database_path, &key_path).await;
+    let agent_b = start_agent("agent-b", "host-b", &database_path, &key_path).await;
 
     let mut portal = Portal::open(
         &database_path,
@@ -320,15 +358,15 @@ async fn committed_retry_does_not_require_agents_or_source() {
 
 #[tokio::test]
 async fn rf2_succeeds_when_an_earlier_extra_agent_rejects() {
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let agent_c = start_agent("agent-c", "host-c").await;
-    let (agent_a, rejecting_task) = start_rejecting_agent("agent-a", "host-a").await;
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let database_path = workspace.path().join("portal.sqlite");
     let source = workspace.path().join("source.bin");
     let expected = write_source(&source);
     MasterKey::create(&key_path).unwrap();
+    let agent_b = start_agent("agent-b", "host-b", &database_path, &key_path).await;
+    let agent_c = start_agent("agent-c", "host-c", &database_path, &key_path).await;
+    let (agent_a, rejecting_task) = start_rejecting_agent("agent-a", "host-a").await;
 
     let mut portal = Portal::open(
         &database_path,
@@ -345,8 +383,14 @@ async fn rf2_succeeds_when_an_earlier_extra_agent_rejects() {
 
 #[tokio::test]
 async fn rf2_succeeds_when_an_earlier_extra_agent_is_unavailable() {
-    let agent_b = start_agent("agent-b", "host-b").await;
-    let agent_c = start_agent("agent-c", "host-c").await;
+    let workspace = tempfile::tempdir().unwrap();
+    let key_path = workspace.path().join("master.key");
+    let database_path = workspace.path().join("portal.sqlite");
+    let source = workspace.path().join("source.bin");
+    let expected = write_source(&source);
+    MasterKey::create(&key_path).unwrap();
+    let agent_b = start_agent("agent-b", "host-b", &database_path, &key_path).await;
+    let agent_c = start_agent("agent-c", "host-c", &database_path, &key_path).await;
     let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let unavailable_address = unavailable_listener.local_addr().unwrap();
     drop(unavailable_listener);
@@ -355,12 +399,6 @@ async fn rf2_succeeds_when_an_earlier_extra_agent_is_unavailable() {
         failure_domain: "host-a".to_owned(),
         base_url: format!("http://{unavailable_address}"),
     };
-    let workspace = tempfile::tempdir().unwrap();
-    let key_path = workspace.path().join("master.key");
-    let database_path = workspace.path().join("portal.sqlite");
-    let source = workspace.path().join("source.bin");
-    let expected = write_source(&source);
-    MasterKey::create(&key_path).unwrap();
 
     let mut portal = Portal::open(
         &database_path,
@@ -376,14 +414,14 @@ async fn rf2_succeeds_when_an_earlier_extra_agent_is_unavailable() {
 
 #[tokio::test]
 async fn changed_source_on_retry_is_idempotency_conflict() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let database_path = workspace.path().join("portal.sqlite");
     let source = workspace.path().join("source.bin");
     write_source(&source);
     MasterKey::create(&key_path).unwrap();
+    let agent_a = start_agent("agent-a", "host-a", &database_path, &key_path).await;
+    let agent_b = start_agent("agent-b", "host-b", &database_path, &key_path).await;
 
     let mut portal = Portal::open(
         &database_path,
@@ -413,14 +451,14 @@ async fn changed_source_on_retry_is_idempotency_conflict() {
 
 #[tokio::test]
 async fn commit_refuses_when_confirmed_replicas_are_gone() {
-    let agent_a = start_agent("agent-a", "host-a").await;
-    let agent_b = start_agent("agent-b", "host-b").await;
     let workspace = tempfile::tempdir().unwrap();
     let key_path = workspace.path().join("master.key");
     let database_path = workspace.path().join("portal.sqlite");
     let source = workspace.path().join("source.bin");
     write_source(&source);
     MasterKey::create(&key_path).unwrap();
+    let agent_a = start_agent("agent-a", "host-a", &database_path, &key_path).await;
+    let agent_b = start_agent("agent-b", "host-b", &database_path, &key_path).await;
 
     let mut portal = Portal::open(
         &database_path,

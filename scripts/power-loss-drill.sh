@@ -8,11 +8,12 @@
 #   1. Creates two sparse images under $HOME/distr-hnsw-drill, attaches them
 #      as loop devices, stacks a dm-log-writes target on the data device,
 #      runs mkfs.<fs> on it and mounts it with default options.
-#   2. Starts one agent on the dm-backed volume (a second agent on a plain
-#      directory supplies the second failure domain RF2 requires), inits a
-#      portal DB outside the mount with its master key on the mount (mark
-#      `master-key`), uploads N files, and after every acknowledged put
-#      inserts a log mark and snapshots the agent inventory.
+#   2. Inits a portal DB outside the mount with its master key on the mount
+#      (mark `master-key`), starts one agent on the dm-backed volume (a
+#      second agent on a plain directory supplies the second failure domain
+#      RF2 requires), each with a single-use join token, joins both, uploads
+#      N files, and after every acknowledged put inserts a log mark and
+#      snapshots the agent inventory.
 #   2b. Re-PUT: restarts agent a with DISTR_HNSW_AGENT_FAILPOINT=
 #      put_after_rename, so the next PUT exits after its rename and before
 #      its directory sync, unacknowledged. Restarts agent a normally,
@@ -21,9 +22,14 @@
 #   3. kill -9 the agent, marks `end`, unmounts, removes the dm device.
 #   4. For every put mark: discards the data device, replays the log up to
 #      the mark, mounts the data device (journal recovery runs as it would
-#      after a real restart), starts a fresh agent on the replayed volume and
+#      after a real restart), starts a fresh agent on the replayed volume
+#      (it needs no token: its trust is on the volume) and
 #      checks that every inventory entry recorded at that mark answers
 #      GET /v1/objects/{kind}/{hash} with 200 (the agent re-hashes on GET).
+#      Every agent request is granted: it goes through `portal agent request`
+#      with the portal database (off the dm volume) and an off-volume copy of
+#      the master key. The join completes before the first `put-<i>` mark, so
+#      every replay that starts an agent includes its durable trust files.
 #      Then unmounts and runs the filesystem's read-only checker. The same
 #      check runs at `reput-ack`; at `master-key` the key file must match
 #      the key written by `portal init` byte for byte.
@@ -35,7 +41,7 @@
 # dhq-<fs>-<pid>; mount points live under $HOME/distr-hnsw-drill/mnt-*.
 # An EXIT trap tears everything down and the script verifies cleanup.
 #
-# Requirements: passwordless sudo, dm-log-writes module, mkfs.<fs>, jq, curl,
+# Requirements: passwordless sudo, dm-log-writes module, mkfs.<fs>, jq,
 # gcc + a shallow xfstests clone for replay-log (built automatically into
 # $HOME/distr-hnsw-drill/replay-log), and target/release/distr-hnsw built
 # with failpoints: cargo build --release -p distr-hnsw --features failpoints
@@ -78,7 +84,7 @@ log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$RUN/drill.log"
 die() { log "FATAL: $*"; exit 1; }
 
 [ -x "$BIN" ] || die "binary not found: $BIN (run: cargo build --release -p distr-hnsw)"
-for tool in "mkfs.$FS" dmsetup losetup blockdev blkdiscard jq curl gcc; do
+for tool in "mkfs.$FS" dmsetup losetup blockdev blkdiscard jq gcc; do
     command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
 # A failpoints build rejects an unknown agent failpoint by name; a build
@@ -141,10 +147,12 @@ cleanup() {
 trap cleanup EXIT
 
 # --- helpers ----------------------------------------------------------------
-wait_health() {
+# An unjoined agent answers only POST /v1/join, so its readiness is the
+# listening port; a joined agent is polled with a granted /v1/health.
+wait_port() {
     local port="$1" i
     for i in $(seq 1 100); do
-        if curl -fsS "http://127.0.0.1:$port/v1/health" >/dev/null 2>&1; then return 0; fi
+        if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then return 0; fi
         sleep 0.1
     done
     return 1
@@ -152,12 +160,47 @@ wait_health() {
 
 # Starts an agent in the background; the PID is left in $LAST_PID (not echoed,
 # so the EXIT trap's AGENT_PIDS list is updated in this shell, not a subshell).
+# An unjoined agent needs DISTR_HNSW_JOIN_TOKEN in the caller's environment
+# (see join_agent); a joined agent restarts without one.
 LAST_PID=""
 start_agent() {
     local id="$1" domain="$2" port="$3" volume="$4" logfile="$5"
     env ${AGENT_FAILPOINT:+DISTR_HNSW_AGENT_FAILPOINT=$AGENT_FAILPOINT} "$BIN" agent --id "$id" --failure-domain "$domain" --bind "127.0.0.1:$port" --insecure-loopback --volume "$volume" >"$logfile" 2>&1 &
     LAST_PID=$!
     AGENT_PIDS+=("$LAST_PID")
+}
+
+# Starts a new agent with a single-use join token (same arguments as
+# start_agent), waits for its port, and joins it. The token stays in the
+# environment, never in a file or log.
+join_agent() {
+    local id="$1" domain="$2" port="$3" token
+    token="$("$BIN" portal agent token --database "$PORTAL/portal.db" --master-key "$KEY" --agent-id "$id")" \
+        || die "portal agent token $id failed"
+    DISTR_HNSW_JOIN_TOKEN="$token" start_agent "$@"
+    wait_port "$port" || die "agent $id did not start: $(tail -3 "$5")"
+    DISTR_HNSW_JOIN_TOKEN="$token" "$BIN" portal agent join --database "$PORTAL/portal.db" --master-key "$KEY" \
+        --agent "$id,$domain,http://127.0.0.1:$port" >>"$RUN/portal-join.log" 2>&1 \
+        || die "portal agent join $id failed: $(tail -3 "$RUN/portal-join.log")"
+}
+
+# One granted request to agent a (the agent under test) listening on $1,
+# through `portal agent request`; prints only the HTTP status. The database
+# lives off the dm volume and GRANT_KEY is an off-volume copy of the master
+# key, so this also works while the drilled volume is unmounted for replays.
+agent_request() {
+    local port="$1"; shift
+    "$BIN" portal agent request --database "$PORTAL/portal.db" --master-key "$GRANT_KEY" \
+        --agent "a,host-a,http://127.0.0.1:$port" "$@" </dev/null
+}
+
+wait_health() {
+    local port="$1" i
+    for i in $(seq 1 100); do
+        if [ "$(agent_request "$port" health 2>/dev/null)" = 200 ]; then return 0; fi
+        sleep 0.1
+    done
+    return 1
 }
 
 # Print the dm table and verify it maps only onto our two loop devices.
@@ -175,13 +218,17 @@ check_dm() {
 
 # Full inventory of one agent as JSON lines: {"kind":..,"hash":..,"size":..}
 inventory() {
-    local port="$1" kind after url page
+    local port="$1" kind after code page
+    local -a cursor
     for kind in chunk manifest deletion_marker; do
         after=""
         while :; do
-            url="http://127.0.0.1:$port/v1/inventory/$kind"
-            [ -n "$after" ] && url="$url?after=$after"
-            page="$(curl -fsS "$url")" || return 1
+            cursor=()
+            [ -n "$after" ] && cursor=(--after "$after")
+            code="$(agent_request "$port" inventory --kind "$kind" "${cursor[@]}" --out "$RUN/inventory-page.json")" \
+                || return 1
+            [ "$code" = 200 ] || return 1
+            page="$(cat "$RUN/inventory-page.json")"
             printf '%s' "$page" | jq -c --arg kind "$kind" '.objects[] | {kind:$kind, hash, size}'
             after="$(printf '%s' "$page" | jq -r '.next_after // empty')"
             [ -z "$after" ] && break
@@ -243,21 +290,24 @@ PORTAL="$RUN/portal"
 mkdir -p "$VOL_A" "$VOL_B" "$PORTAL"
 PORT_A=$PORT_BASE
 PORT_B=$((PORT_BASE + 1))
-start_agent a host-a "$PORT_A" "$VOL_A" "$RUN/agent-a.log"; PID_A=$LAST_PID
-start_agent b host-b "$PORT_B" "$VOL_B" "$RUN/agent-b.log"; PID_B=$LAST_PID
-wait_health "$PORT_A" || die "agent a did not become healthy"
-wait_health "$PORT_B" || die "agent b did not become healthy"
-INCARNATION_ORIG="$(curl -fsS "http://127.0.0.1:$PORT_A/v1/health" | jq -r .incarnation_id)"
-log "agent a pid=$PID_A port=$PORT_A incarnation=$INCARNATION_ORIG; agent b pid=$PID_B port=$PORT_B"
 
 # The master key lives on the drilled volume so its durable write is tested;
-# the portal database stays off it.
+# the portal database stays off it. Init runs before the agents start: it
+# creates the grant-signing key that join tokens need.
 KEY="$MNT/portal-key/master.key"
 "$BIN" portal init --no-recovery-bundle --database "$PORTAL/portal.db" --master-key "$KEY" >"$RUN/portal-init.log" 2>&1 \
     || die "portal init failed: $(cat "$RUN/portal-init.log")"
 KEY_SHA256="$(sha256sum "$KEY" | cut -d' ' -f1)"
 KEY_SIZE="$(stat -c %s "$KEY")"
+GRANT_KEY="$PORTAL/master.key"
+install -m 600 "$KEY" "$GRANT_KEY"
 mark master-key
+
+join_agent a host-a "$PORT_A" "$VOL_A" "$RUN/agent-a.log"; PID_A=$LAST_PID
+join_agent b host-b "$PORT_B" "$VOL_B" "$RUN/agent-b.log"; PID_B=$LAST_PID
+[ "$(agent_request "$PORT_A" health --out "$RUN/health-a.json")" = 200 ] || die "agent a health failed"
+INCARNATION_ORIG="$(jq -r .incarnation_id "$RUN/health-a.json")"
+log "agent a pid=$PID_A port=$PORT_A incarnation=$INCARNATION_ORIG; agent b pid=$PID_B port=$PORT_B"
 
 # File sizes: a few KiB up to ~6 MiB (CHUNK_SIZE is 4 MiB, so >4 MiB gives 2 chunks).
 SIZES=(3072 65536 1048576 4194305 6291456 20480 5242880 6000000)
@@ -303,8 +353,8 @@ REPUT_KIND="$(basename "$(dirname "$(dirname "$(dirname "$REPUT_FILE")")")")"
 cp "$REPUT_FILE" "$RUN/reput-object.bin"
 start_agent a host-a "$PORT_RETRY" "$VOL_A" "$RUN/agent-a-retry.log"; PID_A=$LAST_PID
 wait_health "$PORT_RETRY" || die "agent a did not restart after the failpoint"
-REPUT_CODE="$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @"$RUN/reput-object.bin" \
-    "http://127.0.0.1:$PORT_RETRY/v1/objects/$REPUT_KIND/$REPUT_HASH")"
+REPUT_CODE="$(agent_request "$PORT_RETRY" put --kind "$REPUT_KIND" --hash "$REPUT_HASH" \
+    --body-file "$RUN/reput-object.bin")"
 [ "$REPUT_CODE" = 204 ] || die "re-PUT answered $REPUT_CODE, expected 204"
 REPUT_GAP_MS=$(( $(date +%s%3N) - CRASHED_AT_MS ))
 mark reput-ack
@@ -361,7 +411,9 @@ for i in $(seq 1 "$MARKS_TOTAL"); do
         start_agent a host-a "$port" "$RMNT/agent-a" "$RUN/agent-replay-$m.log"; pid=$LAST_PID
         if wait_health "$port"; then
             agent_ok=true
-            incarnation="$(curl -fsS "http://127.0.0.1:$port/v1/health" | jq -r .incarnation_id)"
+            [ "$(agent_request "$port" health --out "$RUN/health-replay-$m.json")" = 200 ] \
+                || die "replayed agent health failed at $m"
+            incarnation="$(jq -r .incarnation_id "$RUN/health-replay-$m.json")"
             # Objects the replayed agent lists that were only acknowledged
             # after this mark (informational; they were never promised).
             inventory "$port" > "$RUN/inventory-replay-$m.jsonl" || true
@@ -369,7 +421,7 @@ for i in $(seq 1 "$MARKS_TOTAL"); do
                                      <(jq -r .hash "$RUN/inventory-replay-$m.jsonl" | sort) | wc -l)"
             while IFS= read -r line; do
                 kind="$(jq -r .kind <<<"$line")"; hash="$(jq -r .hash <<<"$line")"
-                code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/v1/objects/$kind/$hash")"
+                code="$(agent_request "$port" get --kind "$kind" --hash "$hash")"
                 case "$code" in
                     200) present=$((present + 1)) ;;
                     404) missing=$((missing + 1)); missing_list="$(jq -c --arg k "$kind" --arg h "$hash" --arg c "$code" '. + [{kind:$k,hash:$h,status:$c}]' <<<"$missing_list")" ;;

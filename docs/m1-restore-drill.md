@@ -16,9 +16,11 @@ committed because they contain file identifiers and local paths.
 
 ## Procedure
 
-1. Build the release binary; start three loopback agents in three failure
-   domains; `portal init` with an operator-supplied passphrase and keep only
-   the printed recovery bundle and the passphrase outside the cluster.
+1. Build the release binary; `portal init` with an operator-supplied
+   passphrase and keep only the printed recovery bundle and the passphrase
+   outside the cluster; start three loopback agents in three failure
+   domains, each with a join token, and join them (`portal agent token`,
+   `portal agent join`; added with M2 on 2026-10-28, after the run below).
 2. Commit random files of 1 KiB to 8 MiB, deleting every eighth one after
    commit, so the backup set carries both live and superseded generations.
 3. `portal scrub`, then `portal backup` twice (the second run must copy
@@ -27,8 +29,11 @@ committed because they contain file identifiers and local paths.
    volumes. The loss timestamp starts the recovery clock.
 5. `portal key restore` from the bundle and passphrase; `portal restore
    metadata` from the newest snapshot; start three fresh agents on empty
-   volumes; `portal restore objects`; `portal recover --apply`. The clock
-   stops when recovery converges, because files are downloadable from then.
+   volumes with tokens issued from the restored database and join them
+   (each join raises the grant epoch, because the restored database already
+   knows those agent ids); `portal restore objects` with the restored
+   database and key; `portal recover --apply`. The clock stops when
+   recovery converges, because files are downloadable from then.
 6. `portal scrub --repair` to restore desired placement on every configured
    agent (restore places the two-domain floor only).
 7. Download every kept file and compare SHA-256 to the original; confirm
