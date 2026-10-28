@@ -154,6 +154,29 @@ on exit, and records that the zone was restored. Writes
 `$HOME/distr-hnsw-drill/tailnet-authz-report-<utc>.json` and exits 0 only on
 a `pass` verdict.
 
+## portal-tailnet-drill.sh
+
+Real-tailnet drill for the portal service (M2 work packages 4 to 7). Runs
+`portal serve` under sudo on this node's tailnet address with the node's
+certificate from `tailscaled`, then checks from another tailnet node that
+the certificate validates against that node's trust store, plaintext gets
+no HTTP answer, WhoIs names the remote whatever identity headers it sends,
+its user cannot sign in until added, the session cookie carries every
+attribute, writes without the CSRF token or from another origin fail, and
+an API key is held to its scope.
+
+```sh
+REMOTE=user@other-node OPEN_FIREWALL=1 scripts/portal-tailnet-drill.sh
+```
+
+If this node has no cached certificate, `tailscaled` issues one: a public
+certificate whose name is recorded in Certificate Transparency logs
+([docs/deployment.md](../docs/deployment.md)). The drill changes no tailnet
+setting. `OPEN_FIREWALL=1` opens the drill port (default 47320) on
+`tailscale0` for at most 300 s. Writes
+`$HOME/distr-hnsw-drill/portal-tailnet-report-<utc>.json` and exits 0 only
+on a `pass` verdict.
+
 ## minio-test.sh
 
 Runs the S3 backup target tests against a throwaway MinIO
