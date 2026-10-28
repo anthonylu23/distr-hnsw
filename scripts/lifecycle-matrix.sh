@@ -168,6 +168,9 @@ done < <(awk 'NR % 4 == 0' "$MANIFEST")
 USED_BEFORE=$(du -sb "$WORK/agent-1/objects" "$WORK/agent-2/objects" "$WORK/agent-4/objects" | awk '{s+=$1} END {print s}')
 timed gc-blocked portal gc --apply --retention-seconds 0 --staging-grace-seconds 0 >"$WORK/gc-0.json" || true
 GC_BLOCKED_BEFORE_SCAN="$(jq '.totals.blocked' "$WORK/gc-0.json")"
+# GC accepts only a scan that completes in a later whole second than the
+# deletions; on a small corpus the scan could otherwise finish within it.
+sleep 1.1
 portal scrub >"$WORK/scrub-4.json" || true
 timed gc-plan portal gc --retention-seconds 0 --staging-grace-seconds 0 >"$WORK/gc-1.json" || true
 timed gc-apply portal gc --apply --retention-seconds 0 --staging-grace-seconds 0 >"$WORK/gc-2.json" || true

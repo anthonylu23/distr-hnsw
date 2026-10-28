@@ -119,11 +119,9 @@ scripts/lifecycle-matrix.sh --files 160 --max-mib 24 --flip 24
 scripts/lifecycle-matrix.sh --files 32 --max-mib 4 --flip 12    # quick check
 ```
 
-GC compares whole-second timestamps. On a very small corpus (for example
-8 files of 1 MiB) the replacement scrub and the deletions can land in the
-same second, GC then counts that scrub as an observation after the
-deletions, and the "blocked before a new observation" check fails. The
-pre-M2 binary behaves the same; use the quick-check size or larger.
+GC timestamps are whole seconds, so GC counts a scan as an observation
+after a deletion only if it completes in a later second; the matrix waits
+a second after its deletions before that scan, so any corpus size works.
 
 ## enospc-drill.sh
 

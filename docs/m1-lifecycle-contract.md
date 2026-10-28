@@ -37,7 +37,10 @@ about absence.
 Deletion observation is generation-based. A node has observed a file deletion
 only when a complete scan from the same active incarnation finishes after the
 deletion marker was committed and the scan contains no object that would make
-an older live generation authoritative. Long-absent nodes block collection
+an older live generation authoritative. Timestamps are whole seconds, so a
+scan counts only if it completes in a later second than the deletion; until
+2026-10-28 GC also accepted a scan completed in the same second, which could
+precede the deletion. Long-absent nodes block collection
 until they return and are reconciled or are formally retired.
 
 Retirement is an explicit durable portal transition. A retired incarnation

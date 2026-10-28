@@ -156,6 +156,7 @@ impl Cluster {
     }
 
     async fn scrub(&self) {
+        next_second().await;
         let report = scrub(
             &mut self.database(),
             &self.targets(),
@@ -676,4 +677,17 @@ async fn recovery_ready_follows_the_recorded_restore_drill() {
         );
     }
     assert!(backup::record_restore_drill(&mut database, "{\"report_type\":\"Other\"}").is_err());
+}
+
+/// GC accepts only scans that complete in a later whole second than the
+/// deletion they must observe, so a scan starts in the next second.
+async fn next_second() {
+    let into = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_millis();
+    tokio::time::sleep(std::time::Duration::from_millis(
+        u64::from(1_000 - into) + 10,
+    ))
+    .await;
 }

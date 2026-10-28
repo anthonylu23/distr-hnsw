@@ -672,11 +672,15 @@ fn evaluate(
             ));
         }
     }
+    // Timestamps are whole seconds: a scan that completed in the same
+    // second as the deletion may have finished before it, so only a later
+    // second proves an observation after the deletion (lifecycle contract,
+    // "Node identity and observation").
     let scans_after_threshold = database
         .latest_complete_scans()?
         .into_iter()
         .filter(|scan| scan.kind == kind)
-        .all(|scan| scan.completed_at >= threshold);
+        .all(|scan| scan.completed_at > threshold);
     if !scans_after_threshold {
         blockers.push(format!(
             "a complete {kind} observation predates the deletion or expiry at {threshold}"

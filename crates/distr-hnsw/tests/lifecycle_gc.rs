@@ -156,6 +156,7 @@ impl Cluster {
     }
 
     async fn scrub(&self) {
+        next_second().await;
         let mut database = self.database();
         let report = scrub(
             &mut database,
@@ -764,4 +765,17 @@ async fn expired_staging_uploads_become_candidates_only_after_the_grace_period()
     for index in 0..3 {
         assert!(!cluster.holds(index, ObjectKind::Chunk, &hash));
     }
+}
+
+/// GC accepts only scans that complete in a later whole second than the
+/// deletion they must observe, so a scan starts in the next second.
+async fn next_second() {
+    let into = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_millis();
+    tokio::time::sleep(std::time::Duration::from_millis(
+        u64::from(1_000 - into) + 10,
+    ))
+    .await;
 }
