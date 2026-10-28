@@ -130,3 +130,31 @@ manifest under `docs/bench/`.
 cargo run --release -p distr-hnsw-bench -- verify ~/distr-hnsw-bench/datasets/sift-128-euclidean
 cargo run --release -p distr-hnsw-bench -- oracle ~/distr-hnsw-bench/datasets/sift-128-euclidean --k 10
 ```
+
+## bench/build-project-set.py
+
+Builds `project-nomic-512`, the only bench set at the product's dimension:
+text chunks embedded with the locked phase-0 model and recipe
+(`nomic-embed-text` through Ollama, `search_document: ` / `search_query: `
+prefixes, truncated from 768 to 512 dimensions and L2-normalized). Sources,
+in stream order: the phase-0 mixed corpus (text files; PDFs skipped), then
+Wikipedia `20231101.en` parquet shards pinned to a Hugging Face revision.
+Chunking is an exact port of the phase-0 chunker (2,000 characters, 200
+overlap). Every 100th chunk becomes a query (its first 256 characters);
+the rest fill the base. The script declares its dependencies for `uv`.
+Embedding runs on the GPU (about 88 chunks/s on the RTX 3060 Ti) and
+resumes where it stopped; it refuses to continue if the Ollama model
+digest changes.
+
+```sh
+REV=b04c8d1ceb2f5cd4588862100d08de323dccfbaa   # wikimedia/wikipedia revision
+WORK=~/distr-hnsw-bench/work/project-nomic-512
+scripts/bench/build-project-set.py prepare --corpus ~/distr-hnsw-proto/corpora/mixed-v4-20260719 \
+  --wikipedia ~/distr-hnsw-bench/downloads/wikipedia-20231101.en --wikipedia-revision $REV --work $WORK
+scripts/bench/build-project-set.py embed --work $WORK --limit 200000   # later: no --limit
+scripts/bench/build-project-set.py finalize --work $WORK --base-count 200000 \
+  --name project-nomic-512-200k --out ~/distr-hnsw-bench/datasets/project-nomic-512-200k
+```
+
+The work directory holds private corpus text and stays on the bench host;
+commit only the manifest under `docs/bench/`.
