@@ -154,7 +154,7 @@ fn write_le<T: Copy, const N: usize>(
 ) -> io::Result<()> {
     let mut block = [0_u8; 4096];
     for chunk in values.chunks(block.len() / N) {
-        for (bytes, value) in block.chunks_exact_mut(N).zip(chunk) {
+        for (bytes, value) in block.as_chunks_mut::<N>().0.iter_mut().zip(chunk) {
             bytes.copy_from_slice(&to_le(*value));
         }
         out.write_all(&block[..chunk.len() * N])?;
@@ -666,13 +666,17 @@ pub fn load(path: &Path, expected_partition: Uuid) -> Result<LoadedSnapshot, Sna
     let level0_len = c.take(slot_count, "level0 lengths")?.to_vec();
     let level0: Vec<Slot> = c
         .take(slot_count * params.m0 * 4, "level0 links")?
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().expect("4")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect();
     let tombstones: Vec<u64> = c
         .take(slot_count.div_ceil(64) * 8, "tombstone words")?
-        .chunks_exact(8)
-        .map(|b| u64::from_le_bytes(b.try_into().expect("8")))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| u64::from_le_bytes(*b))
         .collect();
     let mut upper = Vec::with_capacity(slot_count);
     let mut upper_len = Vec::with_capacity(slot_count);
@@ -686,8 +690,10 @@ pub fn load(path: &Path, expected_partition: Uuid) -> Result<LoadedSnapshot, Sna
         let lens = c.take(level, "upper lengths")?.to_vec();
         let links: Vec<Slot> = c
             .take(level * params.m * 4, "upper links")?
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes(b.try_into().expect("4")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
             .collect();
         upper.push(links);
         upper_len.push(lens);

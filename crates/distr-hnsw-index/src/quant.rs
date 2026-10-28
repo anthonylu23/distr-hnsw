@@ -54,11 +54,10 @@ pub fn quantize(vector: &[f32]) -> QuantizedQuery {
 #[inline]
 pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     debug_assert_eq!(a.len(), b.len());
-    let chunks = a.len() / LANES * LANES;
+    let (head_a, tail_a) = a.as_chunks::<LANES>();
+    let (head_b, tail_b) = b.as_chunks::<LANES>();
     let mut acc = [0_i32; LANES];
-    let (head_a, tail_a) = a.split_at(chunks);
-    let (head_b, tail_b) = b.split_at(chunks);
-    for (x, y) in head_a.chunks_exact(LANES).zip(head_b.chunks_exact(LANES)) {
+    for (x, y) in head_a.iter().zip(head_b) {
         for lane in 0..LANES {
             acc[lane] += i32::from(x[lane]) * i32::from(y[lane]);
         }

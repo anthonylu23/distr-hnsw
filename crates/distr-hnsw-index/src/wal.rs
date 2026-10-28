@@ -112,8 +112,10 @@ impl Entry {
                 }
                 let raw = reader.take(dims * 4)?;
                 let vector = raw
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().expect("4 bytes")))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 Operation::Upsert {
                     key,

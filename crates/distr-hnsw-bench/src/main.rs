@@ -248,8 +248,10 @@ fn verify_file(dir: &Path, name: &str, entry: &FileEntry) -> anyhow::Result<Vec<
 
 fn f32le(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("4 bytes")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }
 
@@ -272,8 +274,10 @@ fn load(dir: &Path) -> anyhow::Result<Dataset> {
     let groundtruth: Vec<Vec<RecordId>> = truth
         .chunks_exact(4 * manifest.groundtruth_k)
         .map(|row| {
-            row.chunks_exact(4)
-                .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("4 bytes")) as RecordId)
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| i32::from_le_bytes(*chunk) as RecordId)
                 .collect()
         })
         .collect();

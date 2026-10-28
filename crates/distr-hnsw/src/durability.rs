@@ -184,7 +184,7 @@ impl DurableStore {
             sync_directory(parent)?;
         }
         self.used_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 Some(used.saturating_sub(size))
             })
             .ok();
@@ -300,7 +300,7 @@ impl DurableStore {
             let _ = fs::remove_file(&temporary);
         } else {
             self.used_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                     Some(used.saturating_sub(replaced_bytes) + bytes.len() as u64)
                 })
                 .ok();

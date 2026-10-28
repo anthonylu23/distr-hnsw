@@ -21,11 +21,10 @@ pub fn distance(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    let chunks = a.len() / LANES * LANES;
+    let (head_a, tail_a) = a.as_chunks::<LANES>();
+    let (head_b, tail_b) = b.as_chunks::<LANES>();
     let mut acc = [0.0_f32; LANES];
-    let (head_a, tail_a) = a.split_at(chunks);
-    let (head_b, tail_b) = b.split_at(chunks);
-    for (x, y) in head_a.chunks_exact(LANES).zip(head_b.chunks_exact(LANES)) {
+    for (x, y) in head_a.iter().zip(head_b) {
         for lane in 0..LANES {
             acc[lane] += x[lane] * y[lane];
         }
@@ -40,11 +39,10 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    let chunks = a.len() / LANES * LANES;
+    let (head_a, tail_a) = a.as_chunks::<LANES>();
+    let (head_b, tail_b) = b.as_chunks::<LANES>();
     let mut acc = [0.0_f32; LANES];
-    let (head_a, tail_a) = a.split_at(chunks);
-    let (head_b, tail_b) = b.split_at(chunks);
-    for (x, y) in head_a.chunks_exact(LANES).zip(head_b.chunks_exact(LANES)) {
+    for (x, y) in head_a.iter().zip(head_b) {
         for lane in 0..LANES {
             let d = x[lane] - y[lane];
             acc[lane] += d * d;

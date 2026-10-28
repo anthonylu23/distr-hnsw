@@ -24,7 +24,8 @@ indexed by meaning with distributed HNSW vector search.
 
 ## Build and test
 
-Requires a recent stable Rust toolchain and a C compiler (for `aws-lc-sys`).
+Requires rustup and a C compiler (for `aws-lc-sys`). The Rust version is
+pinned in `rust-toolchain.toml`, which rustup installs on first use.
 
 ```sh
 cargo build --workspace

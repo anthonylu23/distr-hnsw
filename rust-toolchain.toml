@@ -1,0 +1,7 @@
+# Pinned so CI and local builds run the same rustc and clippy; `-D warnings`
+# would otherwise fail on lints added by a new stable release. Upgrade
+# deliberately: bump the version and fix any new lints in the same commit.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

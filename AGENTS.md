@@ -53,7 +53,9 @@ hardening pass (`docs/hardening-2026-10.md`) closed on 2026-10-28. M2
 - `docs/test-hosts.md` — the hosts that produced the evidence, by role; public
   docs name hosts by role, not hostname.
 - `.github/workflows/ci.yml` — CI: fmt, clippy (also with `failpoints`), and
-  the workspace tests; actions are pinned to commit SHAs.
+  the workspace tests; actions are pinned to commit SHAs. The Rust version
+  is pinned in `rust-toolchain.toml`; upgrade it deliberately and fix new
+  lints in the same commit.
 - `docs/roadmap.md` — gated milestones, acceptance criteria, and verification.
 - `docs/next-steps.md` — the immediate work queue.
 - `docs/hardening-2026-10.md` — the audit that reopened M1 and M3, and its

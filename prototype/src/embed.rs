@@ -212,8 +212,8 @@ pub fn bytes_to_f32s(bytes: &[u8]) -> Result<Vec<f32>> {
         bail!("embedding blob length {} not multiple of 4", bytes.len());
     }
     let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    for chunk in bytes.as_chunks::<4>().0 {
+        out.push(f32::from_le_bytes(*chunk));
     }
     Ok(out)
 }
