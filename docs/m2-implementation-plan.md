@@ -110,6 +110,14 @@ in what order, and how each criterion will be proven.
   to serve on it, because its routes are still unauthenticated. Tests:
   `tests/tailscale_localapi.rs` (fake LocalAPI). Every drill and process
   test passes `--insecure-loopback`.
+- **Work package 2 — started.** `crates/distr-hnsw/src/grant.rs` defines
+  grant v1 and key-set v1: canonical binary encodings with domain
+  separation, Ed25519 signatures, and verification that names each
+  rejection (unknown key, bad signature, stale or newer epoch, wrong agent,
+  operation, or object, delete without a GC proof, expired, not yet valid,
+  over-long lifetime). Key sets carry signatures from every key a rotation
+  needs, so agents that know only the old key accept the new set. Not yet
+  wired into agents or the portal.
 
 ## Work packages
 
