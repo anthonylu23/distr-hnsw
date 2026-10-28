@@ -73,18 +73,21 @@ Reading:
   exact oracle at the same recall band.
 
 Defaults (contract §8): `M = 16` for L2 and dot, `M = 32` for cosine;
-`ef_search` 100 for L2/dot and 400 for cosine, per-query overridable, in
-`HnswParams::for_metric` and `hnsw::default_ef_search`. **Open decision:**
-the cosine default of 400 misses 0.97 on glove (0.966). Raising it to 500
-clears both angular sets (0.979 and 0.974) at about 25% more latency
-(nytimes int8 p50 2.00 → 2.46 ms, glove 1.63 → 2.04 ms).
+`ef_search` 100 for L2/dot and 500 for cosine, per-query overridable, in
+`HnswParams::for_metric` and `hnsw::default_ef_search`. The cosine default
+was raised from 400 on 2026-10-27 because 400 misses 0.97 on glove (0.966);
+500 clears both angular sets (0.979 and 0.974) at about 25% more latency
+(nytimes int8 p50 2.00 → 2.46 ms, glove 1.63 → 2.04 ms). The persistence
+and compaction rows below ran at ef = 400, the default at the time.
 
-**Open decision: build throughput.** The plan requires ≥ 5k vectors/s for
-a 1M × 512 parallel build with 16 threads. At M = 32, the parallel build
-reaches 3,182 vectors/s at 100 dims and 1,725 at 256 dims, so 512 dims will
-fall well short. Either the threshold is revised with a documented reason,
-or the shortfall is accepted as a recorded limitation. The 512-dim figure
-itself waits on `project-nomic-512`.
+**Build throughput.** The plan's 1M × 512 threshold assumed M = 16 and
+required ≥ 5k vectors/s. At M = 32 the parallel build reaches 3,182
+vectors/s at 100 dims and 1,725 at 256 dims. On 2026-10-27, before any
+512-dim run, the threshold was revised to ≥ 560 vectors/s required (1M in
+30 minutes) and ≥ 3.3k targeted, because recovery never rebuilds and
+compaction rebuilds off the write path
+([m3-implementation-plan.md](../m3-implementation-plan.md)). The 512-dim
+figure waits on `project-nomic-512`.
 
 ## Int8 traversal with exact rescoring
 

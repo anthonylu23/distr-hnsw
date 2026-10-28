@@ -121,7 +121,8 @@ blob-plane slice in `docs/roadmap.md`.
 `docs/hardening-2026-10.md` found GC, retirement, backup, and recovery
 defects; the fixes are covered by `tests/hardening.rs`, and the drills
 passed again from the clean revision `dc276f3` on 2026-10-27. Re-acceptance
-is the owner's decision.
+follows a power-loss drill re-run (`scripts/power-loss-drill.sh`, sudo,
+run by the owner).
 The blob plane (`crates/distr-hnsw/`) provides the RF2 commit spine, logical
 deletion, recovery, incarnations and observations, scrub/repair, drain,
 retire, capacity admission, proof-based GC, master-key recovery bundles, and
@@ -141,8 +142,10 @@ honor. Large matrices and drills run on
 on 2026-10-01; the 2026-10-25 audit withdrew it (WAL length-field corruption
 read as a torn tail, unreachable inserts after mass deletion, benchmark
 reports without a source revision). The fixes are in, and every bench was
-re-run with `--canonical` on 2026-10-27; acceptance waits on owner
-decisions (cosine default ef, the 1M × 512 build-throughput threshold).
+re-run with `--canonical` on 2026-10-27. On the same day the cosine default
+`ef_search` became 500 and the 1M × 512 build threshold was revised
+(`docs/m3-implementation-plan.md`); acceptance waits on the
+`project-nomic-512` runs.
 The engine (`crates/distr-hnsw-index`)
 provides flat and int8 vectors, HNSW, filtered search with a measured
 cutover, WAL and snapshots, two-phase compaction, and RAM budget admission;

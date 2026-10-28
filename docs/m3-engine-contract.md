@@ -293,17 +293,17 @@ exist (§11).
 | `M` | 16 for `l2` and `dot`, 32 for `cosine` | max neighbours per node on upper levels; set from the pass 3 measurements (`docs/bench/README.md`) |
 | `M0` | `2 · M` | max neighbours on level 0 |
 | `ef_construction` | 200 | candidate list during insert |
-| `ef_search` | 100 for `l2` and `dot`, 400 for `cosine` | per query, at least `k`; per-collection default (`PartitionConfig::ef_search`), per-query override |
+| `ef_search` | 100 for `l2` and `dot`, 500 for `cosine` | per query, at least `k`; per-collection default (`PartitionConfig::ef_search`), per-query override |
 | level multiplier | `1 / ln(M)` | levels drawn from a geometric distribution |
 | level RNG | splitmix64 over `(seed, slot)` | `seed` is configured; `PartitionConfig::for_metric` derives it from the partition id. Deterministic levels, so the same log yields the same levels on every replica and in tests |
 
 The defaults live in code, in one place: `HnswParams::for_metric`,
 `hnsw::default_ef_search`, and `PartitionConfig::for_metric`, which the
 portal should use to create collections. `HnswParams::default()` is the
-`l2`/`dot` row. The cosine `ef_search` of 400 clears 0.97 recall on nytimes
-(0.974) but not on glove (0.966; 0.974 at 500, 0.985 at 800), so the default
-is a recorded open decision for the owner (raise it, or accept glove as the
-hard case), not a met threshold.
+`l2`/`dot` row. The cosine `ef_search` was raised from 400 to 500 on
+2026-10-27: 400 cleared 0.97 recall on nytimes (0.974) but not on glove
+(0.966), while 500 clears both (0.979 and 0.974) for about 25% more query
+latency.
 | neighbour selection | heuristic (HNSW Algorithm 4) with pruned-candidate backfill | |
 | entry point | the slot with the highest level; updated on insert | |
 

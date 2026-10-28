@@ -74,19 +74,23 @@ benchmark reports carry no usable source revision, that p95 latency is not
 published, and that the 1M × 512 build-throughput threshold is likely to be
 missed at M=32 without a recorded decision). The first two are fixed: every
 figure was re-run with `--canonical` on 2026-10-27 and p95 is published.
-The third waits on an owner decision (3,182 vectors/s at 100 dims and 1,725
-at 256 dims with M = 32, against ≥ 5k required). The original review is in
+The third was decided on 2026-10-27, before any 512-dim run: the threshold
+assumed M = 16, and because recovery never rebuilds and compaction rebuilds
+off the write path, it is now ≥ 560 vectors/s required (1M × 512 in 30
+minutes) and ≥ 3.3k targeted. At M = 32 the build measured 3,182 vectors/s
+at 100 dims and 1,725 at 256 dims. The original review is in
 [m3-implementation-plan.md](m3-implementation-plan.md). Every acceptance
 criterion below carries evidence from the engine test suite
 (`crates/distr-hnsw-index`), the blob-plane archive test
 (`crates/distr-hnsw/tests/index_archive.rs`), and the published benchmark
 reports ([bench/README.md](bench/README.md)) on the three pinned public
-datasets. One limitation is proposed for acceptance rather than treated as a
-blocker: the "representative project data" half of the recall criterion and
-the 1M × 512 recovery and memory measurements wait on the
-`project-nomic-512` dataset, whose embedding run needs the shared GPU. The
-thresholds and the measurement commands are fixed, so that run adds evidence
-without changing code. Formal acceptance is the owner's call.
+datasets. The "representative project data" half of the recall criterion
+and the 1M × 512 latency, build, recovery, and memory measurements wait on
+the `project-nomic-512` dataset. The 2026-10-01 review proposed accepting
+that gap as a limitation because the GPU was busy; the GPU is now free, so
+M3 is accepted only after that run instead (decided 2026-10-27). The
+thresholds and the measurement commands are fixed, so the run adds evidence
+without changing code.
 
 ## How milestones are governed
 
@@ -443,7 +447,7 @@ quality, and resource model before adding replication and distributed routing.
   Reopened 2026-10-25: inserts made after mass deletion were unreachable because construction never routed through tombstones (H6), and a parallel-build race could leave a live record without in-links. Both fixed with tests (delete-all then upsert; 99% tombstoned; every node has an in-link).
 - [x] Unfiltered and filtered recall meet documented thresholds against brute
   force on fixed public datasets and representative project data.
-  Evidence (canonical, `dc276f3`, 2026-10-27): sift 0.987 at M = 16 / ef = 100, nytimes 0.974 at M = 32 / ef = 400, and glove 0.974 at M = 32 / ef = 500 and 0.985 at ef = 800 ([bench/README.md](bench/README.md)); filtered recall 0.983 to 1.000 from 0.1% to 50% selectivity on both routes. Open decision: the cosine default ef = 400 gives glove 0.966, below the 0.97 target; ef = 500 clears both angular sets at about 25% more latency. The defaults live in code (`HnswParams::for_metric`). Proposed limitation: the project dataset (`project-nomic-512`) is pending the shared GPU; thresholds are fixed in the plan.
+  Evidence (canonical, `dc276f3`, 2026-10-27): sift 0.987 at M = 16 / ef = 100; at the cosine default M = 32 / ef = 500, nytimes 0.979 and glove 0.974 (0.990 and 0.985 at ef = 800) ([bench/README.md](bench/README.md)); filtered recall 0.983 to 1.000 from 0.1% to 50% selectivity on both routes. The cosine default ef was raised from 400 to 500 on 2026-10-27, because 400 gives glove 0.966, below the 0.97 target, and 500 clears both angular sets (0.979 and 0.974) for about 25% more latency. The defaults live in code (`HnswParams::for_metric`, `default_ef_search`). Open: the representative half of this criterion needs `project-nomic-512`; thresholds are fixed in the plan.
 - [x] Int8 retrieval plus exact rescoring meets its documented recall/latency
   budget and never returns a score computed from the wrong vector/version.
   Evidence: int8 recall within 0.0014 of f32 on every set at about twice the throughput; rescoring reads the f32 original of the current slot only, and upsert tombstones the old slot before the new one is searchable (contract §3, §7).

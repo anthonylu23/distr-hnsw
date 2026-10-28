@@ -54,10 +54,10 @@ impl HnswParams {
 }
 
 /// Measured per-metric `ef_search` default (contract §8): 100 for `l2` and
-/// `dot`, 400 for `cosine`.
+/// `dot`, 500 for `cosine`.
 pub const fn default_ef_search(metric: Metric) -> usize {
     match metric {
-        Metric::Cosine => 400,
+        Metric::Cosine => 500,
         Metric::Dot | Metric::L2 => 100,
     }
 }

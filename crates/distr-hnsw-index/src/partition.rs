@@ -2199,7 +2199,7 @@ mod tests {
     fn per_metric_defaults_come_from_one_place() {
         let id = Uuid::new_v4();
         let cosine = PartitionConfig::for_metric(id, 8, Metric::Cosine);
-        assert_eq!((cosine.m, cosine.m0, cosine.ef_search()), (32, 64, 400));
+        assert_eq!((cosine.m, cosine.m0, cosine.ef_search()), (32, 64, 500));
         let l2 = PartitionConfig::for_metric(id, 8, Metric::L2);
         assert_eq!((l2.m, l2.m0, l2.ef_search()), (16, 32, 100));
         assert_eq!(HnswParams::default(), HnswParams::for_metric(Metric::Dot));

@@ -28,15 +28,23 @@ tracks only the immediate work queue.
    - every M3 bench with `--canonical` on all three pinned sets, with p95.
      nytimes persistence and compaction came from `835f055`, after a bench
      fix for zero-norm rows ([bench/README.md](bench/README.md)).
-3. Optional: `scripts/power-loss-drill.sh` (sudo, run by the owner) for the
-   changed durable-write paths (re-PUT directory sync, master key write).
-4. Owner decisions:
-   - the cosine default ef: 400 gives glove 0.966, below 0.97; 500 clears
-     both angular sets at about 25% more latency;
-   - the 1M × 512 build-throughput threshold (≥ 5k vectors/s required;
-     3,182 at 100 dims and 1,725 at 256 dims with M = 32);
-   - re-accepting M1 and accepting M3. `project-nomic-512` still waits on
-     the GPU and remains a recorded M3 limitation.
+3. Decided 2026-10-27:
+   - the cosine default `ef_search` is 500 (400 gave glove 0.966, below
+     0.97; 500 clears both angular sets for about 25% more latency);
+   - the 1M × 512 build-throughput threshold is ≥ 560 vectors/s required
+     (1M in 30 minutes) and ≥ 3.3k targeted, because recovery never rebuilds
+     and compaction rebuilds off the write path
+     ([m3-implementation-plan.md](m3-implementation-plan.md));
+   - the license copyright line stays "The distr-hnsw authors";
+   - the personal vault fixture leaves the tree without a history rewrite;
+     the repository is already public, so a rewrite would not withdraw it.
+4. To re-accept M1: `scripts/power-loss-drill.sh` (sudo, run by the owner)
+   on btrfs, ext4, and XFS for the changed durable-write paths (re-PUT
+   directory sync), then the acceptance review.
+5. To accept M3: build `project-nomic-512` (200k, then 1M) now that the GPU
+   is free, and run `oracle`, `hnsw`, `filtered`, `persist`, and `compact`
+   on it with `--canonical`. This supplies the representative recall row
+   and the 1M × 512 latency, build, recovery, and memory figures.
 
 ## After hardening
 
@@ -53,10 +61,9 @@ tracks only the immediate work queue.
    - The engine needs a concurrency model for searches during compaction
      finish and snapshot writes.
    - Snapshot cadence, compaction scheduling, and WAL group commit.
-3. **Open-source hygiene.** Remove the personal vault fixture from the tree
-   (history rewrite is the owner's call). Replace host and user names in
-   public docs with roles. Add CI running fmt, clippy, and the non-sudo
-   tests.
+3. **Open-source hygiene.** Replace host and user names in public docs and
+   scripts with roles and environment variables. Add CI running fmt,
+   clippy, and the non-sudo tests.
 
 ## Ops notes
 

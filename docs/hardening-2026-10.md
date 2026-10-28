@@ -101,7 +101,7 @@ ignore. Details are in [m3-engine-contract.md](m3-engine-contract.md).
 | Parallel-build race | A node writing its own neighbor list overwrote back-links other threads had added, which could strand a live record after bulk load or compaction (a test failed about half the time on unmodified `HEAD`). Links now merge, and a final pass gives every node an in-link. | Done (required) |
 | Bulk-load base | `partition.json` records `base_snapshot` before the load. Opening without a verifiable base fails with `BaseSnapshotUnavailable`. | Done (required) |
 | Input validation | Non-finite queries rejected on every metric; `k` ≤ 10,000, `ef` ≤ 100,000; `Hnsw::search_with` panics on a wrong-length query; `PartitionConfig::validate()` at create and open; snapshots cross-checked against `partition.json` on load. | Done |
-| Per-metric defaults | One source in code: `HnswParams::for_metric`, `default_ef_search`, and `PartitionConfig::for_metric` (which derives the level seed from the partition id). Per-collection `ef_search` through `search_default`. | Done; cosine ef decision open |
+| Per-metric defaults | One source in code: `HnswParams::for_metric`, `default_ef_search`, and `PartitionConfig::for_metric` (which derives the level seed from the partition id). Per-collection `ef_search` through `search_default`. | Done; cosine `ef_search` raised to 500 on 2026-10-27 |
 | Archive and restore | Exclusive directory lock; archive verifies without repairing (`Partition::inspect`) and archives the snapshot last; an unchanged part must still be visible; restore stages in a sibling directory and renames only after a full recovery succeeds there. | Done |
 | Concurrent compaction | A short capture step, then a rebuild that owns its input, so writers continue during the rebuild; multithreaded test; the bench writes during the rebuild. | Done (required) |
 | RAM accounting | Each snapshot serves the f32 originals from the file just written; resident bytes match before and after reopen. One hot-set formula (contract §11). | Done |
@@ -125,21 +125,22 @@ Engine items deferred, each recorded in the contract:
 | Item | Status |
 |---|---|
 | Re-run `scripts/restore-drill.sh` (directory and MinIO) and `scripts/lifecycle-matrix.sh` from a clean committed revision; add GC-then-retire and GC-after-restore orders to the matrix | Done 2026-10-27 from `dc276f3`. Restore drill passed on both targets (56/56 verified, 0 resurrected, recovery 3.9 s and 3.75 s), and both reports were recorded with `portal drill record` (`recovery_ready` true; false for a target the deployment does not use). The matrix passed, including retire after GC and stale-restore GC (0 collected, acknowledged file intact). `scripts/minio-test.sh` passed 3/3. See [m1-restore-drill.md](m1-restore-drill.md) and [m1-lifecycle-matrix.md](m1-lifecycle-matrix.md). |
-| Re-run `scripts/power-loss-drill.sh` (needs sudo) for the changed durable-write paths (re-PUT directory sync, master key write) | Recommended |
-| Re-run the M3 benches from a clean revision; publish p95; decide the 1M × 512 build-throughput threshold openly | Re-run done 2026-10-27 with `--canonical` from `dc276f3` (nytimes persistence and compaction from `835f055`). p95 is published next to p50 ([bench/README.md](bench/README.md)). The build-throughput threshold and the cosine default ef wait on owner decisions. |
+| Re-run `scripts/power-loss-drill.sh` (needs sudo) for the changed durable-write paths (re-PUT directory sync, master key write) | Open; required before M1 re-acceptance (decided 2026-10-27) |
+| Re-run the M3 benches from a clean revision; publish p95; decide the 1M × 512 build-throughput threshold openly | Re-run done 2026-10-27 with `--canonical` from `dc276f3` (nytimes persistence and compaction from `835f055`). p95 is published next to p50 ([bench/README.md](bench/README.md)). Decided 2026-10-27: the cosine default ef is 500, and the build-throughput threshold is ≥ 560 vectors/s required, ≥ 3.3k targeted ([m3-implementation-plan.md](m3-implementation-plan.md)). |
 | Drill reports record `git describe --dirty` (restore, lifecycle, ENOSPC, power loss) | Done |
 | Roadmap, next steps, AGENTS, contracts, and DESIGN (v2.2) brought in line with the code | Done |
 | Architecture overview and deployment guide | Done ([architecture.md](architecture.md), [deployment.md](deployment.md)) |
-| Root README, license texts, security policy, repository metadata | Done (copyright line reads "The distr-hnsw authors"; owner to confirm) |
+| Root README, license texts, security policy, repository metadata | Done (copyright line "The distr-hnsw authors", kept on 2026-10-27) |
 | Persistence and compaction benches on nytimes | Fixed in `835f055`. Both benches re-upserted and queried the first 1,000 rows, but nytimes holds 239 zero-norm base rows and 9 zero-norm queries, which the public cosine API rejects (contract §2), so the WAL tail failed and compaction panicked. They now use the first admissible rows and queries and record `queries_evaluated`. These runs had never covered nytimes before. |
 | CI running fmt, clippy, and the non-sudo tests | Open |
 
 ## Open-source hygiene (owner decisions)
 
-- `prototype/testdata/anthonypc-vault-queries.json` lists personal
-  knowledge-base filenames and queries. It must leave the tree before the
-  repository is published. Removing it from history needs a history rewrite,
-  which only the owner can approve.
+- `prototype/testdata/anthonypc-vault-queries.json` listed personal
+  knowledge-base filenames and queries. It left the tree on 2026-10-27. Its
+  history was not rewritten: the repository is already public, the file
+  holds note titles rather than note contents, and a rewrite would not
+  withdraw copies already fetched.
 - Host and user names (`anthonypc`, `anthonylu@…`, home paths) appear in
   tracked docs and scripts. Replace them with roles and environment variables
   before publishing.
