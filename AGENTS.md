@@ -2,9 +2,10 @@
 
 Self-hosted, Tailscale-native distributed semantic storage service: replicated
 encrypted blobs plus distributed HNSW vector search. Product design lives in
-`DESIGN.md`. M0 is accepted. M1 (blob plane, `crates/distr-hnsw/`) is
-reopened and M3 (vector engine, `crates/distr-hnsw-index/`) is in progress
-while the October 2026 hardening pass (`docs/hardening-2026-10.md`) lands.
+`DESIGN.md`. M0 and M1 (blob plane, `crates/distr-hnsw/`) are accepted.
+M3 (vector engine, `crates/distr-hnsw-index/`) is in progress until the
+`project-nomic-512` runs that close the October 2026 hardening pass
+(`docs/hardening-2026-10.md`).
 
 
 ## Stack
@@ -117,13 +118,14 @@ DESIGN §15 (`docs/phase-0-validation.md`). Do not retune the holdout or grow th
 prototype into product code. M1 is unblocked and starts with the recovery-first
 blob-plane slice in `docs/roadmap.md`.
 
-**M1 status:** Reopened 2026-10-25 (accepted 2026-09-30). The audit in
-`docs/hardening-2026-10.md` found GC, retirement, backup, and recovery
-defects; the fixes are covered by `tests/hardening.rs`, and the drills
-passed again from the clean revision `dc276f3` on 2026-10-27. The
-power-loss drill re-ran clean on 2026-10-28 but covers only fresh PUTs;
-re-acceptance waits on extending it to the re-PUT and master-key paths
-(`docs/next-steps.md`).
+**M1 status:** Accepted 2026-10-28 (first accepted 2026-09-30, reopened
+2026-10-25). The audit in `docs/hardening-2026-10.md` found GC,
+retirement, backup, and recovery defects; the fixes are covered by
+`tests/hardening.rs`, and the drills passed again from clean revisions
+(`dc276f3` on 2026-10-27; the power-loss drill, extended to the master-key
+write and a re-PUT after a crash between rename and directory sync, from
+`10d7ed4` on 2026-10-28). The drill needs a `--features failpoints` build;
+agents honor `DISTR_HNSW_AGENT_FAILPOINT` there.
 The blob plane (`crates/distr-hnsw/`) provides the RF2 commit spine, logical
 deletion, recovery, incarnations and observations, scrub/repair, drain,
 retire, capacity admission, proof-based GC, master-key recovery bundles, and

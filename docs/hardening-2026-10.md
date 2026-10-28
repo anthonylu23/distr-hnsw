@@ -2,9 +2,10 @@
 
 **Status:** Fixes done and re-verified. Opened 2026-10-25 after a full code
 and documentation audit. Every item below marked *required* is done. The
-drills and benches were re-run from clean commits on 2026-10-27. M1 stays
-**Reopened** and M3 **In progress** until the owner decides on
-re-acceptance and on the open thresholds below. M2 starts after this pass.
+drills and benches were re-run from clean commits on 2026-10-27, and the
+extended power-loss drill on 2026-10-28. M1 was re-accepted on 2026-10-28.
+M3 stays **In progress** until the `project-nomic-512` runs. M2 starts
+after this pass.
 
 ## Why
 
@@ -125,7 +126,7 @@ Engine items deferred, each recorded in the contract:
 | Item | Status |
 |---|---|
 | Re-run `scripts/restore-drill.sh` (directory and MinIO) and `scripts/lifecycle-matrix.sh` from a clean committed revision; add GC-then-retire and GC-after-restore orders to the matrix | Done 2026-10-27 from `dc276f3`. Restore drill passed on both targets (56/56 verified, 0 resurrected, recovery 3.9 s and 3.75 s), and both reports were recorded with `portal drill record` (`recovery_ready` true; false for a target the deployment does not use). The matrix passed, including retire after GC and stale-restore GC (0 collected, acknowledged file intact). `scripts/minio-test.sh` passed 3/3. See [m1-restore-drill.md](m1-restore-drill.md) and [m1-lifecycle-matrix.md](m1-lifecycle-matrix.md). |
-| Re-run `scripts/power-loss-drill.sh` (needs sudo) for the changed durable-write paths (re-PUT directory sync, master key write) | Partly done. Re-run from `27e9bf9` on 2026-10-28: 8/8 marks on btrfs, ext4, and XFS, negative control lost, so the fresh-PUT path did not regress ([m1-filesystem-qualification.md](m1-filesystem-qualification.md)). The drill does not exercise either changed path (the master key is written off the drilled volume, and no object is re-PUT), so this item stays open until the drill covers them. Required before M1 re-acceptance. |
+| Re-run `scripts/power-loss-drill.sh` (needs sudo) for the changed durable-write paths (re-PUT directory sync, master key write) | Done 2026-10-28. The drill now writes the master key on the drilled volume and re-PUTs an object after an agent failpoint (`put_after_rename`) stops a PUT between its rename and its directory sync. From `10d7ed4` it passed 9/9 marks with the key intact on btrfs, ext4, and XFS. With both fixes reverted it fails on all three, so it detects these defects ([m1-filesystem-qualification.md](m1-filesystem-qualification.md)). |
 | Re-run the M3 benches from a clean revision; publish p95; decide the 1M × 512 build-throughput threshold openly | Re-run done 2026-10-27 with `--canonical` from `dc276f3` (nytimes persistence and compaction from `835f055`). p95 is published next to p50 ([bench/README.md](bench/README.md)). Decided 2026-10-27: the cosine default ef is 500, and the build-throughput threshold is ≥ 560 vectors/s required, ≥ 3.3k targeted ([m3-implementation-plan.md](m3-implementation-plan.md)). |
 | Drill reports record `git describe --dirty` (restore, lifecycle, ENOSPC, power loss) | Done |
 | Roadmap, next steps, AGENTS, contracts, and DESIGN (v2.2) brought in line with the code | Done |

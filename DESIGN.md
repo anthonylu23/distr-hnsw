@@ -924,8 +924,8 @@ a calendar rather than in the abstract.
    documents—stands on it. distr-hnsw may not hold the only copy of a file until
    this recovery gate passes.
 
-   Status: implemented (schema v9). Accepted 2026-09-30 and reopened
-   2026-10-25 by the hardening audit; see
+   Status: implemented (schema v9). Accepted 2026-09-30, reopened
+   2026-10-25 by the hardening audit, and re-accepted 2026-10-28; see
    [docs/roadmap.md](docs/roadmap.md) and
    [docs/hardening-2026-10.md](docs/hardening-2026-10.md).
 2. **Tailscale auth + sessions + API keys** (~2–4 weeks) — WhoIs provider,

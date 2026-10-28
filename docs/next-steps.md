@@ -9,8 +9,8 @@ tracks only the immediate work queue.
 - M0 accepted on 2026-07-19 (`nomic-embed-text @ 512`, see
   [phase-0-validation.md](phase-0-validation.md)). Keep `prototype/`
   disposable.
-- M1 accepted on 2026-09-30 and **reopened on 2026-10-25**. M3 exit review
-  withdrawn the same day. Both result from the audit in
+- M1 accepted on 2026-09-30, reopened on 2026-10-25, and **re-accepted on
+  2026-10-28**. M3 exit review withdrawn on 2026-10-25. Both result from the audit in
   [hardening-2026-10.md](hardening-2026-10.md).
 - M2 starts after the hardening pass.
 
@@ -38,12 +38,9 @@ tracks only the immediate work queue.
    - the license copyright line stays "The distr-hnsw authors";
    - the personal vault fixture leaves the tree without a history rewrite;
      the repository is already public, so a rewrite would not withdraw it.
-4. To re-accept M1: the power-loss drill re-ran from `27e9bf9` on
-   2026-10-28 and passed 8/8 on btrfs, ext4, and XFS, but it exercises only
-   fresh PUTs. Extend `scripts/power-loss-drill.sh` to cover the two
-   changed paths (a re-PUT after a crash between rename and directory sync,
-   and the master key written on the drilled volume), re-run it, then hold
-   the acceptance review.
+4. Done 2026-10-28: the power-loss drill covers the master-key write and a
+   re-PUT after a crash between rename and directory sync; it passed on
+   btrfs, ext4, and XFS from `10d7ed4`, and M1 was re-accepted.
 5. To accept M3: build `project-nomic-512` (200k, then 1M) now that the GPU
    is free, and run `oracle`, `hnsw`, `filtered`, `persist`, and `compact`
    on it with `--canonical`. This supplies the representative recall row

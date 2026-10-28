@@ -17,7 +17,7 @@ both planes; one SQLite database holds control-plane metadata.
 
 | Component | Crate | State |
 |---|---|---|
-| Blob plane: agents, portal commit spine, deletion, recovery, scrub and repair, drain and retire, capacity admission, proof-based GC, key recovery, backup and restore | `crates/distr-hnsw` | Implemented (M1, reopened for hardening) |
+| Blob plane: agents, portal commit spine, deletion, recovery, scrub and repair, drain and retire, capacity admission, proof-based GC, key recovery, backup and restore | `crates/distr-hnsw` | Implemented (M1, accepted) |
 | Single-partition vector engine: flat and int8 vectors, HNSW, filtered search, WAL and snapshots, compaction, RAM admission | `crates/distr-hnsw-index` | Implemented (M3, in hardening) |
 | Benchmark harness on pinned public datasets | `crates/distr-hnsw-bench` | Implemented |
 | Tailscale identity and authorization | — | Not started (M2) |

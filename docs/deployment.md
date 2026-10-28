@@ -4,7 +4,8 @@
 deployment yet. This guide describes how to run the current blob plane for
 evaluation, and the limitations any deployment must carry. Do not let it
 hold the only copy of data you cannot lose until your deployment is
-recovery ready (below) and M1 is re-accepted ([roadmap.md](roadmap.md)).
+recovery ready (below). M1 is accepted, with the limitations below
+([roadmap.md](roadmap.md)).
 
 ## Limitations that apply to every deployment
 

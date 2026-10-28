@@ -2,7 +2,8 @@
 
 Status: **dm-log-writes drill passed on btrfs, ext4, and XFS (kernel
 7.1.9-200.fc44, loop devices); qualified-with-caveats. APFS not qualified.**
-(2026-09-29; fresh-PUT path re-run from `27e9bf9` on 2026-10-28)
+(2026-09-29; re-run from `10d7ed4` on 2026-10-28 with the master-key write and
+the re-PUT path)
 
 This document reviews the durable-write path in
 `crates/distr-hnsw/src/durability.rs` against the filesystems distr-hnsw is
@@ -59,10 +60,8 @@ The same helpers persist the SQLite parent directory (`metadata.rs`) and the
 portal staging directory (`portal.rs`), so the conclusions apply to those
 paths too. Until the hardening pass the master key was written directly to its
 final path. It now follows the same sequence with a hard link in place of
-the rename, so an existing key is never replaced (`crypto.rs`). The
-2026-10-28 drill re-run does not exercise either changed path: the drill
-writes the master key outside the dm-backed volume and never re-PUTs an
-existing object (see [hardening-2026-10.md](hardening-2026-10.md)).
+the rename, so an existing key is never replaced (`crypto.rs`). Both
+changed paths are drilled since 2026-10-28 (below).
 
 ## Per-filesystem analysis
 
@@ -228,22 +227,29 @@ than passing everything through.
 
 ### Re-run after the hardening pass, 2026-10-28
 
-Same host, kernel, tools, and procedure, from the clean revision `27e9bf9`
-(the hardening fixes plus later engine and documentation commits). Every
-filesystem again passed 8/8 marks with 20/20 objects present and hash-valid
-at the last mark, a clean read-only check at every mark, and the negative
-control lost (0 of 1,048,576 un-fsynced bytes visible).
+Same host, kernel, and tools. A first re-run from `27e9bf9` passed 8/8 marks
+on all three filesystems, but it exercised only fresh PUTs: the master key
+was written off the drilled volume and no object was re-PUT. The drill was
+then extended (see the procedure notes below) and re-run from the clean
+revision `10d7ed4`, built with `--features failpoints`:
 
-| Filesystem | Log entries | Marks passed | Wall clock |
-| --- | --- | --- | --- |
-| btrfs | 1106 | 8/8 | 21 s |
-| ext4 | 1697 | 8/8 | 11 s |
-| XFS | 394 | 8/8 | 7 s |
+| Filesystem | Log entries | Marks passed (8 puts + `reput-ack`) | Master key at its mark | Negative control | Wall clock |
+| --- | --- | --- | --- | --- | --- |
+| btrfs | 1161 | 9/9, 21/21 objects at `reput-ack` | 32/32 bytes, SHA-256 match | lost | 7 s |
+| ext4 | 1763 | 9/9, 21/21 | 32/32, match | lost | 8 s |
+| XFS | 412 | 9/9, 21/21 | 32/32, match | lost | 8 s |
 
-This shows the hardening changes did not regress the fresh-PUT path. It is
-not evidence for the two durable-write paths the hardening pass changed:
-the re-PUT directory sync and the master key write are not on the drilled
-volume.
+The read-only checker was clean at every mark, no `.*.tmp` file survived,
+and the re-PUT was acknowledged 25 to 30 ms after the agent exited, well
+inside every filesystem's background commit interval, so only the
+directory syncs in the already-present path can make it durable.
+
+To confirm the extended drill detects the defects it targets, it was also
+run once against a diagnostic build with both fixes reverted (the
+already-present path without its directory syncs, and the key write without
+its parent sync). On all three filesystems the replay to `reput-ack` lacked
+the re-PUT object (it survived only under its temporary name) and the
+replay to `master-key` had no key file. That build was not committed.
 
 ## Drill: dm-log-writes on `anthonypc`
 
@@ -323,6 +329,9 @@ Where the implementation departs from the outline, deliberately:
   recorded above. Document the filesystem each CI run used once CI exists.
 - Done 2026-09-29: `dm-log-writes` drill on `anthonypc` for btrfs, ext4, and
   XFS via `scripts/power-loss-drill.sh`; 8/8 marks on each, table re-rated.
+- Done 2026-10-28: the drill covers the master-key write and a re-PUT after
+  a crash between rename and directory sync (9/9 marks on each filesystem
+  from `10d7ed4`).
 - Re-run the drill after every kernel update on `anthonypc` and record the
   kernel in this document; the btrfs rating in particular is kernel-specific.
 - Extend the drill beyond a single sequential writer: several concurrent

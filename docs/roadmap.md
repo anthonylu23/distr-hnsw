@@ -11,7 +11,7 @@ design first and then bring this document back into alignment.
 | Milestone | State | Exit gate |
 |---|---|---|
 | M0 — Semantic validation | **Accepted** | Larger representative bake-off produces a documented go decision and locks the default local model and dimensions |
-| M1 — Blob plane and recovery foundation | **Reopened** (2026-10-25; accepted 2026-09-30) | Blob durability and an empty-infrastructure restore drill pass |
+| M1 — Blob plane and recovery foundation | **Accepted** (2026-10-28; first accepted 2026-09-30, reopened 2026-10-25) | Blob durability and an empty-infrastructure restore drill pass |
 | M2 — Tailscale identity and authorization | Not started (follows the hardening pass) | Network identity, sessions, grants, and API-key boundaries pass adversarial tests |
 | M3 — Single-partition vector engine | **In progress** (seven passes done; exit review reopened 2026-10-25) | Persistence, recovery, recall, filtering, and compaction gates pass against brute force |
 | M4 — Distributed vector plane | Not started | Quorum, fencing, promotion, movement, and balancing survive failure injection |
@@ -38,10 +38,12 @@ M3's exit review is withdrawn until the required items in
 [hardening-2026-10.md](hardening-2026-10.md) are fixed and re-verified from a
 clean revision. M2 starts after that pass. The fixes landed in `f6381d3` and
 `a7e0371`, and the drills and benches were re-run from clean commits on
-2026-10-27. Re-acceptance of M1 and acceptance of M3 are the owner's
-decisions.
+2026-10-27. M1 was re-accepted on 2026-10-28, after the power-loss drill
+was extended to the two durable-write paths the fixes changed and passed
+on btrfs, ext4, and XFS from `10d7ed4`. M3 accepts after the
+`project-nomic-512` runs.
 
-M1 was **Accepted** on 2026-09-30 and **Reopened** on 2026-10-25. The blob plane provides the RF2
+M1 was **Accepted** on 2026-09-30, **Reopened** on 2026-10-25, and **re-accepted** on 2026-10-28. The blob plane provides the RF2
 commit spine, durable logical deletion, recovery from immutable objects,
 agent incarnations and complete-scan observations, copy-first scrub and
 repair, drain and retirement, capacity admission, proof-based garbage
@@ -275,7 +277,7 @@ closed only when its listed tests and drills pass.
 
 - [x] Acknowledged object writes survive immediate process and host restart on
   each supported storage platform.
-  Evidence: process-exit tests at every boundary; `dm-log-writes` power-loss drill on btrfs, ext4, XFS ([m1-filesystem-qualification.md](m1-filesystem-qualification.md)). Accepted limitation: loop devices, not a physical drive cache; APFS unqualified and not a production target.
+  Evidence: process-exit tests at every boundary; `dm-log-writes` power-loss drill on btrfs, ext4, XFS, re-run from `10d7ed4` on 2026-10-28 with the master-key write and a re-PUT after a crash between rename and directory sync ([m1-filesystem-qualification.md](m1-filesystem-qualification.md)). Accepted limitation: loop devices, not a physical drive cache; APFS unqualified and not a production target.
 - [x] Identical retries converge on the same ciphertext objects and one file
   record; conflicting reuse of an idempotency key is rejected.
 - [x] No staging or partially replicated file is visible or downloadable.
@@ -291,30 +293,30 @@ closed only when its listed tests and drills pass.
 
 - [x] Delete makes a file unreadable only after its deletion marker is durable;
   a stale SQLite restore or returning stale node cannot resurrect it.
-- [ ] Repair, rebalance, quota changes, and garbage collection never remove an
+- [x] Repair, rebalance, quota changes, and garbage collection never remove an
   old copy before a replacement is durable and confirmed.
   Evidence: copy-first repair, drain, and retire (`tests/lifecycle_gc.rs`, [m1-lifecycle-matrix.md](m1-lifecycle-matrix.md)); GC deletes only through an applied proof.
-  Reopened 2026-10-25: GC could delete an acknowledged file's chunks after a stale metadata restore (H1). Fixed in `tests/hardening.rs`. The lifecycle matrix re-run from `dc276f3` (2026-10-27) passed: GC after a stale restore collected nothing and the acknowledged file survived, and retire after GC succeeded.
+  Reopened 2026-10-25: GC could delete an acknowledged file's chunks after a stale metadata restore (H1). Fixed in `tests/hardening.rs`. The lifecycle matrix re-run from `dc276f3` (2026-10-27) passed: GC after a stale restore collected nothing and the acknowledged file survived, and retire after GC succeeded. Re-accepted 2026-10-28.
 - [x] Bit flips are detected by ciphertext hash verification and repaired from
   a valid replica without serving corrupt plaintext.
   Evidence: 24 injected flips, truncations, and removals detected and repaired with every sampled download intact ([m1-lifecycle-matrix.md](m1-lifecycle-matrix.md)).
-- [ ] Staging garbage and unreferenced chunks are collected only after the
+- [x] Staging garbage and unreferenced chunks are collected only after the
   documented grace, reference, observation, and node-retirement gates.
   Evidence: `portal gc` proofs: observation after deletion, retention or grace, no pending movement, deferral when an agent is unreachable, no control object unknown to the metadata, backup coverage of deleted generations, no pending recovery (`tests/lifecycle_gc.rs`, `tests/hardening.rs`, [m1-lifecycle-matrix.md](m1-lifecycle-matrix.md)).
-  Reopened 2026-10-25 (H1, H2): fixed; the matrix re-run from `dc276f3` passed on 2026-10-27.
+  Reopened 2026-10-25 (H1, H2): fixed (`retirement_ignores_collected_objects`, `backup_after_gc_skips_collected_objects`, `gc_waits_for_backup_coverage_of_deleted_generations`); the matrix re-run from `dc276f3` passed on 2026-10-27. Re-accepted 2026-10-28.
 - [x] ENOSPC and global budget exhaustion produce admission-control errors and
   actionable health state without violating the replica floor.
   Evidence: agent HTTP 507 and portal exit 3 with the floor intact; real `ENOSPC` on a loop device ([m1-capacity-drill.md](m1-capacity-drill.md)).
 
 #### Recovery
 
-- [ ] A portal crash at every boundary in the commit and delete protocols
+- [x] A portal crash at every boundary in the commit and delete protocols
   recovers to either one complete committed state or harmless collectible
   garbage—never a visible partial file.
-  Reopened 2026-10-25: a delete abandoned at a boundary and retried under a new key minted a second marker, and recovery then never converged (H3, H4). A recovered upload's same-key retry collided with the recovered file. Fixed in `tests/hardening.rs`.
-- [ ] Core file records newer than an older SQLite restore point can be
+  Reopened 2026-10-25: a delete abandoned at a boundary and retried under a new key minted a second marker, and recovery then never converged (H3, H4). A recovered upload's same-key retry collided with the recovered file. Fixed in `tests/hardening.rs` (`delete_retried_under_a_new_key_reuses_the_pending_marker`, `redundant_deletion_markers_recover_deterministically`, `recovered_upload_is_committed_for_same_key_retries`); the process-exit tests at every commit and delete boundary pass (`tests/commit_spine_process.rs`). Re-accepted 2026-10-28.
+- [x] Core file records newer than an older SQLite restore point can be
   reconstructed from manifests, deletion markers, and inventories.
-  Reopened 2026-10-25 with the item above. The restore drill re-run from `dc276f3` passed on both targets (2026-10-27).
+  Reopened 2026-10-25 with the item above. Lifecycle work stays blocked until recovery runs (`restored_metadata_blocks_lifecycle_until_recovered`). The restore drill re-run from `dc276f3` passed on both targets (2026-10-27). Re-accepted 2026-10-28.
 - [x] The master key can be recovered without relying on any surviving cluster
   machine, and wrong or missing key material fails closed.
   Evidence: recovery bundle v1 and `portal key`; wrong key, wrong passphrase, tampering, and out-of-range KDF parameters fail closed (`tests/commit_spine_process.rs`).
@@ -322,10 +324,10 @@ closed only when its listed tests and drills pass.
   versioned offsite objects, SQLite history, and independent key material;
   regular-file bytes match their original hashes.
   Evidence: [m1-restore-drill.md](m1-restore-drill.md): 64 files, ~250 MB, directory and S3 (MinIO, Object Lock) targets; 3.9 s and 3.75 s recovery time from `dc276f3`.
-- [ ] Backup lag, last integrity verification, RPO/RTO targets, retention, and
+- [x] Backup lag, last integrity verification, RPO/RTO targets, retention, and
   last restore-drill result are externally observable.
   Evidence: `portal health` backup status (lag, verified and pending objects, last snapshot, last integrity sample, last recorded restore drill with declared and actual RPO/RTO, and a derived `recovery_ready`); `portal drill record`. Accepted limitation: retention is enforced by the target's lifecycle and Object Lock rules, not by the portal.
-  Reopened 2026-10-25: `recovery_ready` was hard-coded false and drill results were not recorded. Implemented (`tests/hardening.rs`). Both 2026-10-27 drill reports were recorded and derived `recovery_ready: true`; a report for a target the deployment does not use derived false.
+  Reopened 2026-10-25: `recovery_ready` was hard-coded false and drill results were not recorded. Implemented (`tests/hardening.rs`). Both 2026-10-27 drill reports were recorded and derived `recovery_ready: true`; a report for a target the deployment does not use derived false. Re-accepted 2026-10-28.
 - [x] Master-key custody, backup defaults, and globally-over-budget admission
   behavior are documented decisions with tested recovery/failure behavior.
   Evidence: ratified in DESIGN §10, §11.1, §15 with tests listed in [m1-phase-1-decisions.md](m1-phase-1-decisions.md).

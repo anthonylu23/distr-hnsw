@@ -242,7 +242,7 @@ drilled (directory and S3 targets, snapshot shipping, catalogs, integrity
 sampling, status, restore; `m1-restore-drill.md`). Retention and expiry are
 delegated to bucket lifecycle and Object Lock configuration rather than a
 portal expiry job (accepted limitation). Closed for M1 on 2026-09-30;
-reopened 2026-10-25. The observability item was not met: `recovery_ready`
+reopened 2026-10-25; closed again with M1's re-acceptance on 2026-10-28. The observability item was not met: `recovery_ready`
 was hard-coded false and no drill result was recorded. The hardening pass
 adds `portal drill record` and derives `recovery_ready` from the recorded
 drill, its window, its target, and current lag. `status --json`, per-file
