@@ -58,10 +58,22 @@ Plan: [m2-implementation-plan.md](m2-implementation-plan.md). Work packages
 single-use tokens, and accept only portal-signed grants from the pinned
 portal node, with `DELETE` only for an applied GC proof; the real-tailnet
 drill and the M1 drills pass with grants
-([m2-authorization-drill.md](m2-authorization-drill.md)). Next: work
-package 4, the portal daemon (tailnet bind, WhoIs identity, header-forgery
-rejection), then sessions, CSRF, API keys, audit (5) and certificates (6). The development laptop serves as the unauthorized
-tailnet node. Tests may use the owner's tailnet, including its
+([m2-authorization-drill.md](m2-authorization-drill.md)). Work packages
+4 to 6 are implemented and tested against the fake LocalAPI: `portal
+serve` (HTTPS on the tailnet address only, WhoIs identity per connection,
+identity headers stripped and audited), browser sessions with CSRF, API
+keys with collection scopes, the audit log, and certificate renewal with
+hot reload and fail-closed expiry. Next:
+
+1. Live certificate evidence: the reference host has no cached
+   certificate, so the first fetch issues one and publishes the host's
+   tailnet name in Certificate Transparency logs. Run it once the owner
+   agrees; then a client on the development laptop validates it.
+2. Work package 7: the adversarial drill against the live portal
+   (unauthorized node, forged headers, replayed and stale grants), the
+   key-rotation and node-join drills, and cross-host agents.
+
+The development laptop serves as the unauthorized tailnet node. Tests may use the owner's tailnet, including its
 certificates, but must never disable tailnet HTTPS or change its serve,
 Funnel, or ACL configuration (the owner's remote access depends on it).
 

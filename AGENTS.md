@@ -5,7 +5,12 @@ encrypted blobs plus distributed HNSW vector search. Product design lives in
 `DESIGN.md`. M0, M1 (blob plane, `crates/distr-hnsw/`), and M3 (vector
 engine, `crates/distr-hnsw-index/`) are accepted; the October 2026
 hardening pass (`docs/hardening-2026-10.md`) closed on 2026-10-28. M2
-(Tailscale identity) is in progress (`docs/m2-implementation-plan.md`).
+(Tailscale identity) is in progress (`docs/m2-implementation-plan.md`):
+work packages 1 to 3 (agent grants and joins) are done and drilled; 4 to 6
+(the `portal serve` HTTPS service, sessions, API keys, audit log,
+certificates) are implemented and tested against the fake LocalAPI, with
+the live certificate run pending the owner's go-ahead (the reference host
+has no cached certificate, so a fetch is a new public issuance).
 
 
 ## Stack
@@ -140,14 +145,20 @@ The blob plane (`crates/distr-hnsw/`) provides the RF2 commit spine, logical
 deletion, recovery, incarnations and observations, scrub/repair, drain,
 retire, capacity admission, proof-based GC, master-key recovery bundles, and
 backup set v1 with directory and S3 targets (`portal init|put|get|delete|
-recover|scrub|health|key|backup|restore|drill|drain|retire|gc|agent`). SQLite
-schema is v10 (v10 adds grant-signing keys, joined agents, and join tokens).
+recover|scrub|health|key|backup|restore|drill|drain|retire|gc|agent|serve|
+user|api-key|audit`). SQLite schema is v11 (v10 adds grant-signing keys,
+joined agents, and join tokens; v11 adds users, identities, sessions, API
+keys, and the append-only audit log).
 Drills and their
 evidence: `scripts/` and `docs/m1-*-drill.md`, `docs/m1-lifecycle-matrix.md`,
 `docs/m1-filesystem-qualification.md`. Since M2 work packages 1 to 3,
 agents require a portal-signed grant on every request and a join token
 until joined (`portal agent token|join`); loopback needs
 `--insecure-loopback`. Commands that contact agents take `--master-key`.
+`portal serve` (`portal_server.rs`, `auth.rs`, `tls.rs`) never binds
+loopback; its tests use the shared fake LocalAPI in `tests/common` and
+loopback aliases (127.0.0.2 and up) as tailnet nodes, which Linux
+provides and the tests skip without.
 Tests use `TMPDIR=target/` via `.cargo/config.toml` so they run on a real
 filesystem; `aws-lc-sys` needs a C compiler. The S3 tests are `#[ignore]`d
 and run against MinIO with `scripts/minio-test.sh`. Process tests rely on

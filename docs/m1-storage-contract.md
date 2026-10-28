@@ -239,7 +239,7 @@ backup set, the recovery bundle, and an off-cluster passphrase, and
 downloads the committed file byte for byte while the deleted file stays
 unreadable.
 
-## SQLite schema v9
+## SQLite schema v11
 
 Schema v3 stores `files` as the current projection with generation and
 `committed`, `deleted`, or `recovery_blocked` state. It adds immutable
@@ -272,10 +272,18 @@ rejects a second distinct deletion marker for one file generation in
 owed-recovery-bundle flag set from key creation until `portal init` emits
 the bundle, and the last recorded restore drill.
 
+Schemas v10 and v11 (M2) are additive. v10 adds `signing_keys` (Ed25519
+grant-signing seeds sealed under the master key; at most one `active`),
+`grant_state` (the grant epoch and key-set version), `agent_joins`, and
+`join_tokens` (BLAKE3 hashes, single use). v11 adds `users`, `identities`
+(`tailscale` login → user), `sessions` and `api_keys` (BLAKE3 verifiers
+only, never the secrets), and `audit_log`, whose triggers refuse `UPDATE`
+and `DELETE`. See [m2-implementation-plan.md](m2-implementation-plan.md).
+
 The two earlier development lines both used schema version 2 for incompatible
 layouts. Opening a v2 database inspects its table shape and atomically migrates
 either the audited commit-spine layout or the recovery-history layout to
-canonical v3, then v4, then v7, then v8 and v9 (v5, v6, v8, and v9 are
+canonical v3, then v4, then v7, then v8 to v11 (v5, v6, and v8 to v11 are
 additive; v7 rebuilds `placements`). V1 also migrates through the same chain. Existing manifest
 bytes, ciphertext hashes, and chunk-v1 AAD remain unchanged. Unknown or
 unrecognized schema layouts fail closed.

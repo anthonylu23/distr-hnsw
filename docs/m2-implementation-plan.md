@@ -24,11 +24,14 @@ in what order, and how each criterion will be proven.
   tailnet nodes (DESIGN §3).
 - **Never disable the owner's tailnet HTTPS.** Its certificates serve the
   owner's remote-access setup. M2 tests may use the owner's tailnet,
-  including fetching this node's certificate through LocalAPI (tailscaled
-  reuses its cached certificate, so no new issuance happens), but must not
+  including fetching this node's certificate through LocalAPI, but must not
   turn HTTPS certificates off, change `tailscale serve` or Funnel
   configuration, or edit ACLs. The reference host has no serve or Funnel
-  configuration; the portal still defaults to a port other than 443.
+  configuration; the portal defaults to port 8443, not 443. As of
+  2026-10-28 `tailscaled` on the reference host holds no certificate, so
+  the first live fetch issues a new one and publishes the host's tailnet
+  name in Certificate Transparency logs; that step waits for the owner's
+  go-ahead.
   Renewal and failure paths are tested against a fake LocalAPI with
   generated certificates, because a live certificate cannot be forced to
   expire. Certificate fetches need root (or the tailnet operator user), so
@@ -95,15 +98,19 @@ in what order, and how each criterion will be proven.
    plaintext fallback. Every connection is resolved with WhoIs on the socket
    address; identity headers (`Tailscale-User-Login` and similar) are
    ignored and logged.
-8. **Users, sessions, API keys, audit.** Schema v10 adds users,
-   `identities (provider, external_id) → user_id`, sessions (hashed token,
-   expiry, rotation on privilege change), API keys (an id prefix plus a
-   BLAKE3 verifier of a 256-bit random secret, collection scopes with
-   `read`, `write`, or `admin`), and an append-only audit log of
-   authentication events and state-changing requests. Cookies are
-   `Secure`, `HttpOnly`, `SameSite=Strict`; state-changing routes require a
-   CSRF token bound to the session. Single-user v1, multi-user-ready
-   schema (DESIGN §9).
+8. **Users, sessions, API keys, audit.** Schema v11 (v10 went to grants)
+   adds users, `identities (provider, external_id) → user_id` (provider
+   `tailscale`, keyed by login name, the name ACLs use), sessions (BLAKE3
+   verifier of a 256-bit token, bound to the creating node and user,
+   12-hour lifetime, 1-hour idle limit), API keys (`dhk_<id>_<secret>`,
+   a BLAKE3 verifier of a 256-bit secret, collection scopes with `read`,
+   `write`, or `admin`, optionally bound to one node), and an append-only
+   audit log (triggers refuse `UPDATE` and `DELETE`) of authentication
+   events and state-changing requests. Cookies are `__Host-` prefixed,
+   `Secure`, `HttpOnly`, `SameSite=Strict`; a state-changing request on a
+   session needs the session's CSRF token and a same-origin `Origin` or
+   `Sec-Fetch-Site` when the browser sends them. Single-user v1,
+   multi-user-ready schema (DESIGN §9).
 
 ## Progress
 
@@ -162,6 +169,54 @@ in what order, and how each criterion will be proven.
     agents keep accepting the retired key until their next key-set update.
     Use `--revoke` when a key may be compromised.
 
+- **Work packages 4 to 6 — implemented 2026-10-28; live certificate
+  evidence pending.**
+  - `portal_server.rs`: `portal serve` resolves its bind like an agent but
+    never accepts loopback; it serves only HTTPS and only after obtaining a
+    certificate. Every connection is resolved with WhoIs before the TLS
+    handshake, and an address WhoIs cannot name is dropped and audited.
+    `Tailscale-*`, `X-Forwarded-*`, `Forwarded`, and similar identity
+    headers are stripped, logged, and audited. Routes: `GET /api/whoami`,
+    `POST|DELETE /api/session`, `GET|POST /api/keys`,
+    `DELETE /api/keys/{id}`, `GET /api/audit`, `POST /api/files`,
+    `GET|DELETE /api/files/{id}`. File operations run one at a time on a
+    worker thread that owns the portal; uploads stream to a spool beside
+    the database. Idempotency keys are namespaced per principal.
+    Connections have a 10 s header-read timeout and a 10-minute lifetime
+    (WhoIs is resolved again on reconnect) and are capped per address and
+    in total; uploads and downloads are capped and check spool space.
+  - `auth.rs` and `metadata/identity.rs` (schema v11): decision 8. Login is
+    `POST /api/session` from a node whose WhoIs login belongs to a user;
+    tagged nodes cannot sign in and use API keys, and the portal's own node
+    cannot sign in unless `--allow-portal-node-sign-in` is set. Sign-ins
+    are rate-limited per node. A cookie presented from another node or
+    user is revoked. A login that presents a live cookie revokes it
+    (rotation); disabling a user revokes all sessions and keys. An API key
+    names its node (DESIGN §9: node and key are both checked) unless it is
+    explicitly created for any node.
+  - Audit: a state change is recorded `allowed` before it runs (and does
+    not run if that write fails), then `completed` or `failed`; file
+    changes are recorded by the worker, so a client that hangs up cannot
+    skip them. Refusal and observation records are rate-limited per peer
+    and their peer-supplied fields are length-capped.
+  - An independent security review (2026-10-28) found the hang-up audit
+    gap, unbounded audit growth, sign-in from the portal node, unbound API
+    keys, missing connection limits, unbounded spooling, and unaudited
+    refusals; all are fixed and covered by tests.
+  - `tls.rs`: certificates from LocalAPI `cert/<domain>?type=pair` behind a
+    rustls resolver; renewal starts when a third of the lifetime remains
+    and retries with backoff; the resolver serves only a currently valid
+    certificate, so an expired one refuses handshakes, never plaintext.
+  - CLI: `portal serve`, `portal user add|list|disable`,
+    `portal api-key create|list|revoke`, `portal audit`.
+  - Tests: `tests/portal_server.rs` against the fake LocalAPI (now in
+    `tests/common`), with loopback aliases standing in for tailnet nodes:
+    WhoIs-only identity and forged headers, the session and CSRF matrix
+    (cross-node cookie, rotation, logout, expiry, idle, disable), API-key
+    scopes and verifiers, certificate renewal, hot reload, expiry with no
+    plaintext answer, and recovery, and the bind refusals and exit 75 on
+    an address change.
+
 ## Work packages
 
 | # | Package | Proves |
@@ -170,7 +225,7 @@ in what order, and how each criterion will be proven.
 | 2 | Signing key, grant v1, agent verification on every route; portal attaches grants; `delete` only from GC apply | grant criterion; agent DELETE and inventory closed first |
 | 3 | Join tokens, key-set document, portal and agent pinning, rotation and revocation | join and rotation criterion |
 | 4 | Portal daemon: tailnet bind, WhoIs identity, header-forgery rejection | identity criterion |
-| 5 | Schema v10: users, identities, sessions, CSRF, API keys, audit log | session, CSRF, and API-key criteria |
+| 5 | Schema v11: users, identities, sessions, CSRF, API keys, audit log | session, CSRF, and API-key criteria |
 | 6 | Certificates: LocalAPI fetch, renewal, hot reload, failure behavior (fake LocalAPI) | certificate criterion, except live evidence |
 | 7 | Adversarial drills: unauthorized tailnet node, forged headers, replayed and stale grants, rotation and node-join drills; ACL and certificate-transparency documentation | exit gate |
 
@@ -199,6 +254,8 @@ to grants in the same packages so they keep passing.
 - **Live certificate evidence** comes from the owner's tailnet (approved
   2026-10-28): issuance through LocalAPI, TLS serving with that
   certificate, and a client on the development laptop validating it.
-  Renewal and failure behavior come from the fake LocalAPI.
+  Renewal and failure behavior come from the fake LocalAPI. Because the
+  reference host has no cached certificate, the fetch is a new issuance
+  (a public CT log entry) and waits for the owner's confirmation.
 - **ACL policy** is documented, not applied: the owner applies it to their
   own tailnet.

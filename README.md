@@ -8,9 +8,9 @@ indexed by meaning with distributed HNSW vector search.
 
 > **Status: pre-release, not ready for data you cannot lose.** The blob plane
 > and a single-partition vector engine are implemented and accepted against
-> their milestone gates. Tailscale identity, the distributed vector plane,
-> the extraction pipeline, and the dashboard are not built yet. See
-> [docs/roadmap.md](docs/roadmap.md).
+> their milestone gates. Tailscale identity and authorization (M2) are in
+> progress; the distributed vector plane, the extraction pipeline, and the
+> dashboard are not built yet. See [docs/roadmap.md](docs/roadmap.md).
 
 ## Milestones
 
@@ -18,7 +18,7 @@ indexed by meaning with distributed HNSW vector search.
 |---|---|
 | M0 Semantic validation | Accepted |
 | M1 Blob plane and recovery foundation | Accepted (re-accepted 2026-10-28 after the [hardening pass](docs/hardening-2026-10.md)) |
-| M2 Tailscale identity and authorization | Not started |
+| M2 Tailscale identity and authorization | In progress ([plan](docs/m2-implementation-plan.md)) |
 | M3 Single-partition vector engine | Accepted (2026-10-28, after the [hardening pass](docs/hardening-2026-10.md)) |
 | M4–M7 Distributed vector plane, extraction, dashboard, vault and release | Not started |
 
@@ -57,7 +57,9 @@ are in [scripts/](scripts/README.md) and run on a dedicated host
 ## Security
 
 See [SECURITY.md](SECURITY.md). In the current build, agents require a
-portal-signed grant on every request, and the portal is local commands only.
+portal-signed grant on every request, and the portal service identifies
+callers with Tailscale WhoIs and admits only browser sessions and scoped API
+keys over HTTPS.
 
 ## License
 

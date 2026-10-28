@@ -20,24 +20,27 @@ both planes; one SQLite database holds control-plane metadata.
 | Blob plane: agents, portal commit spine, deletion, recovery, scrub and repair, drain and retire, capacity admission, proof-based GC, key recovery, backup and restore | `crates/distr-hnsw` | Implemented (M1, accepted) |
 | Single-partition vector engine: flat and int8 vectors, HNSW, filtered search, WAL and snapshots, compaction, RAM admission | `crates/distr-hnsw-index` | Implemented (M3, accepted) |
 | Benchmark harness on pinned public datasets and the 512-dim project set | `crates/distr-hnsw-bench` | Implemented |
-| Tailscale identity and authorization | — | Not started (M2) |
+| Tailscale identity and authorization: tailnet binds, agent grants and joins, the portal service with WhoIs identity, sessions, API keys, audit log, and certificates | `crates/distr-hnsw` | In progress (M2) |
 | Distributed vector plane, extraction and embedding pipeline, dashboard, vault | — | Not started (M4–M7) |
 | Phase-0 validation prototype | `prototype/` | Disposable; not product code |
 
 Today everything runs as one binary, `distr-hnsw`, with three command
-groups: `agent` (a storage daemon), `portal` (one-shot coordinator commands
-over the SQLite database), and `index` (moving engine state through the blob
-plane). Agents bind to their node's tailnet address (or to loopback with an
-explicit insecure flag) and accept only requests that carry a grant signed
-by the portal.
+groups: `agent` (a storage daemon), `portal` (coordinator commands over the
+SQLite database, plus `portal serve`, the HTTPS API), and `index` (moving
+engine state through the blob plane). Agents bind to their node's tailnet
+address (or to loopback with an explicit insecure flag) and accept only
+requests that carry a grant signed by the portal.
 
 ## Blob plane
 
 ```text
-             portal (CLI today; daemon in M2)
-             ├─ SQLite metadata (schema v10): uploads, files, generations,
+   browsers, apps ── HTTPS on the tailnet (WhoIs + session or API key)
+             │
+             portal (CLI commands and `portal serve`)
+             ├─ SQLite metadata (schema v11): uploads, files, generations,
              │  placements, incarnations, scans, GC proofs, backup state,
-             │  grant-signing keys, joined agents, join tokens
+             │  grant-signing keys, joined agents, join tokens, users,
+             │  sessions, API keys, audit log
              ├─ master key (file) ── recovery bundle (offline, passphrase)
              │
    PUT/GET/inventory/DELETE over HTTP, each with a signed grant
@@ -65,6 +68,14 @@ by the portal.
   Key rotation and revocation reach an agent on its next request: it
   answers 409, and the portal pushes the new key set, which the old key
   vouches for.
+- **Portal service.** `portal serve` listens only on its node's tailnet
+  address and only over HTTPS, with the node's certificate from
+  `tailscaled`, renewed and swapped in without a restart. Each connection
+  is identified by Tailscale WhoIs on its socket address; identity headers
+  are stripped and audited. Requests authenticate with a browser session
+  (bound to its node and user, CSRF-checked) or an API key (a stored
+  verifier with collection scopes), and every sign-in, refusal, and state
+  change is appended to an audit log.
 - **Commit spine.** The portal persists an idempotent upload plan, places
   every chunk and then the manifest on agents in at least two failure
   domains (RF2), re-verifies them live, and only then commits the file in
@@ -126,7 +137,8 @@ Contract: [m3-engine-contract.md](m3-engine-contract.md). Benchmarks:
 
 ## Tech stack
 
-Rust (tokio, axum, reqwest with rustls), SQLite via rusqlite, BLAKE3,
+Rust (tokio, axum, reqwest and tokio-rustls with rustls), SQLite via
+rusqlite, BLAKE3, Ed25519 (ed25519-dalek),
 XChaCha20-Poly1305 and Argon2id from RustCrypto, roaring bitmaps, and the
 AWS SDK for S3-compatible backup targets. Tests use real temporary volumes
 on disk (`TMPDIR=target/`); drills and large matrices live in
