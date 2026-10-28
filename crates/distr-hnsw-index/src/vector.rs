@@ -193,16 +193,6 @@ impl FlatVectors {
             .enumerate()
             .map(|(index, row)| (index as RecordId, row))
     }
-
-    /// Copy every row into one owned buffer (used when writing a snapshot).
-    pub fn to_contiguous(&self) -> Vec<f32> {
-        let mut out = Vec::with_capacity(self.len() * self.dims);
-        if let Some(base) = &self.base {
-            out.extend_from_slice(base.slice(self.dims));
-        }
-        out.extend_from_slice(&self.tail);
-        out
-    }
 }
 
 #[derive(Debug, Error)]
@@ -271,7 +261,10 @@ mod tests {
         assert_eq!(store.resident_bytes(), 8);
         assert_eq!(store.rows().count(), 4);
         assert_eq!(
-            store.to_contiguous(),
+            store
+                .rows()
+                .flat_map(|(_, row)| row.iter().copied())
+                .collect::<Vec<_>>(),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
         );
         assert!(

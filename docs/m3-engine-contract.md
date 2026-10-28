@@ -203,7 +203,12 @@ Two snapshots at the same high-water mark share a name and the later
 atomically replaces the earlier. They describe the same logical state but
 need not be byte-identical (a compaction renumbers slots), so archives
 identify a snapshot by its BLAKE3, never by its name. An aborted write leaves
-its temporary file, which loading ignores. `partition.json` also records
+its temporary file, which loading ignores. The writer streams the file in two
+passes over the borrowed state: the first computes each section's length and
+BLAKE3 for the table, the second writes header, table, and sections through
+a 1 MiB buffer while digesting the footer. Writing therefore never holds a
+copy of the partition (an earlier in-memory encoding needed about four times
+the file on top of the partition, which at 1M × 512 exhausted `anthonypc`). `partition.json` also records
 `base_snapshot` when history begins with a bulk-load snapshot that is not in
 the WAL (§6).
 
@@ -451,8 +456,9 @@ holds its idempotency window, about 40 bytes per entry (up to 40 MB at the
 default `W`), counted in `resident_bytes` but not per vector. The `f32`
 originals (`dims × 4`) and the snapshot file count against the **disk**
 budget and the page cache, not the RAM budget, except while they are on the
-heap between a write and the next snapshot (§7). Admission uses these
-measured values, not the estimate.
+heap between a write and the next snapshot (§7). Writing a snapshot adds
+only its 1 MiB buffer and the key and idempotency listings (§5), under
+100 MB at 1M keys and the default window. Admission uses these measured values, not the estimate.
 
 A partition has an optional RAM budget (`ram_budget_bytes`; none means
 unlimited) and reserves compaction headroom (`headroom_fraction`, default

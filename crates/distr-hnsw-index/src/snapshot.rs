@@ -85,12 +85,6 @@ pub fn snapshot_name(high_water: u64) -> String {
     format!("{high_water:020}.snap")
 }
 
-fn pad_to(buffer: &mut Vec<u8>, align: usize) {
-    while !buffer.len().is_multiple_of(align) {
-        buffer.push(0);
-    }
-}
-
 fn metric_code(metric: Metric) -> u8 {
     match metric {
         Metric::Cosine => 1,
@@ -108,113 +102,185 @@ fn metric_from(code: u8) -> Option<Metric> {
     }
 }
 
-/// Serialize a snapshot into memory. Separate from writing so tests can
-/// corrupt bytes deliberately.
-pub fn encode(input: &SnapshotInput<'_>) -> Result<Vec<u8>, SnapshotError> {
+/// Section kinds in file order.
+const SECTION_ORDER: [u16; 7] = [
+    SECTION_KEYS,
+    SECTION_SLOTS,
+    SECTION_PAYLOADS,
+    SECTION_VECTORS_F32,
+    SECTION_VECTORS_I8,
+    SECTION_GRAPH,
+    SECTION_IDEMPOTENCY,
+];
+
+/// Write buffer between section encoders and the digest or file.
+const WRITE_BUFFER: usize = 1 << 20;
+
+/// Counts and digests the bytes passing through to `inner`.
+struct Digesting<W> {
+    inner: W,
+    hasher: blake3::Hasher,
+    len: u64,
+}
+
+impl<W> Digesting<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+            len: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for Digesting<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Write `values` little-endian through a fixed scratch block.
+fn write_le<T: Copy, const N: usize>(
+    out: &mut impl Write,
+    values: &[T],
+    to_le: impl Fn(T) -> [u8; N],
+) -> io::Result<()> {
+    let mut block = [0_u8; 4096];
+    for chunk in values.chunks(block.len() / N) {
+        for (bytes, value) in block.chunks_exact_mut(N).zip(chunk) {
+            bytes.copy_from_slice(&to_le(*value));
+        }
+        out.write_all(&block[..chunk.len() * N])?;
+    }
+    Ok(())
+}
+
+/// Encode one section's bytes into `out`. Encoding reads only the borrowed
+/// input, so the same section encodes to the same bytes every time.
+fn encode_section(kind: u16, input: &SnapshotInput<'_>, out: &mut impl Write) -> io::Result<()> {
+    match kind {
+        SECTION_KEYS => {
+            for (key, slot) in input.keys {
+                out.write_all(&(key.len() as u16).to_le_bytes())?;
+                out.write_all(key)?;
+                out.write_all(&slot.to_le_bytes())?;
+            }
+        }
+        SECTION_SLOTS => {
+            let mut payload_offset = 0_u64;
+            for record in input.slots {
+                out.write_all(&record.version.to_le_bytes())?;
+                out.write_all(&[u8::from(record.tombstone)])?;
+                out.write_all(&record.key_index.to_le_bytes())?;
+                out.write_all(&payload_offset.to_le_bytes())?;
+                out.write_all(&(record.payload.len() as u32).to_le_bytes())?;
+                payload_offset += record.payload.len() as u64;
+            }
+        }
+        SECTION_PAYLOADS => {
+            for record in input.slots {
+                out.write_all(&record.payload)?;
+            }
+        }
+        SECTION_VECTORS_F32 => {
+            for (_, row) in input.vectors.rows() {
+                write_le(out, row, f32::to_le_bytes)?;
+            }
+        }
+        SECTION_VECTORS_I8 => {
+            let (codes, scales, norms) = input.quantized.parts();
+            write_le(out, scales, f32::to_le_bytes)?;
+            write_le(out, norms, f32::to_le_bytes)?;
+            out.write_all(bytemuck::cast_slice(codes))?;
+        }
+        SECTION_GRAPH => {
+            let g = &input.graph;
+            out.write_all(&(input.params.m as u32).to_le_bytes())?;
+            out.write_all(&(input.params.m0 as u32).to_le_bytes())?;
+            out.write_all(&(input.params.ef_construction as u32).to_le_bytes())?;
+            out.write_all(&input.params.seed.to_le_bytes())?;
+            out.write_all(&g.entry.unwrap_or(u32::MAX).to_le_bytes())?;
+            out.write_all(&[g.max_level])?;
+            out.write_all(&(g.tombstone_count as u64).to_le_bytes())?;
+            out.write_all(g.levels)?;
+            out.write_all(g.level0_len)?;
+            write_le(out, g.level0, u32::to_le_bytes)?;
+            write_le(out, g.tombstones, u64::to_le_bytes)?;
+            for slot in 0..input.slots.len() {
+                if g.levels[slot] == 0 {
+                    continue;
+                }
+                out.write_all(&g.upper_len[slot])?;
+                write_le(out, &g.upper[slot], u32::to_le_bytes)?;
+            }
+        }
+        SECTION_IDEMPOTENCY => {
+            for (op_id, seq) in input.idempotency {
+                out.write_all(op_id)?;
+                out.write_all(&seq.to_le_bytes())?;
+            }
+        }
+        _ => unreachable!("unknown section kind {kind}"),
+    }
+    Ok(())
+}
+
+/// Length and BLAKE3 digest of one section, without keeping its bytes.
+fn digest_section(kind: u16, input: &SnapshotInput<'_>) -> io::Result<(u64, blake3::Hash)> {
+    let mut out = io::BufWriter::with_capacity(WRITE_BUFFER, Digesting::new(io::sink()));
+    encode_section(kind, input, &mut out)?;
+    let digesting = out.into_inner().map_err(|e| e.into_error())?;
+    Ok((digesting.len, digesting.hasher.finalize()))
+}
+
+fn write_zeros(out: &mut impl Write, count: usize) -> io::Result<()> {
+    out.write_all(&[0_u8; ALIGN][..count])
+}
+
+/// Stream a snapshot into `out` and return it after the footer. Two passes:
+/// the first digests each section for the table (which precedes the
+/// sections), the second writes the file. Peak memory is the write buffer,
+/// not a copy of the partition: at 1M × 512 an in-memory encoding needed
+/// several times the 2.9 GB file on top of the partition itself.
+fn encode_into<W: Write>(input: &SnapshotInput<'_>, out: W) -> Result<W, SnapshotError> {
     let slot_count = input.slots.len();
     if input.vectors.len() != slot_count || input.quantized.len() != slot_count {
         return Err(SnapshotError::Inconsistent(
             "vector counts differ from slot count",
         ));
     }
+    if input
+        .keys
+        .iter()
+        .any(|(key, _)| key.is_empty() || key.len() > u16::MAX as usize)
+    {
+        return Err(SnapshotError::Inconsistent("key length"));
+    }
     let live_count = input.slots.iter().filter(|s| !s.tombstone).count();
 
-    // Build sections.
-    let mut sections: Vec<(u16, Vec<u8>)> = Vec::new();
-
-    let mut keys = Vec::new();
-    for (key, slot) in input.keys {
-        if key.is_empty() || key.len() > u16::MAX as usize {
-            return Err(SnapshotError::Inconsistent("key length"));
-        }
-        keys.extend_from_slice(&(key.len() as u16).to_le_bytes());
-        keys.extend_from_slice(key);
-        keys.extend_from_slice(&slot.to_le_bytes());
-    }
-    sections.push((SECTION_KEYS, keys));
-
-    let mut slots = Vec::with_capacity(slot_count * 25);
-    let mut payloads = Vec::new();
-    for record in input.slots {
-        slots.extend_from_slice(&record.version.to_le_bytes());
-        slots.push(u8::from(record.tombstone));
-        slots.extend_from_slice(&record.key_index.to_le_bytes());
-        slots.extend_from_slice(&(payloads.len() as u64).to_le_bytes());
-        slots.extend_from_slice(&(record.payload.len() as u32).to_le_bytes());
-        payloads.extend_from_slice(&record.payload);
-    }
-    sections.push((SECTION_SLOTS, slots));
-    sections.push((SECTION_PAYLOADS, payloads));
-
-    let f32_rows = input.vectors.to_contiguous();
-    let mut f32_bytes = Vec::with_capacity(f32_rows.len() * 4);
-    for value in &f32_rows {
-        f32_bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    sections.push((SECTION_VECTORS_F32, f32_bytes));
-
-    let (codes, scales, norms) = input.quantized.parts();
-    let mut i8_bytes = Vec::with_capacity(codes.len() + scales.len() * 8);
-    for value in scales {
-        i8_bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    for value in norms {
-        i8_bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    i8_bytes.extend(codes.iter().map(|c| *c as u8));
-    sections.push((SECTION_VECTORS_I8, i8_bytes));
-
-    let g = &input.graph;
-    let mut graph = Vec::new();
-    graph.extend_from_slice(&(input.params.m as u32).to_le_bytes());
-    graph.extend_from_slice(&(input.params.m0 as u32).to_le_bytes());
-    graph.extend_from_slice(&(input.params.ef_construction as u32).to_le_bytes());
-    graph.extend_from_slice(&input.params.seed.to_le_bytes());
-    graph.extend_from_slice(&g.entry.unwrap_or(u32::MAX).to_le_bytes());
-    graph.push(g.max_level);
-    graph.extend_from_slice(&(g.tombstone_count as u64).to_le_bytes());
-    graph.extend_from_slice(g.levels);
-    graph.extend_from_slice(g.level0_len);
-    for slot in g.level0 {
-        graph.extend_from_slice(&slot.to_le_bytes());
-    }
-    for word in g.tombstones {
-        graph.extend_from_slice(&word.to_le_bytes());
-    }
-    for slot in 0..slot_count {
-        let level = g.levels[slot] as usize;
-        if level == 0 {
-            continue;
-        }
-        graph.extend_from_slice(&g.upper_len[slot]);
-        for neighbour in &g.upper[slot] {
-            graph.extend_from_slice(&neighbour.to_le_bytes());
-        }
-    }
-    sections.push((SECTION_GRAPH, graph));
-
-    let mut idem = Vec::with_capacity(input.idempotency.len() * 24);
-    for (op_id, seq) in input.idempotency {
-        idem.extend_from_slice(op_id);
-        idem.extend_from_slice(&seq.to_le_bytes());
-    }
-    sections.push((SECTION_IDEMPOTENCY, idem));
-
-    // Lay out: header, table, aligned sections, footer.
+    // Pass 1: lay out the sections.
     let table_offset = HEADER_LEN;
-    let mut cursor = table_offset + sections.len() * SECTION_ENTRY_LEN;
-    cursor = cursor.div_ceil(ALIGN) * ALIGN;
-    let mut table = Vec::with_capacity(sections.len() * SECTION_ENTRY_LEN);
-    let mut body = Vec::new();
-    for (kind, bytes) in &sections {
-        let offset = cursor + body.len();
+    let first_section =
+        (table_offset + SECTION_ORDER.len() * SECTION_ENTRY_LEN).div_ceil(ALIGN) * ALIGN;
+    let mut table = Vec::with_capacity(SECTION_ORDER.len() * SECTION_ENTRY_LEN);
+    let mut lengths = Vec::with_capacity(SECTION_ORDER.len());
+    let mut cursor = first_section as u64;
+    for kind in SECTION_ORDER {
+        let (len, digest) = digest_section(kind, input)?;
         table.extend_from_slice(&kind.to_le_bytes());
         table.extend_from_slice(&0_u16.to_le_bytes());
-        table.extend_from_slice(&(offset as u64).to_le_bytes());
-        table.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        table.extend_from_slice(blake3::hash(bytes).as_bytes());
-        body.extend_from_slice(bytes);
-        pad_to(&mut body, ALIGN);
+        table.extend_from_slice(&cursor.to_le_bytes());
+        table.extend_from_slice(&len.to_le_bytes());
+        table.extend_from_slice(digest.as_bytes());
+        lengths.push(len);
+        cursor = (cursor + len).div_ceil(ALIGN as u64) * ALIGN as u64;
     }
 
     let mut header = Vec::with_capacity(HEADER_LEN);
@@ -231,7 +297,7 @@ pub fn encode(input: &SnapshotInput<'_>) -> Result<Vec<u8>, SnapshotError> {
     header.extend_from_slice(&(live_count as u32).to_le_bytes());
     header.extend_from_slice(&(input.keys.len() as u32).to_le_bytes());
     header.extend_from_slice(&(input.idempotency.len() as u32).to_le_bytes());
-    header.extend_from_slice(&(sections.len() as u32).to_le_bytes());
+    header.extend_from_slice(&(SECTION_ORDER.len() as u32).to_le_bytes());
     header.extend_from_slice(&(table_offset as u64).to_le_bytes());
     while header.len() < HEADER_LEN - 4 {
         header.push(0);
@@ -239,15 +305,35 @@ pub fn encode(input: &SnapshotInput<'_>) -> Result<Vec<u8>, SnapshotError> {
     let crc = crc32c::crc32c(&header);
     header.extend_from_slice(&crc.to_le_bytes());
 
-    let mut file = Vec::with_capacity(HEADER_LEN + table.len() + body.len() + FOOTER_LEN + ALIGN);
-    file.extend_from_slice(&header);
-    file.extend_from_slice(&table);
-    pad_to(&mut file, ALIGN);
-    debug_assert_eq!(file.len(), cursor);
-    file.extend_from_slice(&body);
-    let digest = blake3::hash(&file);
-    file.extend_from_slice(digest.as_bytes());
-    Ok(file)
+    // Pass 2: header, table, aligned sections, then the footer digest of
+    // everything before it.
+    let mut file = io::BufWriter::with_capacity(WRITE_BUFFER, Digesting::new(out));
+    file.write_all(&header)?;
+    file.write_all(&table)?;
+    write_zeros(&mut file, first_section - HEADER_LEN - table.len())?;
+    let position =
+        |file: &io::BufWriter<Digesting<W>>| file.get_ref().len + file.buffer().len() as u64;
+    for (kind, len) in SECTION_ORDER.into_iter().zip(lengths) {
+        let start = position(&file);
+        encode_section(kind, input, &mut file)?;
+        if position(&file) - start != len {
+            return Err(SnapshotError::Inconsistent(
+                "section length changed between passes",
+            ));
+        }
+        let pad = (len.div_ceil(ALIGN as u64) * ALIGN as u64 - len) as usize;
+        write_zeros(&mut file, pad)?;
+    }
+    let mut digesting = file.into_inner().map_err(|e| e.into_error())?;
+    let digest = digesting.hasher.finalize();
+    digesting.inner.write_all(digest.as_bytes())?;
+    Ok(digesting.inner)
+}
+
+/// Serialize a snapshot into memory: the same bytes [`write`] puts in the
+/// file. For tests and small partitions only; it holds the whole file.
+pub fn encode(input: &SnapshotInput<'_>) -> Result<Vec<u8>, SnapshotError> {
+    encode_into(input, Vec::new())
 }
 
 /// Durably write a snapshot to `directory/<high_water>.snap` via temp file,
@@ -265,23 +351,22 @@ pub fn write_with_hook(
     before_rename: &dyn Fn() -> bool,
 ) -> Result<PathBuf, SnapshotError> {
     fsutil::create_dir_durable(directory)?;
-    let bytes = encode(input)?;
     let final_path = directory.join(snapshot_name(input.high_water));
     let temporary = directory.join(format!(".{}.tmp", Uuid::new_v4()));
     let result = (|| {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&temporary)?;
-        file.write_all(&bytes)?;
+        let file = encode_into(input, file)?;
         file.sync_all()?;
         drop(file);
         if !before_rename() {
-            return Err(io::Error::other("snapshot aborted before rename"));
+            return Err(io::Error::other("snapshot aborted before rename").into());
         }
         fs::rename(&temporary, &final_path)?;
         fsutil::sync_dir(directory)?;
-        Ok::<(), io::Error>(())
+        Ok::<(), SnapshotError>(())
     })();
     // A failure leaves the temporary file; open() ignores non-snapshot names.
     result?;
