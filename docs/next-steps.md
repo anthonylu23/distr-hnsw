@@ -38,9 +38,12 @@ tracks only the immediate work queue.
    - the license copyright line stays "The distr-hnsw authors";
    - the personal vault fixture leaves the tree without a history rewrite;
      the repository is already public, so a rewrite would not withdraw it.
-4. To re-accept M1: `scripts/power-loss-drill.sh` (sudo, run by the owner)
-   on btrfs, ext4, and XFS for the changed durable-write paths (re-PUT
-   directory sync), then the acceptance review.
+4. To re-accept M1: the power-loss drill re-ran from `27e9bf9` on
+   2026-10-28 and passed 8/8 on btrfs, ext4, and XFS, but it exercises only
+   fresh PUTs. Extend `scripts/power-loss-drill.sh` to cover the two
+   changed paths (a re-PUT after a crash between rename and directory sync,
+   and the master key written on the drilled volume), re-run it, then hold
+   the acceptance review.
 5. To accept M3: build `project-nomic-512` (200k, then 1M) now that the GPU
    is free, and run `oracle`, `hnsw`, `filtered`, `persist`, and `compact`
    on it with `--canonical`. This supplies the representative recall row

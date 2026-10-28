@@ -2,7 +2,7 @@
 
 Status: **dm-log-writes drill passed on btrfs, ext4, and XFS (kernel
 7.1.9-200.fc44, loop devices); qualified-with-caveats. APFS not qualified.**
-(2026-09-29)
+(2026-09-29; fresh-PUT path re-run from `27e9bf9` on 2026-10-28)
 
 This document reviews the durable-write path in
 `crates/distr-hnsw/src/durability.rs` against the filesystems distr-hnsw is
@@ -59,9 +59,10 @@ The same helpers persist the SQLite parent directory (`metadata.rs`) and the
 portal staging directory (`portal.rs`), so the conclusions apply to those
 paths too. Until the hardening pass the master key was written directly to its
 final path. It now follows the same sequence with a hard link in place of
-the rename, so an existing key is never replaced (`crypto.rs`). These
-changed paths have not yet been re-run through the power-loss drill (see
-[hardening-2026-10.md](hardening-2026-10.md)).
+the rename, so an existing key is never replaced (`crypto.rs`). The
+2026-10-28 drill re-run does not exercise either changed path: the drill
+writes the master key outside the dm-backed volume and never re-PUTs an
+existing object (see [hardening-2026-10.md](hardening-2026-10.md)).
 
 ## Per-filesystem analysis
 
@@ -224,6 +225,25 @@ object acknowledged only after that mark was visible. The negative control
 (a file written with no `fsync` immediately before its own mark) replayed as
 absent on all three, which confirms the log was dropping cached writes rather
 than passing everything through.
+
+### Re-run after the hardening pass, 2026-10-28
+
+Same host, kernel, tools, and procedure, from the clean revision `27e9bf9`
+(the hardening fixes plus later engine and documentation commits). Every
+filesystem again passed 8/8 marks with 20/20 objects present and hash-valid
+at the last mark, a clean read-only check at every mark, and the negative
+control lost (0 of 1,048,576 un-fsynced bytes visible).
+
+| Filesystem | Log entries | Marks passed | Wall clock |
+| --- | --- | --- | --- |
+| btrfs | 1106 | 8/8 | 21 s |
+| ext4 | 1697 | 8/8 | 11 s |
+| XFS | 394 | 8/8 | 7 s |
+
+This shows the hardening changes did not regress the fresh-PUT path. It is
+not evidence for the two durable-write paths the hardening pass changed:
+the re-PUT directory sync and the master key write are not on the drilled
+volume.
 
 ## Drill: dm-log-writes on `anthonypc`
 

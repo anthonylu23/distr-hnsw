@@ -120,9 +120,10 @@ blob-plane slice in `docs/roadmap.md`.
 **M1 status:** Reopened 2026-10-25 (accepted 2026-09-30). The audit in
 `docs/hardening-2026-10.md` found GC, retirement, backup, and recovery
 defects; the fixes are covered by `tests/hardening.rs`, and the drills
-passed again from the clean revision `dc276f3` on 2026-10-27. Re-acceptance
-follows a power-loss drill re-run (`scripts/power-loss-drill.sh`, sudo,
-run by the owner).
+passed again from the clean revision `dc276f3` on 2026-10-27. The
+power-loss drill re-ran clean on 2026-10-28 but covers only fresh PUTs;
+re-acceptance waits on extending it to the re-PUT and master-key paths
+(`docs/next-steps.md`).
 The blob plane (`crates/distr-hnsw/`) provides the RF2 commit spine, logical
 deletion, recovery, incarnations and observations, scrub/repair, drain,
 retire, capacity admission, proof-based GC, master-key recovery bundles, and
