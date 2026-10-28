@@ -100,6 +100,17 @@ in what order, and how each criterion will be proven.
    CSRF token bound to the session. Single-user v1, multi-user-ready
    schema (DESIGN §9).
 
+## Progress
+
+- **Work package 1 — done 2026-10-28.** `crates/distr-hnsw/src/tailscale.rs`
+  holds the LocalAPI client (`status`, `whois`) and bind discipline
+  (`--bind tailnet:<port>`, `--insecure-loopback`, startup wait, address
+  watcher with exit status 75). Agent health reports `bind_mode`. Until
+  work packages 2 and 3 land, an agent resolves a tailnet bind but refuses
+  to serve on it, because its routes are still unauthenticated. Tests:
+  `tests/tailscale_localapi.rs` (fake LocalAPI). Every drill and process
+  test passes `--insecure-loopback`.
+
 ## Work packages
 
 | # | Package | Proves |

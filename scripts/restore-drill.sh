@@ -73,7 +73,7 @@ start_agents() {
   for i in $(seq 1 "$AGENT_COUNT"); do
     local id="agent-$i" domain="host-$i" port volume
     port="$(free_port)"; volume="$root/$id"; mkdir -p "$volume"
-    "$BIN" agent --id "$id" --failure-domain "$domain" --bind "127.0.0.1:$port" --volume "$volume" \
+    "$BIN" agent --id "$id" --failure-domain "$domain" --bind "127.0.0.1:$port" --insecure-loopback --volume "$volume" \
       >"$root/$id.log" 2>&1 &
     PIDS+=("$!")
     for _ in $(seq 1 100); do curl -sf "http://127.0.0.1:$port/v1/health" >/dev/null && break; sleep 0.05; done

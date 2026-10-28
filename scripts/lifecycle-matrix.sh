@@ -47,7 +47,7 @@ declare -a TARGETS=()
 start_agent() {
   local id="$1" domain="$2" port volume
   port="$(free_port)"; volume="$WORK/$id"; mkdir -p "$volume"
-  "$BIN" agent --id "$id" --failure-domain "$domain" --bind "127.0.0.1:$port" --volume "$volume" >"$WORK/$id.log" 2>&1 &
+  "$BIN" agent --id "$id" --failure-domain "$domain" --bind "127.0.0.1:$port" --insecure-loopback --volume "$volume" >"$WORK/$id.log" 2>&1 &
   PIDS+=("$!"); AGENT_PID["$id"]="$!"
   for _ in $(seq 1 100); do curl -sf "http://127.0.0.1:$port/v1/health" >/dev/null && break; sleep 0.05; done
   TARGETS+=("$id,$domain,http://127.0.0.1:$port")

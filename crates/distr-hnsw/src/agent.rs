@@ -1,11 +1,10 @@
 use std::{
-    net::SocketAddr,
     path::PathBuf,
     sync::{
         atomic::{AtomicI64, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -22,6 +21,7 @@ use tokio::net::TcpListener;
 use crate::{
     durability::{DurableStore, InventoryPage, StoreError, StoreFailpoint, MAX_INVENTORY_PAGE},
     object::{ObjectHash, ObjectKind},
+    tailscale::{self, BindMode, BindSpec, LocalApi},
     CHUNK_SIZE,
 };
 
@@ -77,6 +77,7 @@ pub struct CapacityReport {
 struct AgentState {
     store: Arc<DurableStore>,
     health: AgentHealth,
+    bind_mode: BindMode,
     capacity: CapacityConfig,
     last_refusal_at: Arc<AtomicI64>,
     last_enospc_at: Arc<AtomicI64>,
@@ -189,13 +190,15 @@ pub struct AgentHealth {
     pub incarnation_id: String,
 }
 
-/// Full health response: identity plus capacity.
+/// Full health response: identity, capacity, and how the agent is bound.
 #[derive(Clone, Debug, Serialize)]
 pub struct AgentHealthResponse {
     pub id: String,
     pub failure_domain: String,
     pub incarnation_id: String,
     pub capacity: CapacityReport,
+    /// `tailnet`, or `insecure_loopback` when the operator chose loopback.
+    pub bind_mode: &'static str,
 }
 
 pub async fn serve_agent(
@@ -206,52 +209,110 @@ pub async fn serve_agent(
     serve_agent_with_capacity(listener, volume, identity, CapacityConfig::default()).await
 }
 
+/// Serve an agent on a listener the caller bound to loopback (tests).
 pub async fn serve_agent_with_capacity(
     listener: TcpListener,
     volume: PathBuf,
     identity: AgentIdentity,
     capacity: CapacityConfig,
 ) -> anyhow::Result<()> {
-    serve_store(listener, DurableStore::open(volume)?, identity, capacity).await
-}
-
-async fn serve_store(
-    listener: TcpListener,
-    store: DurableStore,
-    identity: AgentIdentity,
-    capacity: CapacityConfig,
-) -> anyhow::Result<()> {
-    let swept = store.sweep_stale_temporaries(std::time::Duration::from_secs(3600))?;
-    if swept > 0 {
-        eprintln!("removed {swept} stale temporary file(s) left by interrupted writes");
-    }
-    let router = router(store, identity, capacity)?;
+    let router = prepared_router(
+        DurableStore::open(volume)?,
+        identity,
+        capacity,
+        BindMode::InsecureLoopback,
+    )?;
     axum::serve(listener, router).await?;
     Ok(())
 }
 
+fn prepared_router(
+    store: DurableStore,
+    identity: AgentIdentity,
+    capacity: CapacityConfig,
+    bind_mode: BindMode,
+) -> anyhow::Result<Router> {
+    let swept = store.sweep_stale_temporaries(std::time::Duration::from_secs(3600))?;
+    if swept > 0 {
+        eprintln!("removed {swept} stale temporary file(s) left by interrupted writes");
+    }
+    Ok(router_with_mode(store, identity, capacity, bind_mode)?)
+}
+
+/// How an agent listens (docs/m2-implementation-plan.md, decision 2).
+#[derive(Clone, Debug)]
+pub struct AgentBind {
+    pub spec: BindSpec,
+    pub insecure_loopback: bool,
+    pub api: LocalApi,
+    /// How long to wait for `tailscaled` at startup.
+    pub tailnet_wait: Duration,
+    /// How often to check that this node still owns the bound address.
+    pub address_poll: Duration,
+}
+
+/// The agent's tailnet address changed or vanished while it was serving.
+#[derive(Debug, thiserror::Error)]
+#[error("tailnet address {0} is no longer this node's; restart to rebind")]
+pub struct TailnetAddressChanged(pub std::net::IpAddr);
+
 pub async fn bind_and_serve_agent(
-    bind: SocketAddr,
+    bind: AgentBind,
     volume: PathBuf,
     identity: AgentIdentity,
     capacity: CapacityConfig,
     failpoint: Option<StoreFailpoint>,
 ) -> anyhow::Result<()> {
-    if !bind.ip().is_loopback() {
-        anyhow::bail!("M1 agent must bind to a loopback address; Tailscale authorization is M2")
+    let (listener, mode) = tailscale::bind_listener(
+        bind.spec,
+        bind.insecure_loopback,
+        &bind.api,
+        bind.tailnet_wait,
+    )
+    .await?;
+    let local = listener.local_addr()?;
+    if mode == BindMode::Tailnet {
+        // Agent routes are unauthenticated until capability grants and join
+        // land (M2 work packages 2 and 3); on a tailnet address any node
+        // could call DELETE.
+        anyhow::bail!(
+            "refusing to serve on tailnet address {local}: agents accept tailnet \
+             traffic only with capability grants (M2 work package 2); use \
+             --insecure-loopback until then"
+        );
     }
-    let listener = TcpListener::bind(bind).await?;
+    eprintln!("warning: agent bound to loopback {local} with --insecure-loopback");
     let mut store = DurableStore::open(volume)?;
     if let Some(failpoint) = failpoint {
         store = store.with_failpoint(failpoint);
     }
-    serve_store(listener, store, identity, capacity).await
+    let router = prepared_router(store, identity, capacity, mode)?;
+    let server = axum::serve(listener, router);
+    if mode == BindMode::InsecureLoopback {
+        server.await?;
+        return Ok(());
+    }
+    tokio::select! {
+        served = server => served.map_err(anyhow::Error::from),
+        lost = tailscale::address_lost(bind.api, local.ip(), bind.address_poll) => {
+            Err(TailnetAddressChanged(lost).into())
+        }
+    }
 }
 
 pub fn router(
     store: DurableStore,
     identity: AgentIdentity,
     capacity: CapacityConfig,
+) -> Result<Router, StoreError> {
+    router_with_mode(store, identity, capacity, BindMode::InsecureLoopback)
+}
+
+fn router_with_mode(
+    store: DurableStore,
+    identity: AgentIdentity,
+    capacity: CapacityConfig,
+    bind_mode: BindMode,
 ) -> Result<Router, StoreError> {
     let incarnation_id = store.load_or_create_incarnation()?;
     let state = AgentState {
@@ -261,6 +322,7 @@ pub fn router(
             failure_domain: identity.failure_domain,
             incarnation_id,
         },
+        bind_mode,
         capacity,
         last_refusal_at: Arc::new(AtomicI64::new(0)),
         last_enospc_at: Arc::new(AtomicI64::new(0)),
@@ -283,6 +345,10 @@ async fn health(State(state): State<AgentState>) -> Result<Json<AgentHealthRespo
         failure_domain: state.health.failure_domain.clone(),
         incarnation_id: state.health.incarnation_id.clone(),
         capacity,
+        bind_mode: match state.bind_mode {
+            BindMode::Tailnet => "tailnet",
+            BindMode::InsecureLoopback => "insecure_loopback",
+        },
     }))
 }
 

@@ -273,7 +273,7 @@ mount /dev/mapper/dhq /mnt/dhq
 
 # 2. Run an agent on the volume; after each acknowledged portal put, record
 #    the manifest/chunk hashes and insert a mark named after the upload.
-distr-hnsw agent --id a --failure-domain host-a --bind 127.0.0.1:7101 \
+distr-hnsw agent --id a --failure-domain host-a --bind 127.0.0.1:7101 --insecure-loopback \
   --volume /mnt/dhq/agent-a &
 #    (distr-hnsw portal put ...; dmsetup message dhq 0 mark <upload-id>)
 

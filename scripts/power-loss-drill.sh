@@ -84,7 +84,7 @@ done
 # A failpoints build rejects an unknown agent failpoint by name; a build
 # without failpoints refuses any.
 FP_PROBE="$(DISTR_HNSW_AGENT_FAILPOINT=probe "$BIN" agent --id probe --failure-domain probe \
-    --bind 127.0.0.1:1 --volume "$DRILL/failpoint-probe" 2>&1 || true)"
+    --bind 127.0.0.1:1 --insecure-loopback --volume "$DRILL/failpoint-probe" 2>&1 || true)"
 rm -rf "$DRILL/failpoint-probe"
 case "$FP_PROBE" in
     *"unknown agent failpoint"*) ;;
@@ -155,7 +155,7 @@ wait_health() {
 LAST_PID=""
 start_agent() {
     local id="$1" domain="$2" port="$3" volume="$4" logfile="$5"
-    env ${AGENT_FAILPOINT:+DISTR_HNSW_AGENT_FAILPOINT=$AGENT_FAILPOINT} "$BIN" agent --id "$id" --failure-domain "$domain" --bind "127.0.0.1:$port" --volume "$volume" >"$logfile" 2>&1 &
+    env ${AGENT_FAILPOINT:+DISTR_HNSW_AGENT_FAILPOINT=$AGENT_FAILPOINT} "$BIN" agent --id "$id" --failure-domain "$domain" --bind "127.0.0.1:$port" --insecure-loopback --volume "$volume" >"$logfile" 2>&1 &
     LAST_PID=$!
     AGENT_PIDS+=("$LAST_PID")
 }

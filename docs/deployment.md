@@ -30,7 +30,7 @@ recovery ready (below). M1 is accepted, with the limitations below
 
 | Piece | What to provision |
 |---|---|
-| Agents | One `distr-hnsw agent` per volume, each with a unique `--id`, its own `--failure-domain`, a loopback `--bind`, and a `--volume` directory on a qualified filesystem. Optional `--quota-bytes`, `--reserve-bytes`, `--hard-floor-bytes`. |
+| Agents | One `distr-hnsw agent` per volume, each with a unique `--id`, its own `--failure-domain`, a loopback `--bind` with `--insecure-loopback`, and a `--volume` directory on a qualified filesystem. Optional `--quota-bytes`, `--reserve-bytes`, `--hard-floor-bytes`. Agents refuse wildcard and non-tailnet addresses, and refuse to serve on a tailnet address until capability grants land (M2). |
 | Portal database | One SQLite file (`--database`) on a qualified filesystem. Back it up through `portal backup`, not by copying the file. |
 | Master key | A file with mode `0600` (`--master-key`). Its recovery bundle and passphrase must be stored apart from the cluster and from each other. |
 | Backup target | `dir:<path>` on a rotated or remote disk, or `s3:<bucket>[/<prefix>]` with bucket versioning and governance-mode Object Lock. S3 endpoint and credentials come from `DISTR_HNSW_S3_ENDPOINT` and the standard `AWS_*` variables. |
@@ -41,9 +41,10 @@ recovery ready (below). M1 is accepted, with the limitations below
 cargo build --release -p distr-hnsw
 BIN=target/release/distr-hnsw
 
-# Agents (one per volume / failure domain)
-$BIN agent --id a1 --failure-domain disk-1 --bind 127.0.0.1:7101 --volume /srv/dh/a1 &
-$BIN agent --id a2 --failure-domain disk-2 --bind 127.0.0.1:7102 --volume /srv/dh/a2 &
+# Agents (one per volume / failure domain). Until M2's capability grants
+# land, agents serve only on loopback, which must be chosen explicitly.
+$BIN agent --id a1 --failure-domain disk-1 --bind 127.0.0.1:7101 --insecure-loopback --volume /srv/dh/a1 &
+$BIN agent --id a2 --failure-domain disk-2 --bind 127.0.0.1:7102 --insecure-loopback --volume /srv/dh/a2 &
 
 # Portal: creates the key and database and prints the recovery bundle once.
 $BIN portal init --database /var/lib/distr-hnsw/portal.sqlite \

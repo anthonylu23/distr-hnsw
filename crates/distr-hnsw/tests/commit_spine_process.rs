@@ -55,6 +55,7 @@ fn start_agent_with_env(
             domain,
             "--bind",
             &address.to_string(),
+            "--insecure-loopback",
             "--volume",
         ])
         .arg(volume)
@@ -976,6 +977,7 @@ fn agent_refuses_an_unknown_failpoint() {
             "host-a",
             "--bind",
             &free_address().to_string(),
+            "--insecure-loopback",
             "--volume",
         ])
         .arg(workspace.path().join("agent-a"))

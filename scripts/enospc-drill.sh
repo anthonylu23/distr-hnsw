@@ -124,7 +124,7 @@ LAST_PID=""
 start_agent() {
     local id="$1" domain="$2" port="$3" volume="$4" logfile="$5"
     shift 5
-    "$BIN" agent --id "$id" --failure-domain "$domain" --bind "127.0.0.1:$port" --volume "$volume" "$@" >>"$logfile" 2>&1 &
+    "$BIN" agent --id "$id" --failure-domain "$domain" --bind "127.0.0.1:$port" --insecure-loopback --volume "$volume" "$@" >>"$logfile" 2>&1 &
     LAST_PID=$!
     AGENT_PIDS+=("$LAST_PID")
 }

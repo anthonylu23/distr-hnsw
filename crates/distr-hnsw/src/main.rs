@@ -1,6 +1,5 @@
 use std::{
     io::{self, Read, Write},
-    net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -8,7 +7,9 @@ use std::{
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use distr_hnsw::{
-    agent::{bind_and_serve_agent, AgentIdentity, CapacityConfig},
+    agent::{
+        bind_and_serve_agent, AgentBind, AgentIdentity, CapacityConfig, TailnetAddressChanged,
+    },
     backup::{self, BackupTargetSpec},
     crypto::MasterKey,
     durability::StoreFailpoint,
@@ -17,6 +18,7 @@ use distr_hnsw::{
     portal::{prepare_agents, AgentTarget, Failpoint, FailpointAction, Portal},
     reconcile::{health_report, scrub},
     recovery_bundle::{self, KdfParams},
+    tailscale::{self, BindSpec, LocalApi},
 };
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -30,14 +32,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a loopback-only M1 opaque-object agent.
+    /// Run an opaque-object agent on this node's tailnet address.
     Agent {
         #[arg(long)]
         id: String,
         #[arg(long)]
         failure_domain: String,
+        /// `tailnet:<port>` (this node's tailnet IPv4 address), or an explicit
+        /// address that is one of this node's tailnet addresses. Wildcards
+        /// are refused; loopback needs --insecure-loopback.
         #[arg(long)]
-        bind: SocketAddr,
+        bind: BindSpec,
+        /// Allow a loopback --bind for tests and single-host development.
+        /// Health reports the mode; peers have no tailnet identity.
+        #[arg(long)]
+        insecure_loopback: bool,
+        /// Seconds to wait for tailscaled at startup.
+        #[arg(long, default_value_t = 120)]
+        tailnet_wait_seconds: u64,
+        /// Milliseconds between checks that this node still owns the bound
+        /// tailnet address; on a change the agent exits with status 75.
+        #[arg(long, default_value_t = 5000, hide = true)]
+        tailnet_poll_ms: u64,
         #[arg(long)]
         volume: PathBuf,
         /// Maximum bytes this volume may hold (default: filesystem size).
@@ -454,13 +470,22 @@ async fn main() -> anyhow::Result<()> {
             id,
             failure_domain,
             bind,
+            insecure_loopback,
+            tailnet_wait_seconds,
+            tailnet_poll_ms,
             volume,
             quota_bytes,
             reserve_bytes,
             hard_floor_bytes,
         } => {
-            bind_and_serve_agent(
-                bind,
+            let served = bind_and_serve_agent(
+                AgentBind {
+                    spec: bind,
+                    insecure_loopback,
+                    api: LocalApi::from_env(),
+                    tailnet_wait: std::time::Duration::from_secs(tailnet_wait_seconds),
+                    address_poll: std::time::Duration::from_millis(tailnet_poll_ms),
+                },
                 volume,
                 AgentIdentity { id, failure_domain },
                 CapacityConfig {
@@ -470,7 +495,14 @@ async fn main() -> anyhow::Result<()> {
                 },
                 env_agent_failpoint()?,
             )
-            .await
+            .await;
+            if let Err(error) = &served {
+                if error.downcast_ref::<TailnetAddressChanged>().is_some() {
+                    eprintln!("error: {error}");
+                    std::process::exit(tailscale::EXIT_TAILNET_ADDRESS_CHANGED);
+                }
+            }
+            served
         }
         Command::Index { command } => match command {
             IndexCommand::Archive {
