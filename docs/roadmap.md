@@ -12,7 +12,7 @@ design first and then bring this document back into alignment.
 |---|---|---|
 | M0 — Semantic validation | **Accepted** | Larger representative bake-off produces a documented go decision and locks the default local model and dimensions |
 | M1 — Blob plane and recovery foundation | **Accepted** (2026-10-28; first accepted 2026-09-30, reopened 2026-10-25) | Blob durability and an empty-infrastructure restore drill pass |
-| M2 — Tailscale identity and authorization | Not started (follows the hardening pass) | Network identity, sessions, grants, and API-key boundaries pass adversarial tests |
+| M2 — Tailscale identity and authorization | **In progress** (plan 2026-10-28, [m2-implementation-plan.md](m2-implementation-plan.md)) | Network identity, sessions, grants, and API-key boundaries pass adversarial tests |
 | M3 — Single-partition vector engine | **Accepted** (2026-10-28; first exit review 2026-10-01, withdrawn 2026-10-25) | Persistence, recovery, recall, filtering, and compaction gates pass against brute force |
 | M4 — Distributed vector plane | Not started | Quorum, fencing, promotion, movement, and balancing survive failure injection |
 | M5 — File extraction and semantic retrieval | Not started | Files flow safely from extraction through reproducible hybrid search |

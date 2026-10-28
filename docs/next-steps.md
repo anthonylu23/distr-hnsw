@@ -13,7 +13,7 @@ tracks only the immediate work queue.
   2026-10-28**. M3's exit review was withdrawn on 2026-10-25 and M3 was
   **accepted on 2026-10-28**. Both reopenings came from the audit in
   [hardening-2026-10.md](hardening-2026-10.md), which is now closed.
-- M2 is next.
+- M2 is in progress ([m2-implementation-plan.md](m2-implementation-plan.md)).
 
 ## Hardening pass (closed 2026-10-28)
 
@@ -51,14 +51,20 @@ tracks only the immediate work queue.
    `684ddfe`) and that the persistence bench under-reported recall
    (`46757b8`).
 
-## After hardening
+## M2 (now)
 
-1. **M2 (Tailscale identity and authorization).** Choose the test tailnet
-   (a second machine or VM as the unauthorized node) and the portal
-   certificate approach. The authorization matrix must cover agent `DELETE`
-   and inventory first, bind agent ids to node keys, and refuse a DELETE
-   without a portal-signed GC proof.
-2. **M4 design prerequisites** (design before code):
+Plan: [m2-implementation-plan.md](m2-implementation-plan.md). Work packages
+1 to 3 (LocalAPI client and bind discipline, signed capability grants on
+every agent route with `DELETE` only for an applied GC proof, join tokens
+and key rotation) run first, because they close the agents' open `DELETE`
+and inventory surface. The development laptop serves as the unauthorized
+tailnet node. The owner's tailnet HTTPS is off-limits: certificates are
+tested against a fake LocalAPI, and live certificate evidence waits on a
+dedicated test tailnet.
+
+## After M2
+
+1. **M4 design prerequisites** (design before code):
    - WAL and snapshot entries carry no epoch; promotion needs `(epoch, seq)`
      or a hash chain, which is a format v2 change.
    - Parallel build is scheduling-dependent, so replicas diverge after
@@ -66,10 +72,10 @@ tracks only the immediate work queue.
    - The engine needs a concurrency model for searches during compaction
      finish and snapshot writes.
    - Snapshot cadence, compaction scheduling, and WAL group commit.
-3. Done 2026-10-28: **open-source hygiene.** Public docs and scripts name
+2. Done 2026-10-28: **open-source hygiene.** Public docs and scripts name
    hosts by role ([test-hosts.md](test-hosts.md)) and take SSH destinations
    from environment variables; CI runs fmt, clippy, and the non-sudo tests.
-4. **Engine follow-ups carried from M3** (none blocks M2): a subprocess
+3. **Engine follow-ups carried from M3** (none blocks M2): a subprocess
    `kill -9` harness and a power-loss run for the engine; RAM admission
    for compaction (a 1M × 512 compaction holds a second copy of the live
    rows); cold-cache recovery; an int8 brute-force route to cheapen

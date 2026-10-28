@@ -5,7 +5,7 @@ encrypted blobs plus distributed HNSW vector search. Product design lives in
 `DESIGN.md`. M0, M1 (blob plane, `crates/distr-hnsw/`), and M3 (vector
 engine, `crates/distr-hnsw-index/`) are accepted; the October 2026
 hardening pass (`docs/hardening-2026-10.md`) closed on 2026-10-28. M2
-(Tailscale identity) is next.
+(Tailscale identity) is in progress (`docs/m2-implementation-plan.md`).
 
 
 ## Stack
@@ -63,6 +63,8 @@ hardening pass (`docs/hardening-2026-10.md`) closed on 2026-10-28. M2
 - `docs/m1-storage-contract.md` — persistent-format and durability contract for
   the implemented M1 blob-plane passes.
 - `docs/m1-implementation-plan.md` — M1 work packages and dependency order.
+- `docs/m2-implementation-plan.md` — M2 decisions, work packages, and the
+  constraint that the owner's tailnet HTTPS is never touched.
 - `docs/m1-lifecycle-contract.md` — safety gates for reconciliation, movement,
   retirement, and physical deletion.
 - `docs/m1-filesystem-qualification.md` — durable-write review per filesystem
