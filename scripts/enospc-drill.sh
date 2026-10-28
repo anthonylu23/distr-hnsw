@@ -79,6 +79,10 @@ for tool in mkfs.ext4 losetup fallocate jq sha256sum stat findmnt; do
     command -v "$tool" >/dev/null || die "missing tool: $tool"
 done
 sudo -n true 2>/dev/null || die "passwordless sudo required"
+# Run as a normal user; the script calls sudo itself. As root, the agents
+# could write into ext4's reserved blocks, and the block-exact fill in phase 2
+# would never reach the kernel's ENOSPC.
+[ "$(id -u)" != 0 ] || die "run as a normal user, not under sudo (the script uses sudo where it needs root)"
 
 # --- state for cleanup -------------------------------------------------------
 DEV=""
