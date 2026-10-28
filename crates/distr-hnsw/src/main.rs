@@ -2,6 +2,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -17,12 +18,16 @@ use distr_hnsw::{
     crypto::MasterKey,
     durability::StoreFailpoint,
     lifecycle::{self, GcOptions},
-    metadata::{Database, JobMode, KeyBinding},
+    metadata::{AuditRecord, Database, JobMode, KeyBinding, UserRow},
     object::{ObjectHash, ObjectKind},
     portal::{prepare_agents, AgentTarget, Failpoint, FailpointAction, Portal},
+    portal_server::{
+        audit_view, new_api_key, serve_portal, KeyNode, PortalServeConfig, ServeLimits,
+    },
     reconcile::{health_report, scrub},
     recovery_bundle::{self, KdfParams},
     tailscale::{self, BindSpec, LocalApi},
+    tls::RenewalPolicy,
 };
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -238,6 +243,59 @@ enum PortalCommand {
         #[arg(long, default_value_t = 0)]
         verify_sample: usize,
     },
+    /// Serve the portal API over HTTPS on this node's tailnet address, with
+    /// the node's certificate from tailscaled. Callers are identified by
+    /// WhoIs on every connection; see docs/deployment.md.
+    Serve {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        master_key: PathBuf,
+        #[arg(long = "agent", required = true)]
+        agents: Vec<AgentTarget>,
+        /// `tailnet:<port>` or one of this node's tailnet addresses. Loopback
+        /// and wildcards are refused. The default stays off 443.
+        #[arg(long, default_value = "tailnet:8443")]
+        bind: BindSpec,
+        /// Certificate domain (default: the first one LocalAPI lists).
+        #[arg(long)]
+        tls_domain: Option<String>,
+        /// Seconds to wait for tailscaled and the first certificate.
+        #[arg(long, default_value_t = 120)]
+        tailnet_wait_seconds: u64,
+        #[arg(long, default_value_t = 5000, hide = true)]
+        tailnet_poll_ms: u64,
+        /// First retry delay after a failed certificate fetch.
+        #[arg(long, default_value_t = 30_000, hide = true)]
+        cert_retry_ms: u64,
+        /// Largest accepted upload body.
+        #[arg(long, default_value_t = 4 << 30)]
+        max_upload_bytes: u64,
+        /// Allow browser sign-in from this node. Any process here passes
+        /// WhoIs as the node's owner, so this is off by default.
+        #[arg(long)]
+        allow_portal_node_sign_in: bool,
+    },
+    /// Manage portal users (each is identified by a Tailscale login).
+    User {
+        #[command(subcommand)]
+        command: UserCommand,
+    },
+    /// Manage application API keys (scoped to collections).
+    ApiKey {
+        #[command(subcommand)]
+        command: ApiKeyCommand,
+    },
+    /// Print audit-log records as JSON lines.
+    Audit {
+        #[arg(long)]
+        database: PathBuf,
+        /// Only records after this sequence number.
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+    },
     /// Join agents: issue single-use tokens and send joined agents the
     /// portal's key set.
     Agent {
@@ -345,6 +403,72 @@ enum AgentRequest {
     Inventory,
     Get,
     Put,
+}
+
+#[derive(Subcommand)]
+enum UserCommand {
+    /// Add a user who signs in as this Tailscale login (the name tailnet
+    /// ACLs use, for example `alice@github`).
+    Add {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        tailscale_login: String,
+        #[arg(long)]
+        display_name: Option<String>,
+    },
+    List {
+        #[arg(long)]
+        database: PathBuf,
+    },
+    /// Disable a user and revoke all of their sessions and API keys.
+    Disable {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        user_id: Uuid,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApiKeyCommand {
+    /// Create a key and print it once. Only its verifier is stored.
+    Create {
+        #[arg(long)]
+        database: PathBuf,
+        /// The owning user's Tailscale login.
+        #[arg(long)]
+        tailscale_login: String,
+        #[arg(long)]
+        name: String,
+        /// `collection:read|write|admin`; repeat for more collections.
+        /// `files` covers /api/files.
+        #[arg(long = "scope", required = true)]
+        scopes: Vec<String>,
+        /// Accept the key only from this tailnet node (its stable node id,
+        /// as `tailscale status --json` lists it).
+        #[arg(
+            long,
+            required_unless_present = "any_node",
+            conflicts_with = "any_node"
+        )]
+        node: Option<String>,
+        /// Accept the key from any tailnet node; only the key is checked.
+        #[arg(long)]
+        any_node: bool,
+        #[arg(long)]
+        expires_in_days: Option<u32>,
+    },
+    List {
+        #[arg(long)]
+        database: PathBuf,
+    },
+    Revoke {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        key_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -524,10 +648,6 @@ fn with_env_failpoint(portal: Portal) -> anyhow::Result<Portal> {
     }
 }
 
-/// The agent's counterpart to [`with_env_failpoint`], read from
-/// `DISTR_HNSW_AGENT_FAILPOINT` so a variable meant for a portal command
-/// never reaches an agent, with the same refusal in builds without
-/// failpoints.
 fn now_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -541,6 +661,36 @@ fn bound_master_key(database: &mut Database, path: &Path) -> anyhow::Result<Mast
     let key = MasterKey::load(path)?;
     database.bind_master_key_id(&key.key_id_hex())?;
     Ok(key)
+}
+
+/// Audit an identity change made from the command line on this host.
+fn cli_audit(
+    database: &mut Database,
+    event: &str,
+    target: String,
+    detail: Option<String>,
+) -> anyhow::Result<()> {
+    database.append_audit(&AuditRecord {
+        at: now_seconds(),
+        event: event.into(),
+        outcome: "allowed".into(),
+        peer: Some("cli".into()),
+        target: Some(target),
+        detail,
+        ..AuditRecord::default()
+    })?;
+    Ok(())
+}
+
+fn user_json(user: &UserRow) -> serde_json::Value {
+    serde_json::json!({
+        "user_id": user.user_id,
+        "display_name": user.display_name,
+        "role": user.role,
+        "logins": user.logins,
+        "created_at": user.created_at,
+        "disabled_at": user.disabled_at,
+    })
 }
 
 /// The grant-signing client for a command that contacts agents.
@@ -562,6 +712,10 @@ fn read_join_token(file: Option<&Path>) -> anyhow::Result<Option<String>> {
         .filter(|token| !token.is_empty()))
 }
 
+/// The agent's counterpart to [`with_env_failpoint`], read from
+/// `DISTR_HNSW_AGENT_FAILPOINT` so a variable meant for a portal command
+/// never reaches an agent, with the same refusal in builds without
+/// failpoints.
 fn env_agent_failpoint() -> anyhow::Result<Option<StoreFailpoint>> {
     let Ok(value) = std::env::var("DISTR_HNSW_AGENT_FAILPOINT") else {
         return Ok(None);
@@ -975,6 +1129,172 @@ async fn main() -> anyhow::Result<()> {
                         "recovery_ready_reason": status.recovery_ready_reason,
                     }))?
                 );
+                Ok(())
+            }
+            PortalCommand::Serve {
+                database,
+                master_key,
+                agents,
+                bind,
+                tls_domain,
+                tailnet_wait_seconds,
+                tailnet_poll_ms,
+                cert_retry_ms,
+                max_upload_bytes,
+                allow_portal_node_sign_in,
+            } => {
+                let master_key = MasterKey::load(&master_key)?;
+                let served = serve_portal(PortalServeConfig {
+                    database,
+                    master_key,
+                    agents,
+                    bind,
+                    api: LocalApi::from_env(),
+                    tls_domain,
+                    tailnet_wait: Duration::from_secs(tailnet_wait_seconds),
+                    address_poll: Duration::from_millis(tailnet_poll_ms),
+                    renewal: RenewalPolicy {
+                        retry_min: Duration::from_millis(cert_retry_ms.max(100)),
+                        ..RenewalPolicy::default()
+                    },
+                    limits: ServeLimits {
+                        max_upload_bytes,
+                        ..ServeLimits::default()
+                    },
+                    allow_portal_node_sign_in,
+                })
+                .await;
+                if let Err(error) = &served {
+                    if error.downcast_ref::<TailnetAddressChanged>().is_some() {
+                        eprintln!("error: {error}");
+                        std::process::exit(tailscale::EXIT_TAILNET_ADDRESS_CHANGED);
+                    }
+                }
+                served
+            }
+            PortalCommand::User { command } => match command {
+                UserCommand::Add {
+                    database,
+                    tailscale_login,
+                    display_name,
+                } => {
+                    let mut database = Database::open(&database)?;
+                    let name = display_name.unwrap_or_else(|| tailscale_login.clone());
+                    let user = database.add_user(&name, &tailscale_login, now_seconds())?;
+                    cli_audit(&mut database, "user_add", user.user_id.to_string(), None)?;
+                    println!("{}", user_json(&user));
+                    Ok(())
+                }
+                UserCommand::List { database } => {
+                    let database = Database::open(&database)?;
+                    for user in database.users()? {
+                        println!("{}", user_json(&user));
+                    }
+                    Ok(())
+                }
+                UserCommand::Disable { database, user_id } => {
+                    let mut database = Database::open(&database)?;
+                    let (sessions, keys) = database.disable_user(user_id, now_seconds())?;
+                    cli_audit(
+                        &mut database,
+                        "user_disable",
+                        user_id.to_string(),
+                        Some(format!("revoked {sessions} sessions and {keys} API keys")),
+                    )?;
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "user_id": user_id,
+                            "sessions_revoked": sessions,
+                            "api_keys_revoked": keys,
+                        })
+                    );
+                    Ok(())
+                }
+            },
+            PortalCommand::ApiKey { command } => match command {
+                ApiKeyCommand::Create {
+                    database,
+                    tailscale_login,
+                    name,
+                    scopes,
+                    node,
+                    any_node,
+                    expires_in_days,
+                } => {
+                    let mut database = Database::open(&database)?;
+                    let user = database
+                        .user_by_login(&tailscale_login)?
+                        .filter(|user| user.disabled_at.is_none())
+                        .with_context(|| {
+                            format!("no enabled user signs in as {tailscale_login}")
+                        })?;
+                    let node = match (node, any_node) {
+                        (Some(node), false) => KeyNode::Node(node),
+                        _ => KeyNode::Any,
+                    };
+                    let (row, secret) = new_api_key(
+                        user.user_id,
+                        &name,
+                        &scopes,
+                        node,
+                        expires_in_days,
+                        now_seconds(),
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    cli_audit(
+                        &mut database,
+                        "api_key_create",
+                        row.key_id.clone(),
+                        Some(format!(
+                            "{}; node {}",
+                            row.scopes,
+                            row.node_stable_id.as_deref().unwrap_or("any")
+                        )),
+                    )?;
+                    database.insert_api_key(&row)?;
+                    println!("{}", secret.encode().as_str());
+                    Ok(())
+                }
+                ApiKeyCommand::List { database } => {
+                    let database = Database::open(&database)?;
+                    for key in database.api_keys(None)? {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "key_id": key.key_id,
+                                "user_id": key.user_id,
+                                "name": key.name,
+                                "scopes": key.scopes.split_whitespace().collect::<Vec<_>>(),
+                                "node": key.node_stable_id,
+                                "created_at": key.created_at,
+                                "expires_at": key.expires_at,
+                                "revoked_at": key.revoked_at,
+                                "last_used_at": key.last_used_at,
+                            })
+                        );
+                    }
+                    Ok(())
+                }
+                ApiKeyCommand::Revoke { database, key_id } => {
+                    let mut database = Database::open(&database)?;
+                    anyhow::ensure!(
+                        database.revoke_api_key(&key_id, None, now_seconds())?,
+                        "no live API key {key_id}"
+                    );
+                    cli_audit(&mut database, "api_key_revoke", key_id, None)?;
+                    Ok(())
+                }
+            },
+            PortalCommand::Audit {
+                database,
+                after,
+                limit,
+            } => {
+                let database = Database::open(&database)?;
+                for record in database.audit_records(after, limit)? {
+                    println!("{}", audit_view(&record));
+                }
                 Ok(())
             }
             PortalCommand::Health { database } => {

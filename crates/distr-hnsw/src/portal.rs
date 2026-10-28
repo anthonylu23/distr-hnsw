@@ -189,6 +189,13 @@ impl Portal {
         Ok(outcome)
     }
 
+    /// Reload the grant-signing keys from the database, so a rotation made
+    /// by another process (a CLI command beside `portal serve`) is used.
+    pub fn reload_grant_material(&mut self) -> Result<(), PortalError> {
+        self.client = AgentClient::open(&mut self.database, &self.master_key)?;
+        Ok(())
+    }
+
     pub fn with_failpoint(mut self, failpoint: Failpoint, action: FailpointAction) -> Self {
         self.failpoint = Some((failpoint, action));
         self

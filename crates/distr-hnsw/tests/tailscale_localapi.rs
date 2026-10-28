@@ -1,113 +1,18 @@
 //! The LocalAPI client and bind discipline against a fake LocalAPI on a
 //! temporary Unix socket (docs/m2-implementation-plan.md, work package 1).
-//! The fake mirrors the real responses checked on the reference host: it
-//! requires the `local-tailscaled.sock` host, answers `status` and `whois`,
-//! and returns 404 for an address no peer owns.
+//! The fake (`tests/common`) mirrors the real responses checked on the
+//! reference host.
 
-use std::{
-    collections::HashMap,
-    net::{IpAddr, SocketAddr},
-    path::{Path, PathBuf},
-    process::Command,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+mod common;
 
-use axum::{
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-    routing::get,
-    Json, Router,
-};
+use std::{net::IpAddr, process::Command, time::Duration};
+
+use axum::http::StatusCode;
+
+use common::{socket_in, start_fake, Fake, FakePeer, FakeState};
 use distr_hnsw::tailscale::{
     address_lost, resolve_bind, BindError, BindMode, BindSpec, LocalApi, LocalApiError,
 };
-use serde_json::json;
-use tokio::{net::UnixListener, task::JoinHandle};
-
-#[derive(Clone)]
-struct FakeState {
-    backend_state: String,
-    stable_id: String,
-    addresses: Vec<IpAddr>,
-    peers: HashMap<String, (String, String, String)>,
-}
-
-#[derive(Clone)]
-struct Fake(Arc<Mutex<FakeState>>);
-
-impl Fake {
-    fn new(addresses: &[&str]) -> Self {
-        Self(Arc::new(Mutex::new(FakeState {
-            backend_state: "Running".into(),
-            stable_id: "nSELF".into(),
-            addresses: addresses.iter().map(|a| a.parse().unwrap()).collect(),
-            peers: HashMap::new(),
-        })))
-    }
-
-    fn set(&self, f: impl FnOnce(&mut FakeState)) {
-        f(&mut self.0.lock().unwrap());
-    }
-}
-
-fn host_ok(headers: &HeaderMap) -> bool {
-    headers
-        .get("host")
-        .is_some_and(|host| host == "local-tailscaled.sock")
-}
-
-async fn status(State(fake): State<Fake>, headers: HeaderMap) -> Response {
-    if !host_ok(&headers) {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let state = fake.0.lock().unwrap().clone();
-    Json(json!({
-        "BackendState": state.backend_state,
-        "Self": { "ID": state.stable_id, "TailscaleIPs": state.addresses, "Online": true },
-    }))
-    .into_response()
-}
-
-async fn whois(
-    State(fake): State<Fake>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    if !host_ok(&headers) {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let Some(addr) = query.get("addr") else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    let ip = addr.parse::<SocketAddr>().map(|a| a.ip().to_string());
-    let state = fake.0.lock().unwrap().clone();
-    match ip.ok().and_then(|ip| state.peers.get(&ip).cloned()) {
-        Some((stable_id, name, login)) => Json(json!({
-            "Node": { "ID": 7, "StableID": stable_id, "Name": name, "Tags": null },
-            "UserProfile": { "ID": 9, "LoginName": login },
-            "CapMap": {},
-        }))
-        .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-fn start_fake(socket: &Path, fake: Fake) -> JoinHandle<()> {
-    let listener = UnixListener::bind(socket).unwrap();
-    let router = Router::new()
-        .route("/localapi/v0/status", get(status))
-        .route("/localapi/v0/whois", get(whois))
-        .with_state(fake);
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    })
-}
-
-fn socket_in(dir: &tempfile::TempDir) -> PathBuf {
-    dir.path().join("tailscaled.sock")
-}
 
 #[tokio::test]
 async fn status_and_whois_parse_and_unknown_peers_are_refused() {
@@ -117,11 +22,7 @@ async fn status_and_whois_parse_and_unknown_peers_are_refused() {
     fake.set(|s| {
         s.peers.insert(
             "100.64.0.9".into(),
-            (
-                "nPEER".into(),
-                "laptop.example.ts.net.".into(),
-                "owner@example.com".into(),
-            ),
+            FakePeer::new("nPEER", "laptop.example.ts.net.", "owner@example.com"),
         );
     });
     let _server = start_fake(&socket, fake);
@@ -352,11 +253,7 @@ async fn a_tailnet_agent_serves_only_the_pinned_portal_node() {
         move |s: &mut FakeState| {
             s.peers.insert(
                 "127.0.0.1".into(),
-                (
-                    stable_id,
-                    format!("{}.example.ts.net.", "node"),
-                    "owner@example.com".into(),
-                ),
+                FakePeer::new(&stable_id, "node.example.ts.net.", "owner@example.com"),
             );
         }
     };

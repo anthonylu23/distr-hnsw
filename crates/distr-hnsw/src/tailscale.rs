@@ -29,6 +29,8 @@ pub const SOCKET_ENV: &str = "DISTR_HNSW_TAILSCALE_SOCKET";
 pub const EXIT_TAILNET_ADDRESS_CHANGED: i32 = 75;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// A certificate request may wait for an ACME issuance.
+const CERT_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_RESPONSE_BYTES: usize = 4 << 20;
 /// LocalAPI rejects requests without this host name.
 const LOCALAPI_HOST: &str = "local-tailscaled.sock";
@@ -57,6 +59,9 @@ pub enum LocalApiError {
 pub struct SelfNode {
     pub stable_id: String,
     pub addresses: Vec<IpAddr>,
+    /// Domains LocalAPI can issue certificates for (empty when the tailnet
+    /// has HTTPS certificates turned off).
+    pub cert_domains: Vec<String>,
     /// `tailscaled` is logged in and connected (`BackendState` is `Running`).
     pub running: bool,
 }
@@ -70,12 +75,22 @@ pub struct PeerIdentity {
     pub tags: Vec<String>,
 }
 
+impl PeerIdentity {
+    /// A tagged node acts as a service, not as a user: its user profile is
+    /// the shared `tagged-devices` placeholder.
+    pub fn is_tagged(&self) -> bool {
+        !self.tags.is_empty()
+    }
+}
+
 #[derive(Deserialize)]
 struct StatusWire {
     #[serde(rename = "BackendState")]
     backend_state: String,
     #[serde(rename = "Self")]
     self_node: Option<StatusSelfWire>,
+    #[serde(rename = "CertDomains", default)]
+    cert_domains: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -140,16 +155,19 @@ impl LocalApi {
         let wire: StatusWire = serde_json::from_slice(&body)
             .map_err(|error| LocalApiError::Malformed(error.to_string()))?;
         let running = wire.backend_state == "Running";
+        let cert_domains = wire.cert_domains.unwrap_or_default();
         let Some(node) = wire.self_node else {
             return Ok(SelfNode {
                 stable_id: String::new(),
                 addresses: Vec::new(),
+                cert_domains,
                 running: false,
             });
         };
         Ok(SelfNode {
             stable_id: node.id,
             addresses: node.tailscale_ips,
+            cert_domains,
             running,
         })
     }
@@ -177,6 +195,26 @@ impl LocalApi {
             user_login: wire.user.login_name,
             tags: wire.node.tags.unwrap_or_default(),
         })
+    }
+
+    /// This node's certificate and private key for `domain`, as PEM: the
+    /// key block first, then the certificate chain. `tailscaled` returns its
+    /// cached certificate while it is fresh and renews it otherwise. Needs
+    /// root or the tailnet operator user (403 otherwise).
+    pub async fn cert_pair(&self, domain: &str) -> Result<Bytes, LocalApiError> {
+        if domain.is_empty()
+            || !domain
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+        {
+            return Err(LocalApiError::Malformed(format!(
+                "invalid certificate domain {domain:?}"
+            )));
+        }
+        let path = format!("/localapi/v0/cert/{domain}?type=pair");
+        tokio::time::timeout(CERT_TIMEOUT, self.get_inner(&path))
+            .await
+            .map_err(|_| LocalApiError::Timeout)?
     }
 
     async fn get(&self, path: &str) -> Result<Bytes, LocalApiError> {

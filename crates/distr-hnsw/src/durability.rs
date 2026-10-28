@@ -154,19 +154,10 @@ impl DurableStore {
 
     /// Free bytes reported by the filesystem holding the volume.
     pub fn filesystem_free_bytes(&self) -> Result<(u64, u64), StoreError> {
-        use std::os::unix::ffi::OsStrExt;
-        let path = std::ffi::CString::new(self.root.as_os_str().as_bytes())
-            .map_err(|_| StoreError::InvalidPath(self.root.clone()))?;
-        let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
-        let result = unsafe { libc::statvfs(path.as_ptr(), &mut stats) };
-        if result != 0 {
-            return Err(StoreError::Io(io::Error::last_os_error()));
-        }
-        let fragment = stats.f_frsize.max(1);
-        Ok((
-            stats.f_bavail.saturating_mul(fragment),
-            stats.f_blocks.saturating_mul(fragment),
-        ))
+        filesystem_space(&self.root).map_err(|error| match error.kind() {
+            io::ErrorKind::InvalidInput => StoreError::InvalidPath(self.root.clone()),
+            _ => StoreError::Io(error),
+        })
     }
 
     /// Physically remove an object. Idempotent: a missing object is not an
@@ -485,6 +476,24 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
         path
     };
     File::open(path)?.sync_all()
+}
+
+/// Bytes available to unprivileged writers and the total size of the
+/// filesystem holding `path`.
+pub fn filesystem_space(path: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::statvfs(path.as_ptr(), &mut stats) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fragment = stats.f_frsize.max(1);
+    Ok((
+        stats.f_bavail.saturating_mul(fragment),
+        stats.f_blocks.saturating_mul(fragment),
+    ))
 }
 
 pub(crate) fn ensure_directory(path: &Path) -> io::Result<()> {

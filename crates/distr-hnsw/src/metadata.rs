@@ -14,7 +14,11 @@ use crate::{
     object::{ObjectHash, ObjectKind},
 };
 
-const SCHEMA_VERSION: i64 = 10;
+mod identity;
+
+pub use identity::{ApiKeyRow, AuditRecord, SessionRow, UserRow, TAILSCALE_PROVIDER};
+
+const SCHEMA_VERSION: i64 = 11;
 const MASTER_KEY_ID_META: &str = "master_key_id";
 const CONTENT_GENERATION_META: &str = "content_generation";
 /// Set when metadata was restored from a backup snapshot; cleared by the next
@@ -651,7 +655,7 @@ impl Database {
             }
             3 => migrate_v3_to_v4(&mut connection)?,
             4..=6 => migrate_to_v7(&mut connection)?,
-            7..=9 | SCHEMA_VERSION => apply_schema(&connection)?,
+            7..=10 | SCHEMA_VERSION => apply_schema(&connection)?,
             _ => return Err(MetadataError::UnsupportedSchemaVersion(version)),
         }
         let lease = ProcessLease::acquire(path)?;
@@ -3409,7 +3413,8 @@ fn apply_schema(connection: &Connection) -> Result<(), MetadataError> {
     connection.execute_batch(INDEX_ARCHIVE_SCHEMA)?;
     apply_v9(connection)?;
     connection.execute_batch(ACCESS_SCHEMA)?;
-    connection.execute_batch("PRAGMA user_version = 10;")?;
+    connection.execute_batch(identity::IDENTITY_SCHEMA)?;
+    connection.execute_batch("PRAGMA user_version = 11;")?;
     Ok(())
 }
 
