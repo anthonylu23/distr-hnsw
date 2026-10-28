@@ -1383,25 +1383,26 @@ fn admissible_rows(
         .collect()
 }
 
-fn key_row<'a>(loaded: &'a Dataset, key: &[u8]) -> Option<&'a [f32]> {
-    let row = if let Ok(bytes) = <[u8; 8]>::try_from(key) {
-        u64::from_le_bytes(bytes)
-    } else {
-        std::str::from_utf8(key)
-            .ok()?
-            .rsplit('-')
-            .next()?
-            .parse()
-            .ok()?
-    };
-    loaded.base.get(row)
+/// The dataset row a bench key names: the suffix of a `tail-` or
+/// `concurrent-` key, or else the 8-byte little-endian row number of a
+/// bulk-loaded key. Named keys are matched first because `tail-100` to
+/// `tail-999` are also 8 bytes long.
+fn key_row_id(key: &[u8]) -> Option<u64> {
+    let named = ["tail-", "concurrent-"]
+        .iter()
+        .find_map(|prefix| key.strip_prefix(prefix.as_bytes()));
+    match named {
+        Some(digits) => std::str::from_utf8(digits).ok()?.parse().ok(),
+        None => Some(u64::from_le_bytes(key.try_into().ok()?)),
+    }
 }
 
 /// Distance-based recall@k computed from the dataset rather than from the
 /// distances the engine reported: each hit's distance is recomputed from the
 /// row its key names, and a key returned twice counts once. Returns the
 /// recall and the number of hits whose reported distance disagreed with the
-/// recomputed one (a stale or misattributed score).
+/// recomputed one or whose key names no row (a stale or misattributed
+/// score).
 fn verified_recall(
     loaded: &Dataset,
     query: &[f32],
@@ -1415,7 +1416,12 @@ fn verified_recall(
         .iter()
         .filter(|(key, _)| seen.insert(key.clone()))
         .filter_map(|(key, reported)| {
-            let row = key_row(loaded, key)?;
+            // A hit that names no row is a misattributed result, never a
+            // silent miss.
+            let Some(row) = key_row_id(key).and_then(|id| loaded.base.get(id)) else {
+                mismatched += 1;
+                return None;
+            };
             let exact = distance(loaded.metric, query, row);
             if (exact - reported).abs() > 1e-4 * exact.abs().max(1.0) {
                 mismatched += 1;
@@ -1464,4 +1470,22 @@ fn hostname() -> String {
     fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_owned())
         .unwrap_or_else(|_| "unknown".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_row_id;
+
+    #[test]
+    fn named_keys_parse_before_eight_byte_row_numbers() {
+        assert_eq!(key_row_id(&7_u64.to_le_bytes()), Some(7));
+        assert_eq!(key_row_id(&999_999_u64.to_le_bytes()), Some(999_999));
+        assert_eq!(key_row_id(b"tail-5"), Some(5));
+        // Eight bytes long, like a bulk-loaded key.
+        assert_eq!(key_row_id(b"tail-100"), Some(100));
+        assert_eq!(key_row_id(b"tail-999"), Some(999));
+        assert_eq!(key_row_id(b"concurrent-123456"), Some(123_456));
+        assert_eq!(key_row_id(b"other"), None);
+        assert_eq!(key_row_id(b"tail-x"), None);
+    }
 }
