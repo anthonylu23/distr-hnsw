@@ -58,9 +58,9 @@ Plan: [m2-implementation-plan.md](m2-implementation-plan.md). Work packages
 every agent route with `DELETE` only for an applied GC proof, join tokens
 and key rotation) run first, because they close the agents' open `DELETE`
 and inventory surface. The development laptop serves as the unauthorized
-tailnet node. The owner's tailnet HTTPS is off-limits: certificates are
-tested against a fake LocalAPI, and live certificate evidence waits on a
-dedicated test tailnet.
+tailnet node. Tests may use the owner's tailnet, including its
+certificates, but must never disable tailnet HTTPS or change its serve,
+Funnel, or ACL configuration (the owner's remote access depends on it).
 
 ## After M2
 

@@ -22,12 +22,17 @@ in what order, and how each criterion will be proven.
 
 - Ride the host `tailscaled` through LocalAPI. No tsnet and no extra
   tailnet nodes (DESIGN §3).
-- **Do not change the owner's tailnet.** Its HTTPS certificates serve the
-  owner's remote-access setup, so M2 work never requests certificates,
-  changes `tailscale serve`, binds port 443, or edits ACLs on it.
-  Certificate handling is built and tested against a fake LocalAPI with
-  generated certificates. Live certificate evidence needs a dedicated test
-  tailnet, which is an owner action (see [Open items](#open-items)).
+- **Never disable the owner's tailnet HTTPS.** Its certificates serve the
+  owner's remote-access setup. M2 tests may use the owner's tailnet,
+  including fetching this node's certificate through LocalAPI (tailscaled
+  reuses its cached certificate, so no new issuance happens), but must not
+  turn HTTPS certificates off, change `tailscale serve` or Funnel
+  configuration, or edit ACLs. The reference host has no serve or Funnel
+  configuration; the portal still defaults to a port other than 443.
+  Renewal and failure paths are tested against a fake LocalAPI with
+  generated certificates, because a live certificate cannot be forced to
+  expire. Certificate fetches need root (or the tailnet operator user), so
+  the live test runs under `sudo`.
 - WhoIs authenticates the network peer, not the process (DESIGN §3), so
   every internal operation also needs a portal-signed capability grant.
 - Existing M1 drills and tests run agents on loopback. Loopback stays
@@ -143,19 +148,19 @@ to grants in the same packages so they keep passing.
   stale-epoch, and valid grants) for agents and later for portal routes.
 - Process tests with the fake LocalAPI: address change, `tailscaled`
   unavailable at start, certificate expiry and renewal failure.
-- Real tailnet, read-only: an agent bound to the reference host's tailnet
-  address must refuse requests from the development laptop (no grant, and
-  a node that is not the pinned portal). This needs no tailnet change.
+- Real tailnet: an agent bound to the reference host's tailnet address
+  must refuse requests from the development laptop (no grant, and a node
+  that is not the pinned portal), and the portal must serve HTTPS with the
+  node's tailnet certificate to a client on the laptop. Neither changes
+  tailnet settings.
 - M1 drills (restore, lifecycle matrix, power loss, capacity) re-run with
   grants enabled.
 
 ## Open items
 
-- **Live certificate evidence.** The roadmap asks for certificate tests on a
-  real test tailnet. The owner's tailnet is off-limits for certificate
-  work, so this needs a separate test tailnet (a second free tailnet with
-  one throwaway node), or the owner's later approval. Until then the
-  certificate criterion rests on fake-LocalAPI tests and is recorded as a
-  limitation.
+- **Live certificate evidence** comes from the owner's tailnet (approved
+  2026-10-28): issuance through LocalAPI, TLS serving with that
+  certificate, and a client on the development laptop validating it.
+  Renewal and failure behavior come from the fake LocalAPI.
 - **ACL policy** is documented, not applied: the owner applies it to their
   own tailnet.
