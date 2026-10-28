@@ -117,8 +117,13 @@ scripts/enospc-drill.sh            # add --keep to retain the image
 
 Since M2 the script initializes the portal first, starts each agent with a
 join token and joins it, and sends its capacity reads, inventory counts, and
-admission probes as granted requests through `portal agent request`. The
-run above predates M2.
+admission probes as granted requests through `portal agent request`. Re-run
+with grants from `25e31be` on 2026-10-28: setup, phase 1 (17 files
+admitted, then a reserve refusal), phase 2 (kernel `ENOSPC` reported as HTTP
+507, `enospc_observed`), and phase 3 (recovery after GC) all pass. Run it
+as a normal user: under `sudo` the agents can write into ext4's reserved
+blocks and phase 2 never reaches `ENOSPC`, so the script now refuses to run
+as root.
 
 The script only touches the loop device attached to the image it created
 (checked with `losetup -j` before every privileged call), mounts at

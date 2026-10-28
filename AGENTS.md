@@ -65,6 +65,8 @@ hardening pass (`docs/hardening-2026-10.md`) closed on 2026-10-28. M2
 - `docs/m1-implementation-plan.md` — M1 work packages and dependency order.
 - `docs/m2-implementation-plan.md` — M2 decisions, work packages, and the
   constraint that the owner's tailnet HTTPS is never disabled.
+- `docs/m2-authorization-drill.md` — real-tailnet evidence for agent
+  authorization, and the M1 drills re-run with grants.
 - `docs/m1-lifecycle-contract.md` — safety gates for reconciliation, movement,
   retirement, and physical deletion.
 - `docs/m1-filesystem-qualification.md` — durable-write review per filesystem

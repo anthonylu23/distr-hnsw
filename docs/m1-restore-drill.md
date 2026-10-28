@@ -4,7 +4,10 @@ Status: **passed on the reference host with both the versioned-directory target 
 the S3-compatible target (MinIO with Object Lock), re-run from the clean
 hardening revision `dc276f3` on 2026-10-27.** Both reports were then
 recorded with `portal drill record`, which derived `recovery_ready` from
-them.
+them. Re-run with M2 grants (replacement agents joined with tokens from
+the restored database) from `5a8656a` on 2026-10-28, directory target:
+pass, 56 of 56 kept files verified, 8 deleted files unreadable, none
+resurrected, recovery 3.8 s.
 
 This is the evidence package the roadmap requires for the M1 exit gate: a
 representative cluster is destroyed and rebuilt into empty infrastructure

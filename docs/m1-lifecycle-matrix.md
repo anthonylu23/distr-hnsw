@@ -1,7 +1,11 @@
 # M1 lifecycle matrix
 
 Status: **passed on the reference host, re-run from the clean hardening revision
-`dc276f3` on 2026-10-27** (run `20261027T014148Z`). Automated by
+`dc276f3` on 2026-10-27** (run `20261027T014148Z`), and again with M2 grants
+from `5a8656a` on 2026-10-28 (run `20261028T211631Z`: 160 files, 1.87 GB,
+24 flips, 40 deletions, 179 GC candidates blocked before the post-deletion
+scan and applied after it, 548 objects durable, no deleted file readable,
+stale-restore GC applied nothing). Automated by
 [`scripts/lifecycle-matrix.sh`](../scripts/lifecycle-matrix.sh); the full
 report stays under `~/distr-hnsw-drill/` (SHA-256 prefix `7e32162d036d8730`).
 The first run (`20260930T001138Z`, revision `861baee`) predates the

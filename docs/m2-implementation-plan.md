@@ -152,7 +152,9 @@ in what order, and how each criterion will be proven.
   - An agent that trusts another portal refuses its key-set push, and the
     caller sees that refusal (403 `key_set_untrusted`).
   - `scripts/tailnet-authorization-drill.sh` checks the same refusals on
-    the real tailnet from another node.
+    the real tailnet from another node; it passed from `25e31be`, and the
+    M1 drills passed again with grants
+    ([m2-authorization-drill.md](m2-authorization-drill.md)).
   - Grants bind the agent id, not the volume incarnation: a superseded
     volume that returns accepts the newer key set, and the portal's
     incarnation check (M1) is what keeps it out.

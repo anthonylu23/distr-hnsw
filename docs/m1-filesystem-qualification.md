@@ -334,9 +334,11 @@ Where the implementation departs from the outline, deliberately:
 - Done 2026-10-28: the drill covers the master-key write and a re-PUT after
   a crash between rename and directory sync (9/9 marks on each filesystem
   from `10d7ed4`).
-- Re-run the drill with M2 grants: agents now join with tokens, and the
-  inventory snapshots, per-object `GET` checks, re-PUT, and incarnation
-  reads go through `portal agent request`. The results above predate M2.
+- Done 2026-10-28: re-run with M2 grants from `25e31be` (agents join with
+  tokens; inventory snapshots, per-object `GET` checks, the re-PUT, and
+  incarnation reads go through `portal agent request`). 9/9 marks on btrfs,
+  ext4, and XFS, master key intact (32/32 bytes, SHA-256 match), negative
+  control lost, re-PUT acknowledged 31 / 28 / 27 ms after the crash.
 - Re-run the drill after every kernel update on the reference host and record the
   kernel in this document; the btrfs rating in particular is kernel-specific.
 - Extend the drill beyond a single sequential writer: several concurrent
