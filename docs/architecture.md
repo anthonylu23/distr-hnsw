@@ -18,8 +18,8 @@ both planes; one SQLite database holds control-plane metadata.
 | Component | Crate | State |
 |---|---|---|
 | Blob plane: agents, portal commit spine, deletion, recovery, scrub and repair, drain and retire, capacity admission, proof-based GC, key recovery, backup and restore | `crates/distr-hnsw` | Implemented (M1, accepted) |
-| Single-partition vector engine: flat and int8 vectors, HNSW, filtered search, WAL and snapshots, compaction, RAM admission | `crates/distr-hnsw-index` | Implemented (M3, in hardening) |
-| Benchmark harness on pinned public datasets | `crates/distr-hnsw-bench` | Implemented |
+| Single-partition vector engine: flat and int8 vectors, HNSW, filtered search, WAL and snapshots, compaction, RAM admission | `crates/distr-hnsw-index` | Implemented (M3, accepted) |
+| Benchmark harness on pinned public datasets and the 512-dim project set | `crates/distr-hnsw-bench` | Implemented |
 | Tailscale identity and authorization | — | Not started (M2) |
 | Distributed vector plane, extraction and embedding pipeline, dashboard, vault | — | Not started (M4–M7) |
 | Phase-0 validation prototype | `prototype/` | Disposable; not product code |
@@ -97,11 +97,17 @@ defaults, admission).
   window, plus versioned snapshots verified per section. Recovery replays
   the newest verifiable snapshot and the WAL tail. Only an interrupted
   append at the end of the newest segment is repaired; all other damage
-  fails closed.
+  fails closed. Snapshots are streamed to disk, so writing one needs no
+  second copy of the partition in memory.
 - **Compaction.** A short capture step, then a rebuild that writers do not
   wait on, then a swap.
 - **Archive.** `distr-hnsw index archive|restore` stores a partition's
   manifest, snapshot, and WAL segments as ordinary blob-plane files.
+- **Measured scale.** On one 16-thread host with 1M × 512 vectors
+  (`project-nomic-512`): recall@10 0.993 at the default `ef_search` 500,
+  single-thread p95 3.1 ms, bulk build 1,700 vectors/s, recovery 3.7 s
+  ([bench/README.md](bench/README.md)). Compaction holds a second copy of
+  the live rows and is not yet admitted against the RAM budget.
 
 Contract: [m3-engine-contract.md](m3-engine-contract.md). Benchmarks:
 [bench/README.md](bench/README.md).

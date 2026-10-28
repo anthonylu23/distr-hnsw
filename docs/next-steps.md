@@ -10,11 +10,12 @@ tracks only the immediate work queue.
   [phase-0-validation.md](phase-0-validation.md)). Keep `prototype/`
   disposable.
 - M1 accepted on 2026-09-30, reopened on 2026-10-25, and **re-accepted on
-  2026-10-28**. M3 exit review withdrawn on 2026-10-25. Both result from the audit in
-  [hardening-2026-10.md](hardening-2026-10.md).
-- M2 starts after the hardening pass.
+  2026-10-28**. M3's exit review was withdrawn on 2026-10-25 and M3 was
+  **accepted on 2026-10-28**. Both reopenings came from the audit in
+  [hardening-2026-10.md](hardening-2026-10.md), which is now closed.
+- M2 is next.
 
-## Hardening pass (now)
+## Hardening pass (closed 2026-10-28)
 
 1. Done: fixes committed (`f6381d3` blob plane, `a7e0371` engine) with
    regression tests ([hardening-2026-10.md](hardening-2026-10.md)).
@@ -41,12 +42,14 @@ tracks only the immediate work queue.
 4. Done 2026-10-28: the power-loss drill covers the master-key write and a
    re-PUT after a crash between rename and directory sync; it passed on
    btrfs, ext4, and XFS from `10d7ed4`, and M1 was re-accepted.
-5. To accept M3: done 2026-10-28 for 200k (`scripts/bench/build-project-set.py`,
-   all five benches from `30fc26f`, [bench/README.md](bench/README.md)).
-   Remaining: embed the other 800k base chunks (about 3.2 hours on the
-   GPU, which is shared with other CUDA work, so schedule it first), then
-   finalize the 1M set and run the five benches on it. That supplies the
-   1M × 512 latency, build, recovery, and memory figures.
+5. Done 2026-10-28: `project-nomic-512` at 200k (`30fc26f`) and 1M
+   (oracle, HNSW, and filtered from `b4b6710`; compaction from `684ddfe`;
+   persistence from `46757b8`). Every required 1M × 512 threshold is met
+   ([m3-implementation-plan.md](m3-implementation-plan.md)), and M3 was
+   accepted. The 1M run found that snapshot writes built the whole file in
+   memory (OOM-killed at the first 1M snapshot; the writer now streams,
+   `684ddfe`) and that the persistence bench under-reported recall
+   (`46757b8`).
 
 ## After hardening
 
@@ -66,6 +69,11 @@ tracks only the immediate work queue.
 3. **Open-source hygiene.** Replace host and user names in public docs and
    scripts with roles and environment variables. Add CI running fmt,
    clippy, and the non-sudo tests.
+4. **Engine follow-ups carried from M3** (none blocks M2): a subprocess
+   `kill -9` harness and a power-loss run for the engine; RAM admission
+   for compaction (a 1M × 512 compaction holds a second copy of the live
+   rows); cold-cache recovery; an int8 brute-force route to cheapen
+   filtered queries near the cutover (15 to 21 ms at p50 at 1M).
 
 ## Ops notes
 

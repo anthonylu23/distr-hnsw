@@ -1,11 +1,12 @@
 # Hardening pass (October 2026)
 
-**Status:** Fixes done and re-verified. Opened 2026-10-25 after a full code
-and documentation audit. Every item below marked *required* is done. The
-drills and benches were re-run from clean commits on 2026-10-27, and the
-extended power-loss drill on 2026-10-28. M1 was re-accepted on 2026-10-28.
-M3 stays **In progress** until the `project-nomic-512` runs. M2 starts
-after this pass.
+**Status:** Closed 2026-10-28. Opened 2026-10-25 after a full code and
+documentation audit. Every item below marked *required* is done and
+re-verified. The drills and benches were re-run from clean commits on
+2026-10-27, and the extended power-loss drill on 2026-10-28. M1 was
+re-accepted on 2026-10-28, and M3 was accepted the same day after the
+`project-nomic-512` runs, which added one more required item (snapshot
+write memory, below). M2 is next.
 
 ## Why
 
@@ -129,6 +130,7 @@ Engine items deferred, each recorded in the contract:
 | Re-run `scripts/restore-drill.sh` (directory and MinIO) and `scripts/lifecycle-matrix.sh` from a clean committed revision; add GC-then-retire and GC-after-restore orders to the matrix | Done 2026-10-27 from `dc276f3`. Restore drill passed on both targets (56/56 verified, 0 resurrected, recovery 3.9 s and 3.75 s), and both reports were recorded with `portal drill record` (`recovery_ready` true; false for a target the deployment does not use). The matrix passed, including retire after GC and stale-restore GC (0 collected, acknowledged file intact). `scripts/minio-test.sh` passed 3/3. See [m1-restore-drill.md](m1-restore-drill.md) and [m1-lifecycle-matrix.md](m1-lifecycle-matrix.md). |
 | Re-run `scripts/power-loss-drill.sh` (needs sudo) for the changed durable-write paths (re-PUT directory sync, master key write) | Done 2026-10-28. The drill now writes the master key on the drilled volume and re-PUTs an object after an agent failpoint (`put_after_rename`) stops a PUT between its rename and its directory sync. From `10d7ed4` it passed 9/9 marks with the key intact on btrfs, ext4, and XFS. With both fixes reverted it fails on all three, so it detects these defects ([m1-filesystem-qualification.md](m1-filesystem-qualification.md)). |
 | Re-run the M3 benches from a clean revision; publish p95; decide the 1M × 512 build-throughput threshold openly | Re-run done 2026-10-27 with `--canonical` from `dc276f3` (nytimes persistence and compaction from `835f055`). p95 is published next to p50 ([bench/README.md](bench/README.md)). Decided 2026-10-27: the cosine default ef is 500, and the build-throughput threshold is ≥ 560 vectors/s required, ≥ 3.3k targeted ([m3-implementation-plan.md](m3-implementation-plan.md)). |
+| Run the five M3 benches on `project-nomic-512` (200k and 1M × 512) | Done 2026-10-28: 200k from `30fc26f`; 1M oracle, HNSW, and filtered from `b4b6710`, compaction from `684ddfe`, persistence from `46757b8`. Every required 1M × 512 threshold is met ([m3-implementation-plan.md](m3-implementation-plan.md)). The runs found the snapshot write-memory defect above and a bench bug: recall verification read the 8-byte WAL-tail keys `tail-100` to `tail-999` as row numbers and dropped those hits, under-reporting persistence recall (0.9878 instead of 0.9934 at 1M). Fixed in `46757b8`; the public sets' persistence runs were repeated from it ([bench/README.md](bench/README.md)). |
 | Drill reports record `git describe --dirty` (restore, lifecycle, ENOSPC, power loss) | Done |
 | Roadmap, next steps, AGENTS, contracts, and DESIGN (v2.2) brought in line with the code | Done |
 | Architecture overview and deployment guide | Done ([architecture.md](architecture.md), [deployment.md](deployment.md)) |

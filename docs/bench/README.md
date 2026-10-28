@@ -12,15 +12,17 @@ file, and the harness refuses a dataset whose bytes do not match.
 | `sift-128-euclidean` | 1,000,000 | 128 | L2 | 10,000 | 100-NN |
 | `glove-100-angular` | 1,183,514 | 100 | cosine | 10,000 | 100-NN |
 | `project-nomic-512-200k` | 200,000 | 512 | cosine | 10,000 | 100-NN |
-| `project-nomic-512` | 1,000,000 (embedding pending) | 512 | cosine | 10,000 | 100-NN |
+| `project-nomic-512` | 1,000,000 | 512 | cosine | 10,000 | 100-NN |
 
 ## Provenance
 
-Every table below was measured on `anthonypc` (16 threads, 15 GiB RAM) on
-2026-10-27 with `--canonical` builds from clean commits: `dc276f3` for every
-run except the nytimes persistence and compaction rows, which come from
-`835f055`. That commit changes only those two benches, so they skip
-zero-norm rows and queries. Each report records `source_revision`,
+Every table below was measured on `anthonypc` (16 threads, 15 GiB RAM)
+with `--canonical` builds from clean commits. The public sets ran on
+2026-10-27 from `dc276f3`, except nytimes compaction, which comes from
+`835f055` (that commit changes only the persistence and compaction
+benches, so they skip zero-norm rows and queries). Every persistence row
+was re-run on 2026-10-28 from `46757b8`, after a recall-verification fix.
+The project set's provenance is given in its section. Each report records `source_revision`,
 `source_dirty: false`, the executable's BLAKE3, and the command line.
 Reports: `~/distr-hnsw-bench/reports/canonical-<rev>/`.
 
@@ -87,8 +89,9 @@ vectors/s at 100 dims and 1,725 at 256 dims. On 2026-10-27, before any
 512-dim run, the threshold was revised to ≥ 560 vectors/s required (1M in
 30 minutes) and ≥ 3.3k targeted, because recovery never rebuilds and
 compaction rebuilds off the write path
-([m3-implementation-plan.md](../m3-implementation-plan.md)). The 512-dim
-figure waits on `project-nomic-512`.
+([m3-implementation-plan.md](../m3-implementation-plan.md)). At 512 dims
+the 1M project set builds at 1,700 vectors/s (588 s), which meets the
+requirement and misses the target ([Project set](#project-set-project-nomic-512)).
 
 ## Int8 traversal with exact rescoring
 
@@ -180,9 +183,10 @@ the dataset rows each hit's key names).
 
 | Dataset (M, ef) | Snapshot | Bytes/vector | Snapshot write | WAL tail (1,000 upserts) | Recovery | Replayed | Results identical | RAM resident / mapped after recovery |
 |---|---:|---:|---:|---:|---:|---:|---|---|
-| sift 1M (16, 100) | 0.77 GiB | 821 | 3.4 s | 1.47 s, 565 KB | 1.75 s | 1,000 | yes (recall 0.9880 both) | 389 MiB / 488 MiB |
-| nytimes 290k (32, 400) | 0.43 GiB | 1,589 | 1.9 s | 4.16 s, 1.08 MB | 3.98 s | 1,000 | yes (recall 0.9716 both) | 185 MiB / 283 MiB |
-| glove 1.18M (32, 800) | 0.89 GiB | 809 | 3.9 s | 2.79 s, 453 KB | 3.21 s | 1,000 | yes (recall 0.9860 both) | 572 MiB / 451 MiB |
+| sift 1M (16, 100) | 0.77 GiB | 821 | 1.8 s | 1.46 s, 565 KB | 1.76 s | 1,000 | yes (recall 0.9893 both) | 389 MiB / 488 MiB |
+| nytimes 290k (32, 400) | 0.43 GiB | 1,589 | 0.9 s | 4.31 s, 1.08 MB | 4.03 s | 1,000 | yes (recall 0.9767 both) | 185 MiB / 283 MiB |
+| glove 1.18M (32, 800) | 0.89 GiB | 809 | 1.9 s | 2.94 s, 453 KB | 3.24 s | 1,000 | yes (recall 0.9860 both) | 572 MiB / 451 MiB |
+| project-nomic-512 1M (32, 500) | 2.67 GiB | 2,869 | 4.4 s | 2.32 s, 2.10 MB | 3.66 s | 1,000 | yes (recall 0.9934 both) | 879 MiB / 1,953 MiB |
 
 Reading:
 
@@ -191,13 +195,19 @@ Reading:
   RAM, and replaying the tail; afterwards the f32 originals are served from
   the map rather than copied. These runs recovered right after writing,
   from a warm page cache; a cold-cache recovery is still to be measured.
-  Against the plan's 60 s required and 20 s target at 1M × 512, 1.8 to
-  4.0 s at 100 to 256 dims leaves ample room: the 512-dim file is about
-  3 GiB, of which only the int8 copy (0.5 GiB) is copied.
+  At 1M × 512 recovery takes 3.66 s against the plan's 60 s required and
+  20 s target: of the 2.67 GiB file only the int8 and graph sections
+  (0.8 GiB) are copied.
+- These rows ran from `46757b8`. They replace the 2026-10-27 rows, which
+  under-reported recall where a duplicate under a `tail-100` to `tail-999`
+  key was returned (sift 0.9880 and nytimes 0.9716 then; see
+  [Project set](#project-set-project-nomic-512)). Snapshot writes now
+  stream and take about half as long as the earlier in-memory encoding
+  (sift 3.4 → 1.8 s).
 - Recovered search is byte-identical to pre-recovery search, and no hit's
   reported distance disagrees with the distance recomputed from its row
   (`score_mismatches` 0).
-- The WAL tail runs at about 240 to 680 synced entries per second with one
+- The WAL tail runs at about 230 to 690 synced entries per second with one
   `fdatasync` per entry. Group commit (contract §4 rule 1) will batch these;
   the per-entry number is the floor, not the throughput target.
 - nytimes holds 239 zero-norm base rows and 9 zero-norm queries. Bulk load
@@ -256,30 +266,80 @@ files, 1,817 chunks), then Wikipedia `20231101.en` pinned to revision
 `b04c8d1c`. Every 100th chunk is held out and its first 256 characters
 become a query. The base is therefore 99.8% encyclopedic prose: it matches
 the product's vector distribution at 512 dimensions, not the mix of
-personal files a deployment would hold. Manifest:
-[project-nomic-512-200k.manifest.json](project-nomic-512-200k.manifest.json).
+personal files a deployment would hold. Manifests:
+[project-nomic-512-200k.manifest.json](project-nomic-512-200k.manifest.json)
+and [project-nomic-512.manifest.json](project-nomic-512.manifest.json); the
+200k set is the first 200,000 base chunks of the 1M set, and both share
+the same 10,000 queries.
 
-The 200k set (the first 200,000 base chunks) was measured on 2026-10-28
-from `30fc26f`, with the same procedure as the tables above, M = 32, and
-the cosine default ef = 500 unless noted. The 1M set waits on a 3.2-hour
-embedding run on the shared GPU.
+Both sets were measured on 2026-10-28 with the same procedure as the
+tables above, M = 32, and the cosine default ef = 500 unless noted. The
+200k set (the first 200,000 base chunks) ran from `30fc26f`. The 1M set
+ran oracle, HNSW, and filtered from `b4b6710`, compaction from `684ddfe`
+(after the snapshot-writer fix below), and persistence from `46757b8`
+(after the recall-verification fix below).
 
-| Measure | 200k × 512 |
-|---|---|
-| Oracle | recall 1.000, p50 / p95 18.1 / 19.4 ms, 393 queries/s |
-| Parallel build | 80 s, 2,498 vectors/s |
-| Recall@10, f32 → int8, ef 100 / 200 / 500 / 800 | 0.9841 → 0.9841 / 0.9926 → 0.9926 / 0.9973 → 0.9972 / 0.9988 → 0.9987 |
-| p50 / p95 ms, int8, ef 100 / 500 / 800 | 0.42 / 0.64, 1.46 / 2.17, 2.13 / 3.14 |
-| Batch queries/s, int8, ef 500 | 3,979 |
-| Filtered recall, masked route, 0.1% / 1% / 10% / 50% | 1.000 / 1.000 / 0.9997 / 0.9989; crossover at about 29,500 allowed slots |
-| Snapshot | 574 MB (2,869 bytes per vector including f32 originals) |
-| Recovery with a 1,000-entry WAL tail | 1.74 s, results identical |
-| Compaction at 20% tombstones | 1,000 of 1,000 upserts accepted during the 61 s rebuild (slowest 15 ms), finish 3.2 s, no deleted key returned, recall 0.9984 → 0.9986 |
+| Measure | 200k × 512 | 1M × 512 |
+|---|---|---|
+| Oracle | recall 1.000, p50 / p95 18.1 / 19.4 ms, 393 queries/s | recall 1.000, p50 / p95 91.3 / 98.4 ms, 23 queries/s |
+| Parallel build | 80 s, 2,498 vectors/s | 588 s, 1,700 vectors/s |
+| Recall@10, f32 → int8, ef 100 / 200 / 500 / 800 | 0.9841 → 0.9841 / 0.9926 → 0.9926 / 0.9973 → 0.9972 / 0.9988 → 0.9987 | 0.9682 → 0.9680 / 0.9839 → 0.9841 / 0.9933 → 0.9933 / 0.9956 → 0.9956 |
+| p50 / p95 ms, int8, ef 100 / 500 / 800 | 0.42 / 0.64, 1.46 / 2.17, 2.13 / 3.14 | 0.63 / 0.89, 2.18 / 3.14, 3.25 / 4.65 |
+| p50 / p95 ms, f32, ef 500 | — | 3.52 / 5.22 |
+| Batch queries/s, int8, ef 500 | 3,979 | 2,659 |
+| Filtered recall, masked route, 0.1% / 1% / 10% / 50% | 1.000 / 1.000 / 0.9997 / 0.9989; crossover at about 29,500 allowed slots | 1.000 / 1.000 / 0.9990 / 0.9963; crossover at about 85,500 allowed slots |
+| Filtered p50 ms, brute / masked, 0.1% / 1% / 10% / 50% | — | 0.07 / 348, 1.57 / 86.8, 20.8 / 14.5, 99.9 / 3.83 |
+| Accounted bytes per vector (f32 + int8 + graph) | 2,878 | 2,878 (2,048 + 520 + 310) |
+| Snapshot | 574 MB (2,869 bytes per vector including f32 originals) | 2.87 GB (2,869 bytes per vector), written in 4.4 s |
+| Recovery with a 1,000-entry WAL tail | 1.74 s, results identical | 3.66 s, results identical (recall 0.9934 both) |
+| RAM resident / mapped after recovery | — | 879 MiB / 1,953 MiB |
+| Compaction at 20% tombstones | 1,000 of 1,000 upserts accepted during the 61 s rebuild (slowest 15 ms), finish 3.2 s, no deleted key returned, recall 0.9984 → 0.9986 | 1,000 of 1,000 upserts accepted during the 478 s rebuild (slowest 32 ms), finish 6.0 s, no deleted key returned, recall 0.9938 → 0.9941, p50 2.68 → 2.33 ms |
+| Peak RSS of the bench process | — | persistence 7.7 GiB, compaction 9.8 GiB |
 
-Recall on this set is far above the 0.97 requirement even at ef = 100,
-where one query in 1,000 still scores 0 (its minimum rises to 0.6 at ef =
-200). The build is faster than nytimes despite twice the dimensions
-(2,498 against 1,725 vectors/s), so dimension alone does not set build
-cost. That figure is at 200k; the 1M run decides the build, latency,
-recovery, and memory thresholds, which are all stated at 1M × 512.
+Reading (1M, against the plan's thresholds at 1M × 512):
+
+- Every required threshold is met at the defaults: recall 0.9933 (≥ 0.97),
+  single-thread p95 3.14 ms (≤ 5 ms), build 1,700 vectors/s (≥ 560),
+  recovery 3.66 s (≤ 60 s), and a published hot-set factor of
+  about 920 bytes per vector. Three targets are missed: p95 ≤ 2 ms (met at
+  ef = 200, recall 0.984), build ≥ 3.3k vectors/s, and ≤ 800 bytes per
+  vector. The f32 traversal mode exceeds 5 ms at p95 (5.22 ms); int8 is
+  the default and f32 is kept for diagnosis.
+- Recall falls with scale at a fixed ef: 0.9972 at 200k and 0.9933 at 1M
+  for ef = 500, and ef = 100 drops below 0.97 at 1M (0.968). The default
+  ef = 500 keeps a margin at the M3 target scale.
+- The cutover rule `T = 200 · ef_search` (contract §9) puts the boundary at
+  100,000 allowed slots for ef = 500; the measured crossover is about
+  85,500 (171 × ef, inside the 147 to 291 × ef of the public sets), so the
+  rule picks the faster route at every measured level. Near the boundary
+  both routes cost 15 to 21 ms at p50, five to seven times an unfiltered
+  query.
+- The oracle's batch rate falls from 393 to 23 queries/s, 17 times for a
+  base 5 times larger. At 1M each query streams the 2 GB base, an
+  effective 47 GB/s across 16 threads. The cause of the super-linear drop
+  was not investigated; the oracle is a reference, not a serving path.
+- Peak RSS includes the bench's own copy of the dataset (1.9 GiB) and the
+  snapshot pages mapped from the page cache. Compaction holds a second
+  copy of the live rows while it rebuilds, which is why it peaks highest;
+  compaction is not yet admitted against the RAM budget (contract §11).
+
+Two defects surfaced on the 1M set and were fixed before the published
+runs:
+
+- **Snapshot writes built the file in memory.** The first 1M persistence
+  run was OOM-killed at its first snapshot (8.1 GB anonymous memory, swap
+  exhausted): the writer held about four times the 2.9 GB file on top of
+  the partition. It now streams in two passes, and the file is unchanged
+  byte for byte (`684ddfe`, [hardening-2026-10.md](../hardening-2026-10.md)).
+  Benches now run in a `systemd-run --user --scope -p MemoryMax=10G`
+  scope so an overrun kills only the bench.
+- **Persistence recall was under-reported.** Recall verification read any
+  8-byte key as a row number first, and the WAL-tail keys `tail-100` to
+  `tail-999` are 8 bytes long, so those duplicate hits mapped to no row,
+  were dropped, and counted as misses. It showed on this set because base
+  rows 0 to 999 are the corpus chunks its first queries retrieve: the
+  1M run read 0.9878 where the compaction bench read 0.9938 for the same
+  queries. Fixed in `46757b8`; an unmapped key now counts as a score
+  mismatch. The public sets' persistence rows were re-run from the same
+  commit.
 

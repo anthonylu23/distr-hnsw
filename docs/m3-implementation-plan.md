@@ -48,7 +48,7 @@ Rust harness reads only the flat files.
 | `nytimes-256-angular` | 290k | 256 | cosine | Fast regression set for CI on either machine; angular metric |
 | `sift-128-euclidean` | 1.0M | 128 | L2 | Classic baseline with well-known recall/ef curves; catches graph bugs |
 | `glove-100-angular` | 1.18M | 100 | cosine | Hard angular set; exposes recall cliffs and int8 loss |
-| `project-nomic-512` | 200k, later 1M | 512 | cosine | Representative: chunks from the phase-0 mixed corpus plus public text (pinned Wikipedia, so 99.8% of the base), embedded with the locked `nomic-embed-text @ 512` on `anthonypc`; ground truth by exact search (`scripts/bench/build-project-set.py`) |
+| `project-nomic-512` | 200k and 1M | 512 | cosine | Representative: chunks from the phase-0 mixed corpus plus public text (pinned Wikipedia, so 99.8% of the base), embedded with the locked `nomic-embed-text @ 512` on `anthonypc`; ground truth by exact search (`scripts/bench/build-project-set.py`) |
 | `filtered-*` (derived) | as parent | as parent | as parent | Each parent gains synthetic facet labels at 0.1%, 1%, 10%, and 50% selectivity; ground truth is exact search over the matching subset |
 
 The public sets are for engine correctness and comparability; the project set
@@ -100,6 +100,34 @@ for the catch-up and swap (4.0 to 5.5 s measured). Build speed therefore
 bounds only how long a first bulk import or a compaction holds a second
 copy of the partition in RAM. The required bound is a 1M × 512 build within
 30 minutes, and the target is within 5 minutes.
+
+## Results against the thresholds (2026-10-28)
+
+Measured on `project-nomic-512` (1M × 512, cosine) with the defaults
+M = 32, `ef_construction` = 200, `ef_search` = 500, int8 traversal with
+rescoring, from clean commits with `--canonical`: build, latency, and
+filtered recall from `b4b6710`, compaction from `684ddfe`, and
+persistence from `46757b8`. The public-set rows are from `dc276f3`.
+Figures and reports: [bench/README.md](bench/README.md).
+
+| Measure | Required | Target | Measured | Verdict |
+|---|---|---|---|---|
+| Unfiltered recall@10 | ≥ 0.97 on every public set | ≥ 0.99 | sift 0.987 (M 16, ef 100), nytimes 0.979, glove 0.974; project 0.9933 | required met; target met on the project set only |
+| Int8 + rescore vs. f32 | within 0.01 | within 0.005 | ≤ 0.0014 on every set; 0.0000 on the project set at ef 500 | met |
+| Filtered recall@10, 0.1% to 50% | ≥ 0.95 | ≥ 0.98 | project 1.000 / 1.000 / 0.999 / 0.996 | met |
+| Query latency, single thread | p95 ≤ 5 ms | p95 ≤ 2 ms | p95 3.14 ms (p50 2.18 ms) | required met; target missed |
+| Build throughput, 16 threads | ≥ 560 vectors/s | ≥ 3.3k vectors/s | 1,700 vectors/s (588 s) | required met; target missed |
+| RAM per vector, int8 | overhead published; admission uses it | ≤ 800 bytes | 921 bytes resident after recovery (formula 910) | required met; target missed by 15% |
+| Snapshot + WAL-tail recovery | ≤ 60 s | ≤ 20 s | 3.66 s with a 1,000-entry tail, identical results | met |
+| WAL fsync path | survives `kill -9` at every boundary | plus host power loss | in-process failpoints at every append, sync, and apply boundary | accepted with a limitation: no subprocess `kill -9` harness or engine power-loss run yet (deferred) |
+
+The 1M run also found a defect: writing a snapshot built the whole file
+in memory several times over, so the first snapshot of a 1M × 512 bulk
+load was OOM-killed. The writer now streams
+([hardening-2026-10.md](hardening-2026-10.md)), and the persistence and
+compaction rows were measured with it. A bench bug also under-reported
+persistence recall (0.9878 instead of 0.9934); it is fixed and does not
+touch a threshold row.
 
 ## Crates
 

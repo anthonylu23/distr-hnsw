@@ -13,7 +13,7 @@ design first and then bring this document back into alignment.
 | M0 — Semantic validation | **Accepted** | Larger representative bake-off produces a documented go decision and locks the default local model and dimensions |
 | M1 — Blob plane and recovery foundation | **Accepted** (2026-10-28; first accepted 2026-09-30, reopened 2026-10-25) | Blob durability and an empty-infrastructure restore drill pass |
 | M2 — Tailscale identity and authorization | Not started (follows the hardening pass) | Network identity, sessions, grants, and API-key boundaries pass adversarial tests |
-| M3 — Single-partition vector engine | **In progress** (seven passes done; exit review reopened 2026-10-25) | Persistence, recovery, recall, filtering, and compaction gates pass against brute force |
+| M3 — Single-partition vector engine | **Accepted** (2026-10-28; first exit review 2026-10-01, withdrawn 2026-10-25) | Persistence, recovery, recall, filtering, and compaction gates pass against brute force |
 | M4 — Distributed vector plane | Not started | Quorum, fencing, promotion, movement, and balancing survive failure injection |
 | M5 — File extraction and semantic retrieval | Not started | Files flow safely from extraction through reproducible hybrid search |
 | M6 — Dashboard and operations | Not started | User and operator workflows are complete, truthful, and accessible |
@@ -33,15 +33,17 @@ to the best eligible dimension. M0 is accepted and M1 is unblocked. See
 defects that invalidate accepted M1 criteria (garbage collection after a
 stale metadata restore, retirement and backup after GC, and recovery
 convergence after a retried delete) and M3 criteria (WAL corruption read as
-a torn tail, unreachable inserts after mass deletion). M1 is reopened and
-M3's exit review is withdrawn until the required items in
-[hardening-2026-10.md](hardening-2026-10.md) are fixed and re-verified from a
-clean revision. M2 starts after that pass. The fixes landed in `f6381d3` and
-`a7e0371`, and the drills and benches were re-run from clean commits on
-2026-10-27. M1 was re-accepted on 2026-10-28, after the power-loss drill
+a torn tail, unreachable inserts after mass deletion). M1 was reopened and
+M3's exit review withdrawn until the required items in
+[hardening-2026-10.md](hardening-2026-10.md) were fixed and re-verified from
+a clean revision. M2 follows that pass, which closed on 2026-10-28. The
+fixes landed in `f6381d3` and `a7e0371`, and the drills and benches were
+re-run from clean commits on 2026-10-27. M1 was re-accepted on 2026-10-28, after the power-loss drill
 was extended to the two durable-write paths the fixes changed and passed
-on btrfs, ext4, and XFS from `10d7ed4`. M3 accepts after the
-`project-nomic-512` runs.
+on btrfs, ext4, and XFS from `10d7ed4`. M3 was accepted on 2026-10-28
+after the `project-nomic-512` runs, which met every required 1M × 512
+threshold and found one more engine defect (snapshot writes built the
+whole file in memory), fixed in `684ddfe`.
 
 M1 was **Accepted** on 2026-09-30, **Reopened** on 2026-10-25, and **re-accepted** on 2026-10-28. The blob plane provides the RF2
 commit spine, durable logical deletion, recovery from immutable objects,
@@ -70,29 +72,34 @@ portal deletes only through applied GC proofs. See
 [m1-filesystem-qualification.md](m1-filesystem-qualification.md), and the
 ratified decisions in [m1-phase-1-decisions.md](m1-phase-1-decisions.md).
 
-M3's exit review was completed on 2026-10-01 after seven passes and withdrawn
-on 2026-10-25 (see the hardening pass above; the review also found that
-benchmark reports carry no usable source revision, that p95 latency is not
-published, and that the 1M × 512 build-throughput threshold is likely to be
-missed at M=32 without a recorded decision). The first two are fixed: every
-figure was re-run with `--canonical` on 2026-10-27 and p95 is published.
-The third was decided on 2026-10-27, before any 512-dim run: the threshold
-assumed M = 16, and because recovery never rebuilds and compaction rebuilds
-off the write path, it is now ≥ 560 vectors/s required (1M × 512 in 30
-minutes) and ≥ 3.3k targeted. At M = 32 the build measured 3,182 vectors/s
-at 100 dims and 1,725 at 256 dims. The original review is in
-[m3-implementation-plan.md](m3-implementation-plan.md). Every acceptance
-criterion below carries evidence from the engine test suite
-(`crates/distr-hnsw-index`), the blob-plane archive test
-(`crates/distr-hnsw/tests/index_archive.rs`), and the published benchmark
-reports ([bench/README.md](bench/README.md)) on the three pinned public
-datasets. The "representative project data" half of the recall criterion
-and the 1M × 512 latency, build, recovery, and memory measurements wait on
-the `project-nomic-512` dataset. The 2026-10-01 review proposed accepting
-that gap as a limitation because the GPU was busy; the GPU is now free, so
-M3 is accepted only after that run instead (decided 2026-10-27). The
-thresholds and the measurement commands are fixed, so the run adds evidence
-without changing code.
+M3 was **Accepted** on 2026-10-28. Its exit review was first completed on
+2026-10-01 after seven passes and withdrawn on 2026-10-25 by the hardening
+pass, which also found that benchmark reports carried no usable source
+revision, that p95 latency was not published, and that the 1M × 512
+build-throughput threshold would be missed at M = 32 without a recorded
+decision. Every figure was re-run with `--canonical` on 2026-10-27 with p95
+published, and the build threshold was revised before any 512-dim run
+(≥ 560 vectors/s required, ≥ 3.3k targeted; recovery never rebuilds and
+compaction rebuilds off the write path). The `project-nomic-512` runs on
+2026-10-28 supplied the representative-data and 1M × 512 evidence: recall
+0.9933 at the default ef = 500 with int8, p95 3.14 ms single-threaded,
+build 1,700 vectors/s, recovery 3.66 s, and a hot set of about 920 bytes
+per vector. They also found a defect: writing a snapshot built the whole
+file in memory, so the first 1M snapshot was OOM-killed; the writer now
+streams (`684ddfe`). Results against every threshold are in
+[m3-implementation-plan.md](m3-implementation-plan.md), and the figures in
+[bench/README.md](bench/README.md).
+
+Accepted limitations, carried into later milestones rather than blocking
+this one: the WAL crash evidence is in-process (a subprocess `kill -9`
+harness and an engine power-loss run are deferred); compaction is not
+admitted against the RAM budget, and a 1M × 512 compaction holds a second
+copy of the live rows; recovery was measured from a warm page cache only;
+three targets are missed (p95 ≤ 2 ms, build ≥ 3.3k vectors/s, ≤ 800
+bytes per vector); filtered queries near the brute-force cutover cost 15
+to 21 ms at p50 at 1M; the project set's base is 99.8% Wikipedia, so it
+matches the product's vector distribution, not a personal corpus; and all
+measurements come from one host (`anthonypc`, 16 threads, 15 GiB).
 
 ## How milestones are governed
 
@@ -443,13 +450,13 @@ quality, and resource model before adding replication and distributed routing.
 
 ### Acceptance criteria
 
-- [ ] Exact and ANN query results obey the configured distance metric,
+- [x] Exact and ANN query results obey the configured distance metric,
   deterministic tie rules, upsert semantics, and tombstones.
   Evidence: oracle tie-rule and kernel property tests; HNSW model-based tests against the oracle with interleaved insert, upsert, delete, and query ([m3-engine-contract.md](m3-engine-contract.md) §1–§3); oracle recall 1.0 on every pinned set. Non-finite queries are rejected on every metric; `k` and `ef` are bounded.
-  Reopened 2026-10-25: inserts made after mass deletion were unreachable because construction never routed through tombstones (H6), and a parallel-build race could leave a live record without in-links. Both fixed with tests (delete-all then upsert; 99% tombstoned; every node has an in-link).
+  Reopened 2026-10-25: inserts made after mass deletion were unreachable because construction never routed through tombstones (H6), and a parallel-build race could leave a live record without in-links. Both fixed with tests (delete-all then upsert; 99% tombstoned; every node has an in-link). Re-accepted 2026-10-28: `inserts_route_through_tombstones_and_stay_findable`, `records_inserted_after_mass_deletion_stay_reachable`, and `parallel_build_leaves_no_node_without_in_links` pass.
 - [x] Unfiltered and filtered recall meet documented thresholds against brute
   force on fixed public datasets and representative project data.
-  Evidence (canonical, `dc276f3`, 2026-10-27): sift 0.987 at M = 16 / ef = 100; at the cosine default M = 32 / ef = 500, nytimes 0.979 and glove 0.974 (0.990 and 0.985 at ef = 800) ([bench/README.md](bench/README.md)); filtered recall 0.983 to 1.000 from 0.1% to 50% selectivity on both routes. The cosine default ef was raised from 400 to 500 on 2026-10-27, because 400 gives glove 0.966, below the 0.97 target, and 500 clears both angular sets (0.979 and 0.974) for about 25% more latency. The defaults live in code (`HnswParams::for_metric`, `default_ef_search`). Representative data (canonical, `30fc26f`, 2026-10-28): `project-nomic-512-200k` reaches 0.9972 at ef = 500 with int8 (0.984 at ef = 100) and filtered recall of at least 0.9989 at every selectivity. Its base is 99.8% Wikipedia embedded with the product's model and recipe ([bench/README.md](bench/README.md)). Open: the 1M set, which the plan's 1M × 512 thresholds are stated against.
+  Evidence (canonical, `dc276f3`, 2026-10-27): sift 0.987 at M = 16 / ef = 100; at the cosine default M = 32 / ef = 500, nytimes 0.979 and glove 0.974 (0.990 and 0.985 at ef = 800) ([bench/README.md](bench/README.md)); filtered recall 0.983 to 1.000 from 0.1% to 50% selectivity on both routes. The cosine default ef was raised from 400 to 500 on 2026-10-27, because 400 gives glove 0.966, below the 0.97 target, and 500 clears both angular sets (0.979 and 0.974) for about 25% more latency. The defaults live in code (`HnswParams::for_metric`, `default_ef_search`). Representative data (canonical, `30fc26f`, 2026-10-28): `project-nomic-512-200k` reaches 0.9972 at ef = 500 with int8 (0.984 at ef = 100) and filtered recall of at least 0.9989 at every selectivity. Its base is 99.8% Wikipedia embedded with the product's model and recipe ([bench/README.md](bench/README.md)). At 1M (`b4b6710`, 2026-10-28): 0.9933 at ef = 500 with int8 (0.9956 at ef = 800; ef = 100 gives 0.968, below 0.97 at this scale), and filtered recall of at least 0.9963 at every selectivity.
 - [x] Int8 retrieval plus exact rescoring meets its documented recall/latency
   budget and never returns a score computed from the wrong vector/version.
   Evidence: int8 recall within 0.0014 of f32 on every set at about twice the throughput; rescoring reads the f32 original of the current slot only, and upsert tombstones the old slot before the new one is searchable (contract §3, §7).
@@ -458,18 +465,18 @@ quality, and resource model before adding replication and distributed routing.
   Evidence: failpoint tests at every append, sync, and apply boundary; torn-tail truncation; idempotency replay (`partition.rs` tests); 1,000-entry tail replayed on sift, nytimes, and glove with byte-identical results. The writer refuses appends after any failed write, sync, or rotation, and partition, `wal/`, and `snap/` directories are created with parent syncs. Limitation: the crash evidence is in-process; a subprocess kill harness and a power-loss run for the engine are still owed.
 - [x] Snapshot plus WAL-tail restore reproduces logical records, tombstones,
   idempotency state, and the committed high-water mark.
-  Evidence: section-by-section round-trip tests; recovery 1.75 s on sift 1M, 3.98 s on nytimes 290k, and 3.21 s on glove 1.18M with identical search results; `index restore` through RF2 loopback agents reproduces the state and high-water mark.
-- [ ] Truncated, reordered, or checksum-invalid WAL/snapshot data fails closed
+  Evidence: section-by-section round-trip tests; recovery 1.75 s on sift 1M, 3.98 s on nytimes 290k, and 3.21 s on glove 1.18M with identical search results, and 3.66 s on `project-nomic-512` 1M × 512 (`46757b8`; 2.87 GB snapshot, 1,000-entry tail); `index restore` through RF2 loopback agents reproduces the state and high-water mark.
+- [x] Truncated, reordered, or checksum-invalid WAL/snapshot data fails closed
   with a recoverable diagnosis.
   Evidence: corrupt header, mid-segment entry, sequence gap, snapshot header CRC, section BLAKE3, footer, wrong partition id, and missing-history tests; the newest verifiable snapshot is used and a damaged one is reported in the recovery report. Added: every bit of every non-final length field, zero-filled tails, damage in sealed segments, a WAL that stops short of the snapshot, and a bulk-loaded partition whose base snapshot is missing.
-  Reopened 2026-10-25: a corrupt length field was read as a torn tail, so acknowledged entries were truncated silently (H5); repair could truncate a sealed segment; a bulk-loaded partition opened without its snapshot. Fixed with the tests above; awaiting acceptance review.
-- [ ] Compaction under concurrent reads/writes neither loses acknowledged
+  Reopened 2026-10-25: a corrupt length field was read as a torn tail, so acknowledged entries were truncated silently (H5); repair could truncate a sealed segment; a bulk-loaded partition opened without its snapshot. Fixed with the tests above (`a_damaged_length_field_never_discards_the_entries_behind_it`, `damage_in_a_sealed_segment_fails_closed_without_touching_any_file`, `a_wal_that_stops_short_of_the_snapshot_fails_closed`, `a_bulk_load_without_its_snapshot_fails_closed`); re-accepted 2026-10-28.
+- [x] Compaction under concurrent reads/writes neither loses acknowledged
   operations nor makes deleted records visible.
   Evidence: two-phase compaction (a short capture step, then a rebuild that owns its input) with a multithreaded test in which writers run during the rebuild; deletes before compaction; the `CompactionBeforeSwap` crash point. The bench now writes during the rebuild.
-  Reopened 2026-10-25: the earlier API could not run writers beside the rebuild and the published "concurrent" figures were sequential. Fixed in code and re-measured on 2026-10-27: on sift 1M, nytimes, and glove 1.18M every one of 1,000 upserts was acknowledged during the rebuild (slowest 44 ms), the exclusive finish took 4.0 to 5.5 s, and no deleted key was returned ([bench/README.md](bench/README.md)).
+  Reopened 2026-10-25: the earlier API could not run writers beside the rebuild and the published "concurrent" figures were sequential. Fixed in code and re-measured on 2026-10-27: on sift 1M, nytimes, and glove 1.18M every one of 1,000 upserts was acknowledged during the rebuild (slowest 44 ms), the exclusive finish took 4.0 to 5.5 s, and no deleted key was returned ([bench/README.md](bench/README.md)). At 1M × 512 (`684ddfe`): 1,000 of 1,000 upserts acknowledged during the 478 s rebuild (slowest 32 ms), finish 6.0 s, no deleted key returned, recall 0.9938 → 0.9941. Re-accepted 2026-10-28.
 - [x] Hard RAM/disk limits reject or defer work before recovery/compaction
   headroom would be consumed.
-  Evidence: RAM budget admission test (upserts refused with `OverBudget` at `budget − headroom`, deletes admitted); the hot-set formula is measured, not estimated (contract §11: `graph(M) = 54 + 8·M` bytes, 910 B per vector at 512 dims and M = 32). Snapshots now serve the f32 originals from the file just written, so resident bytes match before and after a reopen. Disk admission for archive copies is the M1 portal's (507 / exit 3). Limitation: compaction itself is not yet admitted against the RAM budget.
+  Evidence: RAM budget admission test (upserts refused with `OverBudget` at `budget − headroom`, deletes admitted); the hot-set formula is measured, not estimated (contract §11: `graph(M) = 54 + 8·M` bytes, 910 B per vector at 512 dims and M = 32). Snapshots now serve the f32 originals from the file just written, so resident bytes match before and after a reopen. Disk admission for archive copies is the M1 portal's (507 / exit 3). Writing a snapshot no longer needs a copy of the partition in memory: the 1M run found that it needed about four times the file and was OOM-killed, and the writer now streams (`684ddfe`; `tests/snapshot_memory.rs` bounds the heap growth of a write at half the file). Limitation: compaction itself is not yet admitted against the RAM budget, and at 1M × 512 it holds a second copy of the live rows (peak bench RSS 9.8 GiB including the bench's own copy of the dataset).
 
 ### Verification and evidence
 

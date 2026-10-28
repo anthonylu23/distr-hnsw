@@ -17,7 +17,7 @@ indexed by meaning with distributed HNSW vector search.
 | M0 Semantic validation | Accepted |
 | M1 Blob plane and recovery foundation | Accepted (re-accepted 2026-10-28 after the [hardening pass](docs/hardening-2026-10.md)) |
 | M2 Tailscale identity and authorization | Not started |
-| M3 Single-partition vector engine | In progress (hardening) |
+| M3 Single-partition vector engine | Accepted (2026-10-28, after the [hardening pass](docs/hardening-2026-10.md)) |
 | M4–M7 Distributed vector plane, extraction, dashboard, vault and release | Not started |
 
 ## Build and test

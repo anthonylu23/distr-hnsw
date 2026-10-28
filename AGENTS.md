@@ -2,10 +2,10 @@
 
 Self-hosted, Tailscale-native distributed semantic storage service: replicated
 encrypted blobs plus distributed HNSW vector search. Product design lives in
-`DESIGN.md`. M0 and M1 (blob plane, `crates/distr-hnsw/`) are accepted.
-M3 (vector engine, `crates/distr-hnsw-index/`) is in progress until the
-`project-nomic-512` runs that close the October 2026 hardening pass
-(`docs/hardening-2026-10.md`).
+`DESIGN.md`. M0, M1 (blob plane, `crates/distr-hnsw/`), and M3 (vector
+engine, `crates/distr-hnsw-index/`) are accepted; the October 2026
+hardening pass (`docs/hardening-2026-10.md`) closed on 2026-10-28. M2
+(Tailscale identity) is next.
 
 
 ## Stack
@@ -141,14 +141,16 @@ and run against MinIO with `scripts/minio-test.sh`. Process tests rely on
 honor. Large matrices and drills run on
 `anthonypc`.
 
-**M3 status:** In progress. Seven passes completed and the exit review passed
-on 2026-10-01; the 2026-10-25 audit withdrew it (WAL length-field corruption
-read as a torn tail, unreachable inserts after mass deletion, benchmark
-reports without a source revision). The fixes are in, and every bench was
-re-run with `--canonical` on 2026-10-27. On the same day the cosine default
-`ef_search` became 500 and the 1M × 512 build threshold was revised
-(`docs/m3-implementation-plan.md`); acceptance waits on the
-`project-nomic-512` runs.
+**M3 status:** Accepted 2026-10-28 (first exit review 2026-10-01, withdrawn
+2026-10-25 by the audit: WAL length-field corruption read as a torn tail,
+unreachable inserts after mass deletion, benchmark reports without a source
+revision). The fixes are in, every bench was re-run with `--canonical`, the
+cosine default `ef_search` is 500, and the 1M × 512 build threshold was
+revised before any 512-dim run. The `project-nomic-512` 1M × 512 runs met
+every required threshold (`docs/m3-implementation-plan.md`) and found that
+snapshot writes built the whole file in memory (OOM at 1M); the writer
+now streams. Run multi-GB benches on `anthonypc` inside `systemd-run --user
+--scope -p MemoryMax=10G` so an overrun kills only the bench.
 The engine (`crates/distr-hnsw-index`)
 provides flat and int8 vectors, HNSW, filtered search with a measured
 cutover, WAL and snapshots, two-phase compaction, and RAM budget admission;

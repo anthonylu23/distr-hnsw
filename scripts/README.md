@@ -142,18 +142,32 @@ Wikipedia `20231101.en` parquet shards pinned to a Hugging Face revision.
 Chunking is an exact port of the phase-0 chunker (2,000 characters, 200
 overlap). Every 100th chunk becomes a query (its first 256 characters);
 the rest fill the base. The script declares its dependencies for `uv`.
-Embedding runs on the GPU (about 88 chunks/s on the RTX 3060 Ti) and
-resumes where it stopped; it refuses to continue if the Ollama model
-digest changes.
+Embedding runs on the GPU (88 to 125 chunks/s on the RTX 3060 Ti, about
+2.3 hours for the 1M set) and resumes where it stopped; it refuses to
+continue if the Ollama model digest changes. Finalizing computes exact
+ground truth on the CPU (154 s at 1M, 4.2 GiB peak).
 
 ```sh
 REV=b04c8d1ceb2f5cd4588862100d08de323dccfbaa   # wikimedia/wikipedia revision
 WORK=~/distr-hnsw-bench/work/project-nomic-512
 scripts/bench/build-project-set.py prepare --corpus ~/distr-hnsw-proto/corpora/mixed-v4-20260719 \
   --wikipedia ~/distr-hnsw-bench/downloads/wikipedia-20231101.en --wikipedia-revision $REV --work $WORK
-scripts/bench/build-project-set.py embed --work $WORK --limit 200000   # later: no --limit
+scripts/bench/build-project-set.py embed --work $WORK --limit 200000   # 200k prefix
 scripts/bench/build-project-set.py finalize --work $WORK --base-count 200000 \
   --name project-nomic-512-200k --out ~/distr-hnsw-bench/datasets/project-nomic-512-200k
+scripts/bench/build-project-set.py embed --work $WORK                  # the rest of the 1M
+scripts/bench/build-project-set.py finalize --work $WORK --base-count 1000000 \
+  --name project-nomic-512 --out ~/distr-hnsw-bench/datasets/project-nomic-512
+```
+
+The 1M persistence and compaction benches peak at 7.7 and 9.8 GiB RSS on
+`anthonypc`. Run them in a memory-capped scope so an overrun kills only the
+bench, not the session that started it:
+
+```sh
+systemd-run --user --scope -q -p MemoryMax=10G -p MemorySwapMax=0 -- \
+  target/release/distr-hnsw-bench --canonical compact ~/distr-hnsw-bench/datasets/project-nomic-512 \
+  --partition-dir <dir> --m 32 --ef 500 --out <report.json>
 ```
 
 The work directory holds private corpus text and stays on the bench host;
