@@ -1,0 +1,79 @@
+{
+  "manifest_type": "BenchDatasetV1",
+  "version": 1,
+  "name": "project-nomic-512-200k",
+  "source": "built from text with scripts/bench/build-project-set.py",
+  "converted_with": "scripts/bench/build-project-set.py",
+  "metric": "cosine",
+  "dims": 512,
+  "base_count": 200000,
+  "query_count": 10000,
+  "groundtruth_k": 100,
+  "embedding": {
+    "model": "nomic-embed-text",
+    "ollama_digest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
+    "native_dims": 768,
+    "recipe": "prefix \"search_document: \" (base) or \"search_query: \" (queries); truncate 768 -> 512; L2-normalize (DESIGN \u00a715)"
+  },
+  "chunking": {
+    "chunk_chars": 2000,
+    "chunk_overlap": 200,
+    "port_of": "prototype/src/chunk.rs::chunk_text",
+    "max_file_bytes": 8388608
+  },
+  "split": "every 100th chunk in stream order is a query source until 10000 queries; a query is the first 256 characters of its chunk, cut at whitespace; all other chunks are base, in order",
+  "base_prefix_of": "1000000 prepared base chunks; this set uses the first 200000",
+  "sources": [
+    {
+      "name": "phase-0 mixed corpus (private; text files only, PDFs skipped)",
+      "path_hint": "mixed-v4-20260719",
+      "files": 347,
+      "skipped_pdf": 54,
+      "skipped_large": 0,
+      "skipped_binary": 0,
+      "chunks_base": 1799,
+      "chunks_query": 18,
+      "tree_blake3": "59788076503201a6ead63ed08eef0c8fb5ceb53a0fc689c7eed6107da84feee9"
+    },
+    {
+      "name": "Wikipedia 20231101.en (wikimedia/wikipedia on Hugging Face)",
+      "revision": "b04c8d1ceb2f5cd4588862100d08de323dccfbaa",
+      "files": [
+        {
+          "name": "train-00000-of-00041.parquet",
+          "sha256": "382e7f6f09e488b24793a7f7cfc659879d5a22da2cf2efec6491665f0c019677",
+          "blake3": "35ff5de1e8f6fac3f3bd50706f817c6822b04f7dd493c129e43215c431ae3b66"
+        },
+        {
+          "name": "train-00001-of-00041.parquet",
+          "sha256": "6cd57a5825312ca966313d4a1b614690b5c4fb53cee9b124bc0e999977eb36cf",
+          "blake3": "1fb1cbaca9c444591a7be60b46923a6a184895ed0b017c32423b27bb23ac5348"
+        },
+        {
+          "name": "train-00002-of-00041.parquet",
+          "sha256": "b18674f163d4f106e43396fd58412a79b80a418c72bb728c20af439e7ca4d5b7",
+          "blake3": "4e36f7a512db7516be9347eeb4e2fe537341287bb3c4176165f28351de57e30d"
+        }
+      ],
+      "articles": 376796,
+      "shards_read": 2,
+      "chunks_base": 998201,
+      "chunks_query": 9982
+    }
+  ],
+  "groundtruth": "exact top-100 by cosine over this base (numpy float32), ties by id",
+  "files": {
+    "base.f32le": {
+      "bytes": 409600000,
+      "blake3": "ceadca42201f3e9a5d2656b668ebb0837cd96f2e253e1ae93fbc482ac6224d02"
+    },
+    "queries.f32le": {
+      "bytes": 20480000,
+      "blake3": "8c469e956811baa753b19e4a56780a9e0bb36eb241116d51e25770c9b73d93aa"
+    },
+    "groundtruth.i32le": {
+      "bytes": 4000000,
+      "blake3": "4d91c5b09d91264a74eaad07b0730ea8248bc942e90cc634eeed139eeabe6430"
+    }
+  }
+}

@@ -48,7 +48,7 @@ Rust harness reads only the flat files.
 | `nytimes-256-angular` | 290k | 256 | cosine | Fast regression set for CI on either machine; angular metric |
 | `sift-128-euclidean` | 1.0M | 128 | L2 | Classic baseline with well-known recall/ef curves; catches graph bugs |
 | `glove-100-angular` | 1.18M | 100 | cosine | Hard angular set; exposes recall cliffs and int8 loss |
-| `project-nomic-512` | 200k, later 1M | 512 | cosine | Representative: chunks from the phase-0 mixed corpus plus public text, embedded with the locked `nomic-embed-text @ 512` on `anthonypc`; ground truth by exact search |
+| `project-nomic-512` | 200k, later 1M | 512 | cosine | Representative: chunks from the phase-0 mixed corpus plus public text (pinned Wikipedia, so 99.8% of the base), embedded with the locked `nomic-embed-text @ 512` on `anthonypc`; ground truth by exact search (`scripts/bench/build-project-set.py`) |
 | `filtered-*` (derived) | as parent | as parent | as parent | Each parent gains synthetic facet labels at 0.1%, 1%, 10%, and 50% selectivity; ground truth is exact search over the matching subset |
 
 The public sets are for engine correctness and comparability; the project set

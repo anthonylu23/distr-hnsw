@@ -41,10 +41,12 @@ tracks only the immediate work queue.
 4. Done 2026-10-28: the power-loss drill covers the master-key write and a
    re-PUT after a crash between rename and directory sync; it passed on
    btrfs, ext4, and XFS from `10d7ed4`, and M1 was re-accepted.
-5. To accept M3: build `project-nomic-512` (200k, then 1M) now that the GPU
-   is free, and run `oracle`, `hnsw`, `filtered`, `persist`, and `compact`
-   on it with `--canonical`. This supplies the representative recall row
-   and the 1M × 512 latency, build, recovery, and memory figures.
+5. To accept M3: done 2026-10-28 for 200k (`scripts/bench/build-project-set.py`,
+   all five benches from `30fc26f`, [bench/README.md](bench/README.md)).
+   Remaining: embed the other 800k base chunks (about 3.2 hours on the
+   GPU, which is shared with other CUDA work, so schedule it first), then
+   finalize the 1M set and run the five benches on it. That supplies the
+   1M × 512 latency, build, recovery, and memory figures.
 
 ## After hardening
 

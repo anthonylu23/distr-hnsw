@@ -11,7 +11,8 @@ file, and the harness refuses a dataset whose bytes do not match.
 | `nytimes-256-angular` | 290,000 | 256 | cosine | 10,000 | 100-NN |
 | `sift-128-euclidean` | 1,000,000 | 128 | L2 | 10,000 | 100-NN |
 | `glove-100-angular` | 1,183,514 | 100 | cosine | 10,000 | 100-NN |
-| `project-nomic-512` | pending (GPU shared) | 512 | cosine | | exact search |
+| `project-nomic-512-200k` | 200,000 | 512 | cosine | 10,000 | 100-NN |
+| `project-nomic-512` | 1,000,000 (embedding pending) | 512 | cosine | 10,000 | 100-NN |
 
 ## Provenance
 
@@ -242,3 +243,43 @@ Reading:
 - No deleted key appears in any result after compaction, the catch-up
   replayed every concurrent upsert (`caught_up_entries` = 1,000), and every
   concurrent key is present after the swap.
+
+## Project set (`project-nomic-512`)
+
+The only set at the product's dimension, built by
+[`scripts/bench/build-project-set.py`](../../scripts/README.md) with the
+locked phase-0 model and recipe: `nomic-embed-text` (Ollama digest
+`0a109f42…`), task prefixes, truncated from 768 to 512 dimensions and
+L2-normalized. Text is chunked with the phase-0 chunker (2,000 characters,
+200 overlap). Sources in stream order: the phase-0 mixed corpus (347 text
+files, 1,817 chunks), then Wikipedia `20231101.en` pinned to revision
+`b04c8d1c`. Every 100th chunk is held out and its first 256 characters
+become a query. The base is therefore 99.8% encyclopedic prose: it matches
+the product's vector distribution at 512 dimensions, not the mix of
+personal files a deployment would hold. Manifest:
+[project-nomic-512-200k.manifest.json](project-nomic-512-200k.manifest.json).
+
+The 200k set (the first 200,000 base chunks) was measured on 2026-10-28
+from `30fc26f`, with the same procedure as the tables above, M = 32, and
+the cosine default ef = 500 unless noted. The 1M set waits on a 3.2-hour
+embedding run on the shared GPU.
+
+| Measure | 200k × 512 |
+|---|---|
+| Oracle | recall 1.000, p50 / p95 18.1 / 19.4 ms, 393 queries/s |
+| Parallel build | 80 s, 2,498 vectors/s |
+| Recall@10, f32 → int8, ef 100 / 200 / 500 / 800 | 0.9841 → 0.9841 / 0.9926 → 0.9926 / 0.9973 → 0.9972 / 0.9988 → 0.9987 |
+| p50 / p95 ms, int8, ef 100 / 500 / 800 | 0.42 / 0.64, 1.46 / 2.17, 2.13 / 3.14 |
+| Batch queries/s, int8, ef 500 | 3,979 |
+| Filtered recall, masked route, 0.1% / 1% / 10% / 50% | 1.000 / 1.000 / 0.9997 / 0.9989; crossover at about 29,500 allowed slots |
+| Snapshot | 574 MB (2,869 bytes per vector including f32 originals) |
+| Recovery with a 1,000-entry WAL tail | 1.74 s, results identical |
+| Compaction at 20% tombstones | 1,000 of 1,000 upserts accepted during the 61 s rebuild (slowest 15 ms), finish 3.2 s, no deleted key returned, recall 0.9984 → 0.9986 |
+
+Recall on this set is far above the 0.97 requirement even at ef = 100,
+where one query in 1,000 still scores 0 (its minimum rises to 0.6 at ef =
+200). The build is faster than nytimes despite twice the dimensions
+(2,498 against 1,725 vectors/s), so dimension alone does not set build
+cost. That figure is at 200k; the 1M run decides the build, latency,
+recovery, and memory thresholds, which are all stated at 1M × 512.
+
