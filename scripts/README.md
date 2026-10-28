@@ -11,7 +11,7 @@ the procedure are in
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo build --release -p distr-hnsw
+cargo build --release -p distr-hnsw --features failpoints
 scripts/power-loss-drill.sh btrfs     # also: ext4, xfs
 scripts/power-loss-drill.sh ext4 --files 16 --keep   # more marks; keep images
 ```
@@ -20,6 +20,10 @@ Requirements (all present on `anthonypc`): passwordless `sudo`, the
 `dm-log-writes` module, `mkfs.<fs>`, `dmsetup`, `losetup`, `blkdiscard`,
 `jq`, `curl`, `gcc`, and network access on first run to shallow-clone
 xfstests for `replay-log` (compiled into `$HOME/distr-hnsw-drill/replay-log`).
+The binary must be built with `--features failpoints`: the re-PUT phase
+stops an agent between a PUT's rename and its directory sync through
+`DISTR_HNSW_AGENT_FAILPOINT=put_after_rename`, and the script refuses a
+build without failpoints.
 
 What it does:
 

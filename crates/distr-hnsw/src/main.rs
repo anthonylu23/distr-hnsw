@@ -11,6 +11,7 @@ use distr_hnsw::{
     agent::{bind_and_serve_agent, AgentIdentity, CapacityConfig},
     backup::{self, BackupTargetSpec},
     crypto::MasterKey,
+    durability::StoreFailpoint,
     lifecycle::{self, GcOptions},
     metadata::{Database, JobMode, KeyBinding},
     portal::{prepare_agents, AgentTarget, Failpoint, FailpointAction, Portal},
@@ -359,8 +360,6 @@ fn read_passphrase_stdin() -> anyhow::Result<Zeroizing<String>> {
     Ok(Zeroizing::new(trimmed))
 }
 
-/// Emit the recovery bundle for `key`, verifying that it round-trips before
-/// anything is printed. Returns the armored text.
 /// Process-level crash injection for the commit-spine tests. Only debug
 /// builds and builds with the `failpoints` feature honor
 /// `DISTR_HNSW_FAILPOINT`; a release build refuses to run with it set rather
@@ -379,6 +378,26 @@ fn with_env_failpoint(portal: Portal) -> anyhow::Result<Portal> {
     }
 }
 
+/// The agent's counterpart to [`with_env_failpoint`], read from
+/// `DISTR_HNSW_AGENT_FAILPOINT` so a variable meant for a portal command
+/// never reaches an agent, with the same refusal in builds without
+/// failpoints.
+fn env_agent_failpoint() -> anyhow::Result<Option<StoreFailpoint>> {
+    let Ok(value) = std::env::var("DISTR_HNSW_AGENT_FAILPOINT") else {
+        return Ok(None);
+    };
+    if cfg!(any(debug_assertions, feature = "failpoints")) {
+        Ok(Some(value.parse().map_err(anyhow::Error::msg)?))
+    } else {
+        anyhow::bail!(
+            "DISTR_HNSW_AGENT_FAILPOINT is set, but this build has no failpoints \
+             (build with --features failpoints)"
+        )
+    }
+}
+
+/// Emit the recovery bundle for `key`, verifying that it round-trips before
+/// anything is printed. Returns the armored text.
 fn emit_recovery_bundle(
     key: &MasterKey,
     passphrase: &PassphraseArgs,
@@ -449,6 +468,7 @@ async fn main() -> anyhow::Result<()> {
                     reserve_bytes,
                     hard_floor_bytes,
                 },
+                env_agent_failpoint()?,
             )
             .await
         }

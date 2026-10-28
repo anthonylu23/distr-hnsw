@@ -2,6 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -25,12 +26,43 @@ pub struct InventoryPage {
     pub next_after: Option<ObjectHash>,
 }
 
+/// Process-level crash injection for the power-loss drill. The agent binary
+/// honors `DISTR_HNSW_AGENT_FAILPOINT` only in debug builds and builds with
+/// the `failpoints` feature.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreFailpoint {
+    /// Exit after a PUT renames its object into place and before it syncs
+    /// the directory, so the rename is not yet durable and the PUT is never
+    /// acknowledged.
+    PutAfterRename,
+}
+
+impl StoreFailpoint {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PutAfterRename => "put_after_rename",
+        }
+    }
+}
+
+impl FromStr for StoreFailpoint {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "put_after_rename" => Ok(Self::PutAfterRename),
+            other => Err(format!("unknown agent failpoint: {other}")),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DurableStore {
     root: PathBuf,
     /// Bytes held by stored objects, computed on open and maintained by put
     /// and delete. Temporary files are not counted.
     used_bytes: AtomicU64,
+    failpoint: Option<StoreFailpoint>,
 }
 
 impl DurableStore {
@@ -45,6 +77,7 @@ impl DurableStore {
         let store = Self {
             root,
             used_bytes: AtomicU64::new(0),
+            failpoint: None,
         };
         let mut used = 0_u64;
         for kind in ObjectKind::ALL {
@@ -60,6 +93,11 @@ impl DurableStore {
         }
         store.used_bytes.store(used, Ordering::Relaxed);
         Ok(store)
+    }
+
+    pub fn with_failpoint(mut self, failpoint: StoreFailpoint) -> Self {
+        self.failpoint = Some(failpoint);
+        self
     }
 
     /// Remove temporary files that an interrupted PUT left behind and that
@@ -251,6 +289,9 @@ impl DurableStore {
             sync_regular_file(&file)?;
             drop(file);
             fs::rename(&temporary, &final_path)?;
+            if self.failpoint == Some(StoreFailpoint::PutAfterRename) {
+                std::process::exit(86);
+            }
             sync_directory(parent)?;
             Ok(())
         })();

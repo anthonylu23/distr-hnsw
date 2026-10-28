@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::{
-    durability::{DurableStore, InventoryPage, StoreError, MAX_INVENTORY_PAGE},
+    durability::{DurableStore, InventoryPage, StoreError, StoreFailpoint, MAX_INVENTORY_PAGE},
     object::{ObjectHash, ObjectKind},
     CHUNK_SIZE,
 };
@@ -212,7 +212,15 @@ pub async fn serve_agent_with_capacity(
     identity: AgentIdentity,
     capacity: CapacityConfig,
 ) -> anyhow::Result<()> {
-    let store = DurableStore::open(volume)?;
+    serve_store(listener, DurableStore::open(volume)?, identity, capacity).await
+}
+
+async fn serve_store(
+    listener: TcpListener,
+    store: DurableStore,
+    identity: AgentIdentity,
+    capacity: CapacityConfig,
+) -> anyhow::Result<()> {
     let swept = store.sweep_stale_temporaries(std::time::Duration::from_secs(3600))?;
     if swept > 0 {
         eprintln!("removed {swept} stale temporary file(s) left by interrupted writes");
@@ -227,12 +235,17 @@ pub async fn bind_and_serve_agent(
     volume: PathBuf,
     identity: AgentIdentity,
     capacity: CapacityConfig,
+    failpoint: Option<StoreFailpoint>,
 ) -> anyhow::Result<()> {
     if !bind.ip().is_loopback() {
         anyhow::bail!("M1 agent must bind to a loopback address; Tailscale authorization is M2")
     }
     let listener = TcpListener::bind(bind).await?;
-    serve_agent_with_capacity(listener, volume, identity, capacity).await
+    let mut store = DurableStore::open(volume)?;
+    if let Some(failpoint) = failpoint {
+        store = store.with_failpoint(failpoint);
+    }
+    serve_store(listener, store, identity, capacity).await
 }
 
 pub fn router(

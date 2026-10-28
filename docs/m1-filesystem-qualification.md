@@ -306,6 +306,15 @@ Where the implementation departs from the outline, deliberately:
   misreport a dirty journal.
 - A negative control (1 MiB written with no `fsync`, then a mark) is replayed
   last; the run is reported `INCONCLUSIVE` if that file survives intact.
+- Since 2026-10-28 the drill also covers the two durable-write paths the
+  hardening pass changed. `portal init` writes the master key onto the
+  drilled volume (mark `master-key`; after replay the key must match byte
+  for byte). After the uploads, agent a is restarted with
+  `DISTR_HNSW_AGENT_FAILPOINT=put_after_rename` (failpoints builds only),
+  so the next PUT exits after its rename and before its directory sync,
+  unacknowledged. A restarted agent then acknowledges a re-PUT of that
+  object through the already-present path (mark `reput-ack`), and the
+  replay to that mark must contain it.
 
 ## Gaps and next actions
 

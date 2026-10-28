@@ -9,7 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use distr_hnsw::{metadata::Database, portal::Failpoint, CHUNK_SIZE};
+use distr_hnsw::{
+    metadata::Database,
+    object::{ObjectHash, ObjectKind},
+    portal::Failpoint,
+    CHUNK_SIZE,
+};
 use uuid::Uuid;
 
 struct AgentProcess {
@@ -29,8 +34,19 @@ fn free_address() -> SocketAddr {
 }
 
 fn start_agent(binary: &Path, id: &str, domain: &str, volume: &Path) -> (AgentProcess, String) {
+    start_agent_with_env(binary, id, domain, volume, &[])
+}
+
+fn start_agent_with_env(
+    binary: &Path,
+    id: &str,
+    domain: &str,
+    volume: &Path,
+    env: &[(&str, &str)],
+) -> (AgentProcess, String) {
     let address = free_address();
     let child = Command::new(binary)
+        .envs(env.iter().copied())
         .args([
             "agent",
             "--id",
@@ -894,4 +910,82 @@ fn empty_infrastructure_restore_drill_rebuilds_files_from_backup_alone() {
         .write_all(passphrase.as_bytes())
         .unwrap();
     assert!(verify.wait().unwrap().success());
+}
+
+/// Send one raw HTTP/1.1 PUT and return the status code, or `None` when the
+/// agent closed the connection without answering.
+fn raw_put(target: &str, path: &str, body: &[u8]) -> Option<u16> {
+    use std::io::{Read as _, Write as _};
+    let address = target.rsplit("http://").next().unwrap();
+    let mut stream = TcpStream::connect(address).unwrap();
+    let head = format!(
+        "PUT {path} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).ok()?;
+    stream.write_all(body).ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    response.split(' ').nth(1)?.parse().ok()
+}
+
+/// An agent that exits between a PUT's rename and its directory sync never
+/// acknowledges that PUT, and a retry of the same object takes the
+/// already-present path and is acknowledged. The power-loss drill checks
+/// that this second acknowledgement is durable.
+#[test]
+fn agent_exit_after_put_rename_is_unacknowledged_and_retry_succeeds() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_distr-hnsw"));
+    let workspace = tempfile::tempdir().unwrap();
+    let volume = workspace.path().join("agent-a");
+    let body: Vec<u8> = (0..3072_u32).map(|index| (index % 251) as u8).collect();
+    let hash = ObjectHash::digest(&body);
+    let path = format!("/v1/objects/chunk/{}", hash.as_str());
+    let object = volume
+        .join("objects")
+        .join(ObjectKind::Chunk.as_str())
+        .join(&hash.as_str()[0..2])
+        .join(&hash.as_str()[2..4])
+        .join(hash.as_str());
+
+    let (mut crashing, target) = start_agent_with_env(
+        binary,
+        "agent-a",
+        "host-a",
+        &volume,
+        &[("DISTR_HNSW_AGENT_FAILPOINT", "put_after_rename")],
+    );
+    assert_eq!(raw_put(&target, &path, &body), None);
+    assert_eq!(crashing.child.wait().unwrap().code(), Some(86));
+    assert_eq!(fs::read(&object).unwrap(), body, "the rename happened");
+
+    let (_agent, target) = start_agent(binary, "agent-a", "host-a", &volume);
+    assert_eq!(raw_put(&target, &path, &body), Some(204));
+    assert_eq!(fs::read(&object).unwrap(), body);
+}
+
+#[test]
+fn agent_refuses_an_unknown_failpoint() {
+    let workspace = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_distr-hnsw"))
+        .args([
+            "agent",
+            "--id",
+            "agent-a",
+            "--failure-domain",
+            "host-a",
+            "--bind",
+            &free_address().to_string(),
+            "--volume",
+        ])
+        .arg(workspace.path().join("agent-a"))
+        .env("DISTR_HNSW_AGENT_FAILPOINT", "after_plan")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unknown agent failpoint"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
