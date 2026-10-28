@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Copy-only assembly of a phase-0 mixed corpus onto anthonypc.
+# Copy-only assembly of a phase-0 mixed corpus onto the reference host
+# (docs/test-hosts.md). REMOTE names it as user@host.
 # Source trees are never modified. Every invocation uses an empty stage so
 # stale files from an earlier assembly cannot affect evaluation.
 set -euo pipefail
 
-REMOTE="${REMOTE:-anthonylu@anthonypc}"
+REMOTE="${REMOTE:?set REMOTE=user@host for the reference host}"
 CORPUS_ID="${CORPUS_ID:-mixed-$(date -u +%Y%m%dT%H%M%SZ)}"
-STAGE_REMOTE="${STAGE_REMOTE:-/home/anthonylu/distr-hnsw-proto/corpora/$CORPUS_ID}"
+# Relative remote paths resolve against the remote home directory.
+STAGE_REMOTE="${STAGE_REMOTE:-distr-hnsw-proto/corpora/$CORPUS_ID}"
 META_REMOTE="${META_REMOTE:-$(dirname "$STAGE_REMOTE")}"
 LAPTOP_DOCS="${LAPTOP_DOCS:-$HOME/Documents}"
 LAPTOP_PROJECTS="${LAPTOP_PROJECTS:-$HOME/Documents/Projects}"
@@ -99,7 +101,7 @@ ssh "$REMOTE" "
     exit 2
   fi
   mkdir -p \
-  $(printf %q "$STAGE_REMOTE")/{notes/anthonypc-vault,notes/laptop-vault,code,pdfs/{psych,cs,learning,resumes,misc},public/{gutenberg,html,pdf,code}}"
+  $(printf %q "$STAGE_REMOTE")/{notes/desktop-vault,notes/laptop-vault,code,pdfs/{psych,cs,learning,resumes,misc},public/{gutenberg,html,pdf,code}}"
 
 echo "==> copying laptop Obsidian notes"
 rsync_to "$LAPTOP_DOCS/obsidianVault/" "$STAGE_REMOTE/notes/laptop-vault/"
@@ -175,9 +177,11 @@ else
   echo "skip missing CS directory" >&2
 fi
 
-echo "==> copying anthonypc-local sources (vault + cuda course)"
-ssh "$REMOTE" "STAGE='$STAGE_REMOTE' bash -s" <<'EOF'
+echo "==> copying reference-host-local sources (vault + cuda course)"
+ssh "$REMOTE" "STAGE=$(printf %q "$STAGE_REMOTE") bash -s" <<'EOF'
 set -euo pipefail
+# Relative paths name the remote home; anchor them before any cd.
+[[ "$STAGE" == /* ]] || STAGE="$HOME/$STAGE"
 copy_supported() {
   local src="$1"
   local dest="$2"
@@ -199,7 +203,7 @@ copy_supported() {
   )
 }
 if [[ -d "$HOME/Documents/Obsidian Vault" ]]; then
-  copy_supported "$HOME/Documents/Obsidian Vault" "$STAGE/notes/anthonypc-vault"
+  copy_supported "$HOME/Documents/Obsidian Vault" "$STAGE/notes/desktop-vault"
 fi
 if [[ -d "$HOME/Documents/cuda-freecodecamp" ]]; then
   copy_supported "$HOME/Documents/cuda-freecodecamp" "$STAGE/code/cuda-freecodecamp"
@@ -208,6 +212,9 @@ EOF
 echo "==> downloading public fillers on remote"
 ssh "$REMOTE" "STAGE=$(printf %q "$STAGE_REMOTE") META=$(printf %q "$META_REMOTE") bash -s" <<'REMOTE_EOF'
 set -euo pipefail
+# Relative paths name the remote home; anchor them before any cd.
+[[ "$STAGE" == /* ]] || STAGE="$HOME/$STAGE"
+[[ "$META" == /* ]] || META="$HOME/$META"
 CORPUS_ID="${STAGE##*/}"
 PUB="$STAGE/public"
 mkdir -p "$PUB"/{gutenberg,html,pdf,code}
@@ -218,7 +225,7 @@ cat > "$SOURCES" <<'HDR'
 # Public filler sources for the phase-0 mixed corpus
 
 Copied into `public/` for phase-0 coverage. Licenses are as published by the
-upstream hosts. Private laptop/anthonypc copies live outside `public/`.
+upstream hosts. Private laptop and reference-host copies live outside `public/`.
 Meta files (this SOURCES list, inventory, manifest, and queries) live beside
 the run-scoped corpus, not inside it, so they are not indexed.
 

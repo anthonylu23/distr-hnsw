@@ -208,7 +208,7 @@ passes over the borrowed state: the first computes each section's length and
 BLAKE3 for the table, the second writes header, table, and sections through
 a 1 MiB buffer while digesting the footer. Writing therefore never holds a
 copy of the partition (an earlier in-memory encoding needed about four times
-the file on top of the partition, which at 1M × 512 exhausted `anthonypc`). `partition.json` also records
+the file on top of the partition, which at 1M × 512 exhausted the reference host). `partition.json` also records
 `base_snapshot` when history begins with a bulk-load snapshot that is not in
 the WAL (§6).
 

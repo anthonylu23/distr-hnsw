@@ -50,6 +50,10 @@ hardening pass (`docs/hardening-2026-10.md`) closed on 2026-10-28. M2
 - `docs/` — living documentation (phase status, next steps).
 - `docs/architecture.md` — system overview for new readers.
 - `docs/deployment.md` — deployment guide and the limitations it must carry.
+- `docs/test-hosts.md` — the hosts that produced the evidence, by role; public
+  docs name hosts by role, not hostname.
+- `.github/workflows/ci.yml` — CI: fmt, clippy (also with `failpoints`), and
+  the workspace tests; actions are pinned to commit SHAs.
 - `docs/roadmap.md` — gated milestones, acceptance criteria, and verification.
 - `docs/next-steps.md` — the immediate work queue.
 - `docs/hardening-2026-10.md` — the audit that reopened M1 and M3, and its
@@ -110,7 +114,7 @@ results remain comparable.
 Assemble larger corpora with `prototype/scripts/assemble-mixed-corpus.sh`
 (copy-only onto `anthonypc:~/distr-hnsw-proto/corpora/…`). Keep the query JSON
 beside the stage tree, not inside it, so prepare does not index labels. Run
-`prototype/scripts/run-bakeoff-anthonypc.sh` for the matrix.
+`prototype/scripts/run-bakeoff.sh` for the matrix.
 
 **M0 status:** Accepted. The frozen holdout and exact repeat validate
 `nomic-embed-text`; the documented non-inferiority tie-break locks 512d in

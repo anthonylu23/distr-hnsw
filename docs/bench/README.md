@@ -2,7 +2,7 @@
 
 Manifests for the pinned datasets the M3 engine is measured against
 ([m3-implementation-plan.md](../m3-implementation-plan.md)). Data files live
-under `~/distr-hnsw-bench/datasets/<name>/` on `anthonypc`; each manifest
+under `~/distr-hnsw-bench/datasets/<name>/` on the reference host; each manifest
 records the source, conversion command, shape, metric, and BLAKE3 of every
 file, and the harness refuses a dataset whose bytes do not match.
 
@@ -16,7 +16,8 @@ file, and the harness refuses a dataset whose bytes do not match.
 
 ## Provenance
 
-Every table below was measured on `anthonypc` (16 threads, 15 GiB RAM)
+Every table below was measured on the reference host
+([test-hosts.md](../test-hosts.md); 16 threads, 15 GiB RAM)
 with `--canonical` builds from clean commits. The public sets ran on
 2026-10-27 from `dc276f3`, except nytimes compaction, which comes from
 `835f055` (that commit changes only the persistence and compaction

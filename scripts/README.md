@@ -16,7 +16,7 @@ scripts/power-loss-drill.sh btrfs     # also: ext4, xfs
 scripts/power-loss-drill.sh ext4 --files 16 --keep   # more marks; keep images
 ```
 
-Requirements (all present on `anthonypc`): passwordless `sudo`, the
+Requirements (all present on the reference host): passwordless `sudo`, the
 `dm-log-writes` module, `mkfs.<fs>`, `dmsetup`, `losetup`, `blkdiscard`,
 `jq`, `curl`, `gcc`, and network access on first run to shallow-clone
 xfstests for `replay-log` (compiled into `$HOME/distr-hnsw-drill/replay-log`).
@@ -58,7 +58,7 @@ leftover count from `losetup -a` and `dmsetup ls`. Nothing outside
 `$HOME/distr-hnsw-drill/` is touched.
 
 Do not run this on the laptop; it needs root and a Linux block layer. It
-takes about 10 seconds per filesystem on `anthonypc`.
+takes about 10 seconds per filesystem on the reference host.
 
 ## restore-drill.sh
 
@@ -161,7 +161,7 @@ scripts/bench/build-project-set.py finalize --work $WORK --base-count 1000000 \
 ```
 
 The 1M persistence and compaction benches peak at 7.7 and 9.8 GiB RSS on
-`anthonypc`. Run them in a memory-capped scope so an overrun kills only the
+the reference host. Run them in a memory-capped scope so an overrun kills only the
 bench, not the session that started it:
 
 ```sh

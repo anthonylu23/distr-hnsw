@@ -67,13 +67,13 @@ changed paths are drilled since 2026-10-28 (below).
 
 ### btrfs (development and test desktop)
 
-`anthonypc` runs Fedora with `/home` on btrfs, the Fedora desktop default since
+The reference host ([test-hosts.md](test-hosts.md)) runs Fedora with `/home` on btrfs, the Fedora desktop default since
 Fedora 33 (root and home subvolumes) [4]. Recorded on 2026-09-29: kernel
 `7.1.9-200.fc44.x86_64`; `/home` is `/dev/nvme0n1p3` (subvolume `/home`)
 mounted `rw,relatime,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2`
 (so `barrier` and `treelog` are at their defaults, on); the NVMe drive reports
 `/sys/block/nvme0n1/queue/write_cache = write back`, meaning the kernel must
-issue cache flushes and the `fsync` path is load-bearing. The MacBook runs
+issue cache flushes and the `fsync` path is load-bearing. The development laptop runs
 macOS 27.0 (Darwin 27.0.0) on APFS.
 
 - **Sufficiency.** btrfs implements `fsync` through the tree log
@@ -158,21 +158,21 @@ the test fleet; the drill below used a loop-backed XFS image.
 | --- | --- | --- | --- |
 | `durability.rs` unit tests | In-process, `tempfile::tempdir()` | Idempotent PUT, hash verification on GET, inventory paging and malformed-entry rejection | Any durability property |
 | `commit_spine_process.rs`, `delete_recovery.rs` | Child portal calls `std::process::exit(86)` at each `Failpoint`; agents keep running | Recovery from a lost process at every durable boundary; SQLite and object-store state after the OS has accepted the writes | Power loss. The kernel page cache and device cache survive a process exit, so a missing `fsync` would pass these tests. |
-| `scripts/power-loss-drill.sh` (manual, `anthonypc`) | `dm-log-writes` on loop devices; log replayed to the mark taken after each acknowledged put; fresh agent on the replayed volume re-hashes every object via `GET /v1/objects` | Every object the agent had acknowledged before the mark is present and hash-valid after discarding everything that was not flushed; the filesystem passes its read-only checker after journal recovery; the agent `incarnation` survives; a deliberately un-fsynced 1 MiB control file does not survive | Behaviour of a physical drive's own write cache (loop devices honour flushes by `fsync` on the backing file); concurrency (one sequential writer); kernels other than the one recorded |
+| `scripts/power-loss-drill.sh` (manual, reference host) | `dm-log-writes` on loop devices; log replayed to the mark taken after each acknowledged put; fresh agent on the replayed volume re-hashes every object via `GET /v1/objects` | Every object the agent had acknowledged before the mark is present and hash-valid after discarding everything that was not flushed; the filesystem passes its read-only checker after journal recovery; the agent `incarnation` survives; a deliberately un-fsynced 1 MiB control file does not survive | Behaviour of a physical drive's own write cache (loop devices honour flushes by `fsync` on the backing file); concurrency (one sequential writer); kernels other than the one recorded |
 
 Two further limitations apply:
 
-- `tempfile::tempdir()` honours `TMPDIR`. On `anthonypc`, `/tmp` is tmpfs
+- `tempfile::tempdir()` honours `TMPDIR`. On the reference host, `/tmp` is tmpfs
   (`findmnt /tmp` reports `tmpfs`), where `fsync` is a no-op, so until
   2026-09-29 the suite had exercised no real Linux filesystem. The workspace
   now sets `TMPDIR` to `target/` in `.cargo/config.toml`, so tests run on
-  btrfs on `anthonypc` and APFS on the MacBook. This still proves only
+  btrfs on the reference host and APFS on the development laptop. This still proves only
   process-loss safety, not power-loss safety.
 - The drill observes the flush stream at the device-mapper layer: `dm-log-writes`
   only commits queued writes to its log when a `REQ_PREFLUSH` arrives, so a
   missing or ineffective `fsync` in the agent would have surfaced as a missing
   object (the negative control shows that un-flushed data is indeed dropped).
-  It does not observe the NVMe/SATA drive in `anthonypc`; whether that drive
+  It does not observe the NVMe/SATA drive in the reference host; whether that drive
   honours flushes still rests on kernel documentation [1][16].
 
 ## Qualification status
@@ -198,7 +198,7 @@ test of the drive's own cache behaviour.
 
 ### Drill results, 2026-09-29
 
-Host `anthonypc`, kernel `7.1.9-200.fc44.x86_64`, `dm-log-writes` target
+Reference host, kernel `7.1.9-200.fc44.x86_64`, `dm-log-writes` target
 v1.1.0, `replay-log` built from xfstests `3e1ee80`, loop devices over 4 GiB
 sparse images on the btrfs `/home` volume (`/sys/block/loopN/queue/write_cache
 = write back` for data, log, and the dm device). Eight files of 3 KiB to
@@ -207,7 +207,7 @@ uploaded through the portal at RF2 with the dm-backed agent as one failure
 domain; a mark was inserted after each acknowledged put and the agent's
 inventory snapshotted (2, 4, 6, 9, 12, 14, 17, 20 objects). The agent was
 then `kill -9`ed and the device torn down. Full reports:
-`~/distr-hnsw-drill/report-<fs>-<utc>.json` on `anthonypc` (not committed).
+`~/distr-hnsw-drill/report-<fs>-<utc>.json` on the reference host (not committed).
 
 | Filesystem | mkfs | Mount options observed | Log entries | Marks passed | Objects at last mark | `.*.tmp` survivors | Read-only check | Negative control (1 MiB un-fsynced file) | Wall clock |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -251,7 +251,7 @@ its parent sync). On all three filesystems the replay to `reput-ack` lacked
 the re-PUT object (it survived only under its temporary name) and the
 replay to `master-key` had no key file. That build was not committed.
 
-## Drill: dm-log-writes on `anthonypc`
+## Drill: dm-log-writes on the reference host
 
 Implemented as `scripts/power-loss-drill.sh <btrfs|ext4|xfs>` (see
 `scripts/README.md`); the outline below is what it does.
@@ -325,14 +325,14 @@ Where the implementation departs from the outline, deliberately:
 ## Gaps and next actions
 
 - Done 2026-09-29: `TMPDIR` points at `target/` so the suite exercises a real
-  filesystem; `anthonypc` kernel, mount options, and write-cache mode are
+  filesystem; the reference host's kernel, mount options, and write-cache mode are
   recorded above. Document the filesystem each CI run used once CI exists.
-- Done 2026-09-29: `dm-log-writes` drill on `anthonypc` for btrfs, ext4, and
+- Done 2026-09-29: `dm-log-writes` drill on the reference host for btrfs, ext4, and
   XFS via `scripts/power-loss-drill.sh`; 8/8 marks on each, table re-rated.
 - Done 2026-10-28: the drill covers the master-key write and a re-PUT after
   a crash between rename and directory sync (9/9 marks on each filesystem
   from `10d7ed4`).
-- Re-run the drill after every kernel update on `anthonypc` and record the
+- Re-run the drill after every kernel update on the reference host and record the
   kernel in this document; the btrfs rating in particular is kernel-specific.
 - Extend the drill beyond a single sequential writer: several concurrent
   portal puts between marks, a delete (deletion-marker objects were not

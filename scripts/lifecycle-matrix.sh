@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Large storage, corruption, movement, retirement, and garbage-collection
 # matrix for the M1 blob plane (roadmap M1 "Delete, repair, and capacity
-# safety" evidence). Runs on anthonypc; needs no root. Section 5 covers the
+# safety" evidence). Runs on the reference host; needs no root. Section 5 covers the
 # orders the 2026-10-25 audit found broken: retirement after GC, and GC after
 # the portal database is replaced by a snapshot taken mid-upload.
 #

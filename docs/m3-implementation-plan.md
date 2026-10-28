@@ -34,7 +34,7 @@ exist before engine code:
 
 ## Datasets
 
-All datasets live under `~/distr-hnsw-bench/datasets/<name>/` on `anthonypc`
+All datasets live under `~/distr-hnsw-bench/datasets/<name>/` on the reference host
 in one flat format: `base.f32le` (row-major vectors), `queries.f32le`,
 `groundtruth.i32le` (k = 100 nearest ids per query under the dataset's
 metric), and `manifest.json` (source URL, conversion command, dimensions,
@@ -48,21 +48,21 @@ Rust harness reads only the flat files.
 | `nytimes-256-angular` | 290k | 256 | cosine | Fast regression set for CI on either machine; angular metric |
 | `sift-128-euclidean` | 1.0M | 128 | L2 | Classic baseline with well-known recall/ef curves; catches graph bugs |
 | `glove-100-angular` | 1.18M | 100 | cosine | Hard angular set; exposes recall cliffs and int8 loss |
-| `project-nomic-512` | 200k and 1M | 512 | cosine | Representative: chunks from the phase-0 mixed corpus plus public text (pinned Wikipedia, so 99.8% of the base), embedded with the locked `nomic-embed-text @ 512` on `anthonypc`; ground truth by exact search (`scripts/bench/build-project-set.py`) |
+| `project-nomic-512` | 200k and 1M | 512 | cosine | Representative: chunks from the phase-0 mixed corpus plus public text (pinned Wikipedia, so 99.8% of the base), embedded with the locked `nomic-embed-text @ 512` on the reference host; ground truth by exact search (`scripts/bench/build-project-set.py`) |
 | `filtered-*` (derived) | as parent | as parent | as parent | Each parent gains synthetic facet labels at 0.1%, 1%, 10%, and 50% selectivity; ground truth is exact search over the matching subset |
 
 The public sets are for engine correctness and comparability; the project set
 is the only one at the product's dimensionality and is what capacity numbers
-are published against. Its embedding run needs the GPU on `anthonypc`, which
+are published against. Its embedding run needs the GPU on the reference host, which
 is shared with other work; pass 1 therefore starts with the public sets and
 builds the project set when the card is free, without blocking engine work. The 1M single-partition scale is the M3 target (about
 0.5 GiB int8 vectors plus roughly 0.15 GiB of graph at M = 16, well inside
-`anthonypc`'s 15 GiB with the 2 GiB of full-precision originals kept for
+the reference host's 15 GiB with the 2 GiB of full-precision originals kept for
 rescoring).
 
 ## Thresholds (written before engine code)
 
-Measured on `anthonypc` (16 threads, 15 GiB RAM), single partition, default
+Measured on the reference host (16 threads, 15 GiB RAM), single partition, default
 parameters M = 16, `ef_construction` = 200, `ef_search` chosen per dataset.
 
 | Measure | Required | Target |

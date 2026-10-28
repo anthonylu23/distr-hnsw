@@ -19,15 +19,15 @@ Binary: `target/release/distr-hnsw-validate`
 - [Ollama](https://ollama.com) listening on `http://127.0.0.1:11434`
 - Embedding model(s), e.g. `ollama pull nomic-embed-text`
 
-## Mixed corpus assembly (anthonypc)
+## Mixed corpus assembly (reference host)
 
 Copy-only staging of a larger bake-off tree (never deletes/moves originals):
 
 ```bash
-# From the laptop (Tailscale SSH + rsync to anthonypc):
+# From the laptop (Tailscale SSH + rsync to the reference host):
 ./prototype/scripts/assemble-mixed-corpus.sh
 # The script prints a unique stage such as:
-# anthonypc:~/distr-hnsw-proto/corpora/mixed-20260719T050000Z/
+# <reference host>:~/distr-hnsw-proto/corpora/mixed-20260719T050000Z/
 ```
 
 Every invocation requires an empty, run-scoped destination, copies only
@@ -43,8 +43,8 @@ Then run the bake-off script with that corpus and a ≥40-query set:
 export CORPUS=$HOME/distr-hnsw-proto/corpora/mixed-20260719T050000Z
 export QUERIES=${CORPUS}-queries.json
 # Full matrix (default): nomic 768/512/384 + bge-m3 native 1024 diagnostic
-./prototype/scripts/run-bakeoff-anthonypc.sh
-# Nomic-only smoke: MODEL=nomic-embed-text ./prototype/scripts/run-bakeoff-anthonypc.sh
+./prototype/scripts/run-bakeoff.sh
+# Nomic-only smoke: MODEL=nomic-embed-text ./prototype/scripts/run-bakeoff.sh
 ```
 
 Pull models first if needed: `ollama pull nomic-embed-text` and `ollama pull bge-m3`.
@@ -56,7 +56,7 @@ that default at 768 dimensions. `recommend()` chooses globally among eligible
 configs; an oversized result cannot select a model, affect dim-lock confidence,
 or produce a go verdict.
 
-## Typical workflow (anthonypc)
+## Typical workflow (reference host)
 
 ```bash
 export STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -67,7 +67,7 @@ mkdir -p "$WORK_DIR"
 ./target/release/distr-hnsw-validate --work-dir "$WORK_DIR" \
   prepare --fresh --corpus /path/to/your/files
 
-# 2. Embed bake-off matrix (or use run-bakeoff-anthonypc.sh)
+# 2. Embed bake-off matrix (or use run-bakeoff.sh)
 for dims in 768 512 384; do
   ./target/release/distr-hnsw-validate --work-dir "$WORK_DIR" \
     embed --model nomic-embed-text --dims "$dims"

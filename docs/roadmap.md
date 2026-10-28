@@ -20,7 +20,7 @@ design first and then bring this document back into alignment.
 | M7 — Vault, sharing, and v1 release | Not started | Security, deployment, recovery, and operating-envelope qualification pass |
 
 The phase-0 implementation is intentionally disposable. A frozen independent
-40-query holdout (`anthonypc` policy run
+40-query holdout (reference-host policy run
 `20260720T032226Z-holdout-policy`) validates the semantic product bet: 512d
 scores 32/0/8 versus name, and an unchanged-input repeat reproduces rankings
 and retrieval metrics exactly with complete provenance. The documented
@@ -99,7 +99,8 @@ three targets are missed (p95 ≤ 2 ms, build ≥ 3.3k vectors/s, ≤ 800
 bytes per vector); filtered queries near the brute-force cutover cost 15
 to 21 ms at p50 at 1M; the project set's base is 99.8% Wikipedia, so it
 matches the product's vector distribution, not a personal corpus; and all
-measurements come from one host (`anthonypc`, 16 threads, 15 GiB).
+measurements come from one host (the reference host in
+[test-hosts.md](test-hosts.md): 16 threads, 15 GiB).
 
 ## How milestones are governed
 
@@ -131,7 +132,7 @@ same as its milestone being accepted.
    outcomes so results can be reproduced.
 6. Run development and small fixture tests on the laptop. Run large-corpus,
    large-artifact, GPU, sustained-load, and destructive storage-flow tests on
-   `anthonypc` or purpose-built disposable infrastructure.
+   the reference host or purpose-built disposable infrastructure.
 7. Update this roadmap, the relevant `docs/` pages, and operator documentation
    as behavior changes. Do not let a green test encode a contract that the
    documentation does not explain.
@@ -145,7 +146,7 @@ claim crosses a machine or durability boundary.
 |---|---|---|
 | Static | Formatting, linting, dependency and unsafe-code review | Laptop and CI |
 | Unit/property | Formats, state machines, placement, crypto envelopes, index invariants | Laptop and CI |
-| Process integration | Real roles on temporary volumes; restart and crash boundaries | Laptop for small fixtures; `anthonypc` for larger artifacts |
+| Process integration | Real roles on temporary volumes; restart and crash boundaries | Laptop for small fixtures; the reference host for larger artifacts |
 | Multi-node fault | Loss, partition, stale return, ENOSPC, bit flips, movement under load | Disposable processes/VMs across distinct failure domains |
 | Performance/quality | Retrieval recall, latency, memory, throughput, recovery time | Pinned datasets and recorded hardware |
 | Disaster recovery | Independently restore keys, metadata, blobs, and vector state into empty infrastructure | Isolated restore environment |
@@ -209,9 +210,9 @@ their formats and capacity costs become embedded in later milestones.
 
 ### Verification and evidence
 
-Run the fixture test locally, then execute the full bake-off on `anthonypc`
+Run the fixture test locally, then execute the full bake-off on the reference host
 with a fresh run-scoped work directory via
-`prototype/scripts/run-bakeoff-anthonypc.sh`. Verify the sanitized report
+`prototype/scripts/run-bakeoff.sh`. Verify the sanitized report
 contains hashes for the query set, source tree, executable, and model identity.
 Repeat evaluation without rebuilding the corpus and compare metrics. Retain the
 sanitized aggregate under `docs/`; keep private full reports in the ignored run
@@ -348,7 +349,7 @@ closed only when its listed tests and drills pass.
   truncates writes, retries requests, flips stored bits, fills volumes, and
   returns retired/stale nodes.
 - Multi-agent tests use distinct temporary volumes and failure domains. Larger
-  artifact matrices run on `anthonypc`, never against irreplaceable data.
+  artifact matrices run on the reference host, never against irreplaceable data.
 - The restore drill starts with blank metadata and object directories. It
   records declared RPO/RTO, actual recovery point/time, source hashes, restored
   hashes, missing control metadata, and operator steps.
@@ -485,7 +486,7 @@ each WAL append/sync/apply, snapshot publication, and compaction swap boundary.
 Benchmark recall, p50/p95/p99 latency, build time, memory, disk amplification,
 snapshot bytes, and recovery time on pinned datasets and hardware. Include
 filter selectivities that exercise both masked traversal and brute-force
-cutover. Run large benchmarks on `anthonypc`.
+cutover. Run large benchmarks on the reference host.
 
 **Exit gate.** The engine meets published correctness, recall, resource, and
 recovery thresholds on a single partition; all persistent-format corruption
@@ -623,7 +624,7 @@ Maintain a fixture corpus spanning supported, unsupported, malformed, huge,
 encrypted, empty, and scanned documents. Run workers under enforced limits and
 inject crashes/timeouts between pipeline transitions. Compare hybrid/filter
 results with deterministic expected rankings and audit provenance round trips.
-Run representative corpus quality and GPU/provider load tests on `anthonypc`,
+Run representative corpus quality and GPU/provider load tests on the reference host,
 including provider restart and digest-change scenarios.
 
 **Exit gate.** End-to-end file ingest, degraded operation, re-indexing, delete,

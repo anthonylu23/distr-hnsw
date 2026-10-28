@@ -1,7 +1,8 @@
 # Phase-0 validation prototype
 
-Status: **M0 Accepted**. A frozen 40-query independent holdout on `anthonypc`
-produced **32/0/8** at 512d versus name, exact repeat retrieval evidence, and
+Status: **M0 Accepted**. A frozen 40-query independent holdout on the
+reference host ([test-hosts.md](test-hosts.md)) produced **32/0/8** at 512d
+versus name, exact repeat retrieval evidence, and
 complete provenance. The documented non-inferiority tie-break locks
 `nomic-embed-text @ 512`: it is only **0.001** nDCG below the best eligible
 dimension and within the predeclared **0.03** band. This closes DESIGN §15 and
@@ -91,7 +92,7 @@ reports, the retained binary, and the repeat comparison remain under the
 private run directory. The sanitized aggregate is
 [`phase-0-bakeoff-summary.json`](phase-0-bakeoff-summary.json).
 
-## anthonypc bake-off — mixed-v4b development set (2026-07-19)
+## Reference-host bake-off — mixed-v4b development set (2026-07-19)
 
 Hardware: Fedora desktop, RTX 3060 Ti 8GB, Ollama `nomic-embed-text`.
 
@@ -143,7 +144,7 @@ Category strata remain diagnostics. Study notes stay the weakest stratum and
 should stay visible in later quality work; they do not reopen the M0 gate.
 
 Full reports remain private/gitignored. Remote source of truth:
-`anthonypc:~/distr-hnsw-proto/runs/20260719T192138Z/reports/`.
+`~/distr-hnsw-proto/runs/20260719T192138Z/reports/` on the reference host.
 Sanitized aggregate: [`phase-0-bakeoff-summary.json`](phase-0-bakeoff-summary.json).
 
 ### Locked defaults

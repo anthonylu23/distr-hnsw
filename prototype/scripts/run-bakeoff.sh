@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run phase-0 bake-off on anthonypc after repo is present and Ollama is up.
+# Run the phase-0 bake-off on the reference host after the repo is present
+# and Ollama is up.
 #
 # Default matrix:
 #   nomic-embed-text: 768, 512, 384

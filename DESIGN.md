@@ -968,7 +968,7 @@ Each question is tagged with the phase (§14) that must resolve it.
 
 - **[phase 0 — locked] Default local embedding model and dimensionality**
   for file collections (≤768 dims per §6.5): **`nomic-embed-text` @ 512**.
-  A frozen independent 40-query holdout on `anthonypc` produced **32/0/8** at
+  A frozen independent 40-query holdout on the reference host produced **32/0/8** at
   512d versus filename search, mean recall@10 **0.800**, and mean nDCG@10
   **0.691**, with exact repeat retrieval evidence and complete provenance.
   Eligible holdout nDCG spans only **0.014**, and 512d is **0.001** below the

@@ -1,6 +1,6 @@
 # M1 capacity and ENOSPC drill
 
-Status: **passed on ext4 (loop device, kernel 7.1.9-200.fc44, `anthonypc`),
+Status: **passed on ext4 (loop device, kernel 7.1.9-200.fc44, reference host),
 all three phases, 36/36 checks.** (2026-09-29)
 
 This document records the storage-pressure drill that
@@ -21,7 +21,7 @@ under `$HOME/distr-hnsw-drill/report-enospc-<utc>.json`.
 
 | Item | Value |
 | --- | --- |
-| Host, kernel | `anthonypc`, Linux 7.1.9-200.fc44.x86_64 |
+| Host, kernel | reference host, Linux 7.1.9-200.fc44.x86_64 |
 | Filesystem | ext4, `mke2fs 1.47.3`, 96 MiB sparse image on a loop device, mounted `rw,relatime,seclabel`; 1 KiB blocks, 88,566,784 bytes total, 81,473,536 available to the user at start |
 | Agent A (under test) | volume on the loop filesystem, no `--quota-bytes`, `--reserve-bytes 8388608`, `--hard-floor-bytes 1048576`; restarted for phase 2 with reserve and hard floor 0 |
 | Agent B | plain directory on `/home` (btrfs), default policy; supplies the second failure domain RF2 needs |
@@ -106,7 +106,7 @@ No durability or admission bug was found. Two labelling observations:
 
 ## Rerun
 
-On `anthonypc` (passwordless sudo, `mkfs.ext4`, `losetup`, `fallocate`,
+On the reference host (passwordless sudo, `mkfs.ext4`, `losetup`, `fallocate`,
 `jq`, `curl`):
 
 ```sh

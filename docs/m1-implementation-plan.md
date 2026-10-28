@@ -168,7 +168,7 @@ cargo test -p distr-hnsw
 filesystem rather than tmpfs. The process-level tests launch two real agent
 children, abruptly exit the portal at each crash boundary, and drive `scrub`
 and `health` through the binary. Larger storage matrices belong on
-`anthonypc`.
+the reference host.
 
 ## Parallel lanes for the next pass
 

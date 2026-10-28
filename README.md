@@ -1,13 +1,15 @@
 # distr-hnsw
 
+[![CI](https://github.com/anthonylu23/distr-hnsw/actions/workflows/ci.yml/badge.svg)](https://github.com/anthonylu23/distr-hnsw/actions/workflows/ci.yml)
+
 Self-hosted, Tailscale-native distributed semantic storage: files replicated
 as encrypted, content-addressed objects across machines you already own,
 indexed by meaning with distributed HNSW vector search.
 
 > **Status: pre-release, not ready for data you cannot lose.** The blob plane
-> and a single-partition vector engine are implemented and are going through
-> a hardening pass. Tailscale identity, the distributed vector plane, the
-> extraction pipeline, and the dashboard are not built yet. See
+> and a single-partition vector engine are implemented and accepted against
+> their milestone gates. Tailscale identity, the distributed vector plane,
+> the extraction pipeline, and the dashboard are not built yet. See
 > [docs/roadmap.md](docs/roadmap.md).
 
 ## Milestones
@@ -33,8 +35,11 @@ scripts/minio-test.sh        # S3 backup tests against a throwaway MinIO
 ```
 
 Tests write temporary data under `target/` so durability tests run on a real
-filesystem. Larger drills (restore, lifecycle matrix, power loss, ENOSPC)
-are in [scripts/](scripts/README.md).
+filesystem. CI runs the format check, clippy (also with `--features
+failpoints`), and the test suite on every push and pull request. Larger
+drills (restore, lifecycle matrix, power loss, ENOSPC) and the benchmarks
+are in [scripts/](scripts/README.md) and run on a dedicated host
+([docs/test-hosts.md](docs/test-hosts.md)).
 
 ## Documentation
 

@@ -1,6 +1,6 @@
 # M1 lifecycle matrix
 
-Status: **passed on `anthonypc`, re-run from the clean hardening revision
+Status: **passed on the reference host, re-run from the clean hardening revision
 `dc276f3` on 2026-10-27** (run `20261027T014148Z`). Automated by
 [`scripts/lifecycle-matrix.sh`](../scripts/lifecycle-matrix.sh); the full
 report stays under `~/distr-hnsw-drill/` (SHA-256 prefix `7e32162d036d8730`).

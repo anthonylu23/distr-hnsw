@@ -1,6 +1,6 @@
 # M1 empty-infrastructure restore drill
 
-Status: **passed on `anthonypc` with both the versioned-directory target and
+Status: **passed on the reference host with both the versioned-directory target and
 the S3-compatible target (MinIO with Object Lock), re-run from the clean
 hardening revision `dc276f3` on 2026-10-27.** Both reports were then
 recorded with `portal drill record`, which derived `recovery_ready` from
@@ -11,7 +11,7 @@ representative cluster is destroyed and rebuilt into empty infrastructure
 from the backup set, the recovery bundle, and an off-cluster passphrase, and
 every committed regular file is downloaded byte for byte. The drill is
 automated by [`scripts/restore-drill.sh`](../scripts/restore-drill.sh);
-full reports stay under `~/distr-hnsw-drill/` on `anthonypc` and are not
+full reports stay under `~/distr-hnsw-drill/` on the reference host and are not
 committed because they contain file identifiers and local paths.
 
 ## Procedure
@@ -39,7 +39,7 @@ committed because they contain file identifiers and local paths.
 
 | Field | Value |
 |---|---|
-| Host, kernel | `anthonypc`, `7.1.9-200.fc44.x86_64` |
+| Host, kernel | reference host, `7.1.9-200.fc44.x86_64` |
 | Source revision | `dc276f3` (clean) |
 | Backup target | versioned directory (`dir:`), local disk |
 | Corpus | 64 files, 293,134,603 bytes; 56 kept, 8 deleted; 3 agents |

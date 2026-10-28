@@ -141,7 +141,7 @@ repeats this. §11 names Litestream. Nothing is implemented yet
 
 Define one **backup-set layout v1** behind a small `BackupTarget` trait with
 two adapters: a **versioned directory** adapter (lands first; CI, the
-`anthonypc` drill rig, attached or rotated disks) and an **S3-compatible**
+reference-host drill rig, attached or rotated disks) and an **S3-compatible**
 adapter as the first supported network offsite target, with Backblaze B2 as the
 reference deployment and MinIO as the test double. SFTP/WebDAV are deferred.
 
@@ -212,8 +212,8 @@ bytes, durability is undemonstrated and `DESIGN.md` §11.1 forbids claiming it.
 
 | Target | Versioning / immutability | Testability | Verdict |
 |---|---|---|---|
-| **Versioned directory** (attached disk, mounted share, rclone-able) | Layout-level only | Best; laptop and `anthonypc` | First adapter and drill rig; offsite only on a rotated or remote disk. |
-| **S3-compatible** (B2, MinIO, AWS) | Bucket versioning + Object Lock | MinIO on `anthonypc` | First supported network target; B2 reference. |
+| **Versioned directory** (attached disk, mounted share, rclone-able) | Layout-level only | Best; laptop and reference host | First adapter and drill rig; offsite only on a rotated or remote disk. |
+| **S3-compatible** (B2, MinIO, AWS) | Bucket versioning + Object Lock | MinIO on the reference host | First supported network target; B2 reference. |
 | SFTP / WebDAV | None native | Easy | Defer; no immutability story for objects. |
 | Litestream | PITR, second-level RPO | Good | Optional later addition; extra process and version-sensitive format kept it off v1. |
 | **`VACUUM INTO` snapshots** | RPO = interval | Simplest; one code path | Adopt as primary; file records are reconstructible so minutes of metadata RPO are acceptable. |
@@ -225,7 +225,7 @@ bytes, durability is undemonstrated and `DESIGN.md` §11.1 forbids claiming it.
 - Process integration: commit → backup job → `offsite_state = verified`; a
   kill mid-copy never leaves `verified` without a hash-verified offsite
   object; `backup_lag_seconds` rises when the target is unreachable.
-- `anthonypc` matrix: directory and MinIO targets with Object Lock; deleting
+- Reference-host matrix: directory and MinIO targets with Object Lock; deleting
   a locked object fails; a restored `VACUUM INTO` snapshot reconciles against
   the object set and recovery rebuilds any newer file records.
 - Empty-infrastructure drill: blank metadata and volumes; inputs are only the
@@ -331,7 +331,7 @@ deletion. This makes that concrete for the M1 blob plane.
 - Unit/property: `effective_free` on quota-, filesystem-, and reserve-bound
   volumes; chunks never breach the reserve; markers and manifests may use it;
   the hard floor blocks repair.
-- Process integration (tmpfs or loop device on `anthonypc`): fill a volume;
+- Process integration (tmpfs or loop device on the reference host): fill a volume;
   `put` exits 3 with `InsufficientCapacity`; `delete` still commits its marker
   at RF2; `recover --apply` repairs into the reserve; inventory digests prove
   nothing was removed; `status` shows `admission_paused`, then `ok`.
@@ -355,13 +355,13 @@ the drill serializes on them.
    `key_id`, `RecoveryBundleV1`, zeroize, `key` subcommands, schema v5.
 2. **Lane C, backup set (Decision 2).** Layout v1 and the directory adapter
    with the copy-and-verify job and `BackupStatusV1`; then the S3-compatible
-   adapter against MinIO on `anthonypc`; `VACUUM INTO` snapshot shipping
+   adapter against MinIO on the reference host; `VACUUM INTO` snapshot shipping
    lands with the directory adapter.
 3. **Lane A, lifecycle (existing plan).** Decision 3 is step 4 of the
    lifecycle contract's order (quota/headroom admission, ENOSPC injection),
    after observations and scrub/repair, before GC planning.
 4. **Empty-infrastructure restore drill.** Waits for lanes B and C and for
-   lane A's reconciliation observations; runs on `anthonypc` with blank
+   lane A's reconciliation observations; runs on the reference host with blank
    metadata and volumes and records the roadmap evidence package. Its pass
    closes the M1 exit gate.
 5. **Ratification bookkeeping.** Done 2026-09-29: `DESIGN.md` §10, §11,

@@ -66,9 +66,9 @@ tracks only the immediate work queue.
    - The engine needs a concurrency model for searches during compaction
      finish and snapshot writes.
    - Snapshot cadence, compaction scheduling, and WAL group commit.
-3. **Open-source hygiene.** Replace host and user names in public docs and
-   scripts with roles and environment variables. Add CI running fmt,
-   clippy, and the non-sudo tests.
+3. Done 2026-10-28: **open-source hygiene.** Public docs and scripts name
+   hosts by role ([test-hosts.md](test-hosts.md)) and take SSH destinations
+   from environment variables; CI runs fmt, clippy, and the non-sudo tests.
 4. **Engine follow-ups carried from M3** (none blocks M2): a subprocess
    `kill -9` harness and a power-loss run for the engine; RAM admission
    for compaction (a 1M × 512 compaction holds a second copy of the live
@@ -77,8 +77,9 @@ tracks only the immediate work queue.
 
 ## Ops notes
 
-- Sessions may run directly on `anthonypc`; the MacBook is reachable as
-  `ssh macbook`. Both checkouts track `origin/main`.
+- Sessions may run directly on the reference host or on the development
+  laptop ([test-hosts.md](test-hosts.md)). Both checkouts track
+  `origin/main`.
 - Tests write temporary data under `target/` (see `.cargo/config.toml`), not
   tmpfs, so durability tests exercise the real filesystem.
 - Drills live in `scripts/` (`power-loss-drill.sh` and `enospc-drill.sh` need

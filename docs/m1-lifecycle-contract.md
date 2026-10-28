@@ -138,6 +138,6 @@ the proof above.
    restored database is pending recovery (`tests/hardening.rs`).
 
 Large corruption, movement, retirement, and storage-pressure matrices run on
-`anthonypc`. Backup, key recovery, and the empty-infrastructure restore are
+the reference host. Backup, key recovery, and the empty-infrastructure restore are
 specified in [m1-storage-contract.md](m1-storage-contract.md) and
 [m1-phase-1-decisions.md](m1-phase-1-decisions.md).
