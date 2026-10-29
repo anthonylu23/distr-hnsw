@@ -511,15 +511,17 @@ impl KeySet {
         if grant.operation == Operation::Delete && grant.gc_proof.is_none() {
             return Err(GrantError::DeleteWithoutProof);
         }
-        if grant.expires_at - grant.issued_at > MAX_GRANT_LIFETIME_SECONDS
+        // Saturating: wrapped arithmetic on extreme times would read an
+        // unbounded lifetime as a short one.
+        if grant.expires_at.saturating_sub(grant.issued_at) > MAX_GRANT_LIFETIME_SECONDS
             || grant.expires_at < grant.issued_at
         {
             return Err(GrantError::LifetimeTooLong);
         }
-        if now > grant.expires_at + CLOCK_SKEW_SECONDS {
+        if now > grant.expires_at.saturating_add(CLOCK_SKEW_SECONDS) {
             return Err(GrantError::Expired);
         }
-        if grant.issued_at > now + CLOCK_SKEW_SECONDS {
+        if grant.issued_at > now.saturating_add(CLOCK_SKEW_SECONDS) {
             return Err(GrantError::NotYetValid);
         }
         Ok(grant)
@@ -794,5 +796,401 @@ mod tests {
         assert_eq!(token_from_header("Bearer abc"), None);
         assert_eq!(token_from_header("DistrGrant "), None);
         assert_eq!(token_from_header("DistrGrant"), None);
+    }
+}
+
+/// Property tests for grant and key-set parsing, signatures, and expiry
+/// (roadmap M2 verification).
+#[cfg(test)]
+mod properties {
+    use std::sync::LazyLock;
+
+    use proptest::{prelude::*, sample::Index};
+
+    use super::*;
+
+    const NOW: i64 = 1_800_000_000;
+    static SIGNER: LazyLock<PortalSigner> = LazyLock::new(|| PortalSigner::from_seed(&[7; 32]));
+
+    fn trusting(epoch: u64) -> KeySet {
+        KeySet {
+            version: 1,
+            epoch,
+            keys: vec![TrustedKey {
+                key_id: SIGNER.key_id(),
+                public: SIGNER.verifying_key(),
+                status: KeyStatus::Active,
+            }],
+        }
+    }
+
+    fn expectation(grant: &Grant) -> Expectation<'_> {
+        Expectation {
+            agent_id: &grant.agent_id,
+            operation: grant.operation,
+            scope: &grant.scope,
+        }
+    }
+
+    fn kind() -> impl Strategy<Value = ObjectKind> {
+        prop_oneof![
+            Just(ObjectKind::Chunk),
+            Just(ObjectKind::Manifest),
+            Just(ObjectKind::DeletionMarker),
+        ]
+    }
+
+    fn scope() -> impl Strategy<Value = Scope> {
+        prop_oneof![
+            Just(Scope::Agent),
+            kind().prop_map(Scope::Kind),
+            (kind(), any::<[u8; 32]>()).prop_map(|(kind, hash)| {
+                Scope::Object(kind, ObjectHash::parse(hex::encode(hash)).unwrap())
+            }),
+        ]
+    }
+
+    fn operation() -> impl Strategy<Value = Operation> {
+        (1_u8..=5).prop_map(|code| Operation::from_code(code).unwrap())
+    }
+
+    /// Times around `NOW`, plus the extremes of the type.
+    fn time() -> impl Strategy<Value = i64> {
+        prop_oneof![
+            NOW - 1_000..NOW + 1_000,
+            any::<i64>(),
+            Just(i64::MIN),
+            Just(i64::MAX),
+        ]
+    }
+
+    prop_compose! {
+        /// A grant the portal could issue: any agent, operation, scope, and
+        /// epoch, a lifetime within the cap, and a proof on every delete.
+        fn grant()(
+            epoch in any::<u64>(),
+            // At most 60 characters of up to 4 bytes: within the 255-byte cap.
+            agent_id in "\\PC{0,60}",
+            operation in operation(),
+            scope in scope(),
+            proof in any::<[u8; 16]>(),
+            proof_on_other in any::<bool>(),
+            issued_at in NOW - 100_000_000..NOW + 100_000_000,
+            lifetime in 0..=MAX_GRANT_LIFETIME_SECONDS,
+            nonce in any::<[u8; 16]>(),
+        ) -> Grant {
+            let gc_proof = (operation == Operation::Delete || proof_on_other)
+                .then(|| Uuid::from_bytes(proof));
+            Grant {
+                key_id: SIGNER.key_id(),
+                epoch,
+                agent_id,
+                operation,
+                scope,
+                gc_proof,
+                issued_at,
+                expires_at: issued_at + lifetime,
+                nonce,
+            }
+        }
+    }
+
+    prop_compose! {
+        /// One to sixteen keys, exactly one active, as the set and the seeds
+        /// of the signers that hold its keys.
+        fn key_set()(
+            seeds in proptest::collection::vec(any::<[u8; 32]>(), 1..=MAX_KEYS),
+            active in any::<Index>(),
+            version in any::<u64>(),
+            epoch in any::<u64>(),
+        ) -> (KeySet, Vec<[u8; 32]>) {
+            let active = active.index(seeds.len());
+            let keys = seeds
+                .iter()
+                .enumerate()
+                .map(|(index, seed)| {
+                    let signer = PortalSigner::from_seed(seed);
+                    TrustedKey {
+                        key_id: signer.key_id(),
+                        public: signer.verifying_key(),
+                        status: if index == active {
+                            KeyStatus::Active
+                        } else {
+                            KeyStatus::Retiring
+                        },
+                    }
+                })
+                .collect();
+            (KeySet { version, epoch, keys }, seeds)
+        }
+    }
+
+    /// Found by `extreme_times_never_panic_or_stretch_a_grant`: in release
+    /// builds `expires_at - issued_at` wrapped, so this grant passed the
+    /// lifetime cap and stayed valid for billions of years.
+    #[test]
+    fn a_lifetime_that_wraps_is_refused() {
+        let grant = Grant {
+            key_id: SIGNER.key_id(),
+            epoch: 1,
+            agent_id: "a1".into(),
+            operation: Operation::Health,
+            scope: Scope::Agent,
+            gc_proof: None,
+            issued_at: -(1 << 62) - 5,
+            expires_at: 1 << 62,
+            nonce: [0; 16],
+        };
+        assert_eq!(
+            trusting(1).verify(&SIGNER.sign_grant(&grant), &expectation(&grant), NOW),
+            Err(GrantError::LifetimeTooLong)
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn issued_grants_round_trip(grant in grant()) {
+            prop_assert_eq!(Grant::decode_body(&grant.encode_body()), Ok(grant.clone()));
+            let token = SIGNER.sign_grant(&grant);
+            let verified = trusting(grant.epoch).verify(&token, &expectation(&grant), grant.issued_at);
+            prop_assert_eq!(verified, Ok(grant));
+        }
+
+        #[test]
+        fn arbitrary_input_is_refused_without_panicking(
+            bytes in proptest::collection::vec(any::<u8>(), 0..400),
+            text in "\\PC{0,200}",
+        ) {
+            // Whatever parses re-encodes to the same bytes: one encoding per grant.
+            if let Ok(grant) = Grant::decode_body(&bytes) {
+                prop_assert_eq!(grant.encode_body(), bytes.clone());
+            }
+            let set = trusting(0);
+            let scope = Scope::Agent;
+            let expect = Expectation { agent_id: "a1", operation: Operation::Health, scope: &scope };
+            prop_assert!(set.verify(&URL_SAFE_NO_PAD.encode(&bytes), &expect, NOW).is_err());
+            prop_assert!(set.verify(&text, &expect, NOW).is_err());
+            if let Some(token) = token_from_header(&text) {
+                prop_assert!(set.verify(token, &expect, NOW).is_err());
+            }
+            if let Ok(parsed) = SignedKeySet::from_bytes(&bytes) {
+                prop_assert_eq!(parsed.to_bytes(), bytes);
+            }
+        }
+
+        #[test]
+        fn any_change_to_a_signed_grant_is_refused(
+            grant in grant(),
+            at in any::<Index>(),
+            flip in 1_u8..=255,
+            cut in any::<Index>(),
+            extra in proptest::collection::vec(any::<u8>(), 1..8),
+            letter in any::<Index>(),
+            replacement in "[A-Za-z0-9_-]",
+        ) {
+            let set = trusting(grant.epoch);
+            let expect = expectation(&grant);
+            let now = grant.issued_at;
+            let token = SIGNER.sign_grant(&grant);
+            let raw = URL_SAFE_NO_PAD.decode(&token).unwrap();
+
+            let mut altered = raw.clone();
+            let at = at.index(raw.len());
+            altered[at] ^= flip;
+            let body = &altered[..altered.len() - 64];
+            if let Ok(decoded) = Grant::decode_body(body) {
+                prop_assert_eq!(decoded.encode_body(), body.to_vec());
+            }
+            prop_assert!(
+                set.verify(&URL_SAFE_NO_PAD.encode(&altered), &expect, now).is_err(),
+                "byte {} ^ {:#04x} was accepted", at, flip
+            );
+
+            let truncated = &raw[..cut.index(raw.len())];
+            prop_assert!(set.verify(&URL_SAFE_NO_PAD.encode(truncated), &expect, now).is_err());
+
+            let mut extended = raw.clone();
+            extended.extend_from_slice(&extra);
+            prop_assert!(set.verify(&URL_SAFE_NO_PAD.encode(&extended), &expect, now).is_err());
+
+            // One character of the header value changed.
+            let letter = letter.index(token.len());
+            let mut text = token.clone().into_bytes();
+            prop_assume!(text[letter] != replacement.as_bytes()[0]);
+            text[letter] = replacement.as_bytes()[0];
+            let text = String::from_utf8(text).unwrap();
+            prop_assert!(set.verify(&text, &expect, now).is_err(), "{} accepted", text);
+        }
+
+        #[test]
+        fn expiry_is_enforced_at_the_skew_boundary(grant in grant(), offset in -400_i64..=800) {
+            let set = trusting(grant.epoch);
+            let expect = expectation(&grant);
+            let token = SIGNER.sign_grant(&grant);
+            let now = grant.issued_at + offset;
+            let expected = if now > grant.expires_at + CLOCK_SKEW_SECONDS {
+                Err(GrantError::Expired)
+            } else if now < grant.issued_at - CLOCK_SKEW_SECONDS {
+                Err(GrantError::NotYetValid)
+            } else {
+                Ok(grant.clone())
+            };
+            prop_assert_eq!(set.verify(&token, &expect, now), expected);
+            for (now, valid) in [
+                (grant.expires_at + CLOCK_SKEW_SECONDS, true),
+                (grant.expires_at + CLOCK_SKEW_SECONDS + 1, false),
+                (grant.issued_at - CLOCK_SKEW_SECONDS, true),
+                (grant.issued_at - CLOCK_SKEW_SECONDS - 1, false),
+            ] {
+                prop_assert_eq!(set.verify(&token, &expect, now).is_ok(), valid, "now {}", now);
+            }
+        }
+
+        #[test]
+        fn lifetimes_outside_the_cap_are_refused_at_any_time(
+            grant in grant(),
+            lifetime in prop_oneof![
+                MAX_GRANT_LIFETIME_SECONDS + 1..1_000_000_000_000,
+                -1_000_000_000_000_i64..0,
+            ],
+            now in time(),
+        ) {
+            let mut grant = grant;
+            grant.expires_at = grant.issued_at + lifetime;
+            prop_assert_eq!(
+                trusting(grant.epoch).verify(&SIGNER.sign_grant(&grant), &expectation(&grant), now),
+                Err(GrantError::LifetimeTooLong)
+            );
+        }
+
+        /// Signed grants with any times: no overflow panics, and nothing
+        /// outside the lifetime cap or the skew window is accepted.
+        #[test]
+        fn extreme_times_never_panic_or_stretch_a_grant(
+            grant in grant(),
+            issued_at in time(),
+            expires_at in time(),
+            now in time(),
+        ) {
+            let mut grant = grant;
+            grant.issued_at = issued_at;
+            grant.expires_at = expires_at;
+            let result = trusting(grant.epoch).verify(&SIGNER.sign_grant(&grant), &expectation(&grant), now);
+            if result.is_ok() {
+                let (issued, expires, now) = (i128::from(issued_at), i128::from(expires_at), i128::from(now));
+                prop_assert!((0..=i128::from(MAX_GRANT_LIFETIME_SECONDS)).contains(&(expires - issued)));
+                let skew = i128::from(CLOCK_SKEW_SECONDS);
+                prop_assert!(issued - skew <= now && now <= expires + skew);
+            }
+        }
+
+        #[test]
+        fn a_grant_for_another_request_is_refused(
+            grant in grant(),
+            field in 0_u8..5,
+            other_agent in "\\PC{0,60}",
+            other_operation in operation(),
+            other_scope in scope(),
+            other_epoch in any::<u64>(),
+        ) {
+            let now = grant.issued_at;
+            let token = SIGNER.sign_grant(&grant);
+            let (result, expected) = match field {
+                0 => {
+                    prop_assume!(other_agent != grant.agent_id);
+                    let expect = Expectation { agent_id: &other_agent, ..expectation(&grant) };
+                    (trusting(grant.epoch).verify(&token, &expect, now), GrantError::WrongAgent(grant.agent_id.clone()))
+                }
+                1 => {
+                    prop_assume!(other_operation != grant.operation);
+                    let expect = Expectation { operation: other_operation, ..expectation(&grant) };
+                    (trusting(grant.epoch).verify(&token, &expect, now), GrantError::WrongOperation)
+                }
+                2 => {
+                    prop_assume!(other_scope != grant.scope);
+                    let expect = Expectation { scope: &other_scope, ..expectation(&grant) };
+                    (trusting(grant.epoch).verify(&token, &expect, now), GrantError::WrongObject)
+                }
+                3 => {
+                    prop_assume!(other_epoch != grant.epoch);
+                    let expected = if grant.epoch < other_epoch {
+                        GrantError::StaleEpoch { grant: grant.epoch, current: other_epoch }
+                    } else {
+                        GrantError::NewerEpoch { grant: grant.epoch, current: other_epoch }
+                    };
+                    (trusting(other_epoch).verify(&token, &expectation(&grant), now), expected)
+                }
+                _ => {
+                    let mut unproven = grant.clone();
+                    unproven.operation = Operation::Delete;
+                    unproven.gc_proof = None;
+                    let token = SIGNER.sign_grant(&unproven);
+                    (trusting(grant.epoch).verify(&token, &expectation(&unproven), now), GrantError::DeleteWithoutProof)
+                }
+            };
+            prop_assert_eq!(result, Err(expected));
+        }
+    }
+
+    proptest! {
+        // Each case derives up to sixteen Ed25519 keys.
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn key_sets_round_trip_and_verify_only_under_their_keys(
+            (set, seeds) in key_set(),
+            mask in any::<u16>(),
+            stranger in any::<[u8; 32]>(),
+        ) {
+            let signers: Vec<PortalSigner> = seeds.iter().map(PortalSigner::from_seed).collect();
+            let mut chosen: Vec<&PortalSigner> = signers
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1 << index) != 0)
+                .map(|(_, signer)| signer)
+                .collect();
+            if chosen.is_empty() {
+                chosen.push(&signers[0]);
+            }
+            let signed = set.sign(&chosen);
+            let parsed = SignedKeySet::from_bytes(&signed.to_bytes()).unwrap();
+            prop_assert_eq!(&parsed, &signed);
+            prop_assert!(parsed.self_signed());
+
+            prop_assume!(!seeds.contains(&stranger));
+            let stranger = PortalSigner::from_seed(&stranger);
+            let strangers = KeySet {
+                version: 1,
+                epoch: set.epoch,
+                keys: vec![TrustedKey {
+                    key_id: stranger.key_id(),
+                    public: stranger.verifying_key(),
+                    status: KeyStatus::Active,
+                }],
+            };
+            prop_assert!(!parsed.signed_by(&strangers));
+            prop_assert!(!set.sign(&[&stranger]).signed_by(&set));
+        }
+
+        #[test]
+        fn any_change_to_a_signed_key_set_is_refused(
+            (set, seeds) in key_set(),
+            signer in any::<Index>(),
+            at in any::<Index>(),
+            flip in 1_u8..=255,
+            cut in any::<Index>(),
+        ) {
+            let signer = PortalSigner::from_seed(&seeds[signer.index(seeds.len())]);
+            let bytes = set.sign(&[&signer]).to_bytes();
+            let mut altered = bytes.clone();
+            altered[at.index(bytes.len())] ^= flip;
+            if let Ok(parsed) = SignedKeySet::from_bytes(&altered) {
+                prop_assert_eq!(parsed.to_bytes(), altered.clone());
+                prop_assert!(!parsed.signed_by(&set), "a changed key set still verifies");
+            }
+            prop_assert!(SignedKeySet::from_bytes(&bytes[..cut.index(bytes.len())]).is_err());
+        }
     }
 }

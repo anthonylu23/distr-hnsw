@@ -55,6 +55,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 distr-hnsw-index = { version = "0.1.0", path = "../distr-hnsw-index" }
 
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
 rcgen = "0.14"
 tempfile = "3"
 time = "0.3"

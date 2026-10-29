@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f7cfc8a3b31ee2edcb325db553f1962db95419b8aa9cb8774dbc35eb34fce6ad # shrinks to grant = Grant { key_id: KeyId([8, 113, 243, 170, 188, 38, 228, 88]), epoch: 0, agent_id: "", operation: Health, scope: Agent, gc_proof: None, issued_at: 1700000000, expires_at: 1700000000, nonce: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }, issued_at = -9223372036854775808, expires_at = 1799999000, now = 1799999000

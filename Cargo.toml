@@ -15,3 +15,8 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# Ed25519 signs and verifies every grant; unoptimized, the grant property
+# tests and the agent authorization tests spend most of their time here.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
