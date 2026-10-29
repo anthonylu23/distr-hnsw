@@ -157,25 +157,78 @@ a `pass` verdict.
 ## portal-tailnet-drill.sh
 
 Real-tailnet drill for the portal service (M2 work packages 4 to 7). Runs
-`portal serve` under sudo on this node's tailnet address with the node's
-certificate from `tailscaled`, then checks from another tailnet node that
-the certificate validates against that node's trust store, plaintext gets
-no HTTP answer, WhoIs names the remote whatever identity headers it sends,
-its user cannot sign in until added, the session cookie carries every
-attribute, writes without the CSRF token or from another origin fail, and
-an API key is held to its scope.
+`portal serve` on this node's tailnet address and checks, from another
+tailnet node and from a local process on the portal's node:
+- **TLS:** the certificate validates, and plaintext gets no HTTP answer.
+- **Identity:** WhoIs names each caller whatever identity headers it sends,
+  the forgeries are audited, and the portal's own node cannot sign in.
+- **Sessions:** the remote's user cannot sign in until added; the session
+  cookie carries every attribute; writes without the CSRF token or from
+  another origin fail; the cookie replayed from the portal node is refused
+  and revoked.
+- **API keys:** a key is held to its scope and to the node it names.
+
+Each check compares the HTTP status and the portal's refusal code.
 
 ```sh
 REMOTE=user@other-node OPEN_FIREWALL=1 scripts/portal-tailnet-drill.sh
+REMOTE=user@other-node OPEN_FIREWALL=1 CERT_SOURCE=tailscale scripts/portal-tailnet-drill.sh
 ```
 
-If this node has no cached certificate, `tailscaled` issues one: a public
-certificate whose name is recorded in Certificate Transparency logs
-([docs/deployment.md](../docs/deployment.md)). The drill changes no tailnet
-setting. `OPEN_FIREWALL=1` opens the drill port (default 47320) on
-`tailscale0` for at most 300 s. Writes
+`CERT_SOURCE` picks the certificate:
+- **`private-ca` (the default):** a drill CA issues the leaf for the node's
+  tailnet name, and `localapi-cert-shim.py` answers the LocalAPI
+  certificate call while forwarding everything else (status, WhoIs) to the
+  real `tailscaled`. The portal runs without root, nothing is issued
+  publicly, and the remote trusts the drill CA through a temporary file.
+  This mode also checks that the remote refuses the certificate without
+  that CA.
+- **`tailscale`:** the node's real certificate, under sudo. If the node has
+  no cached certificate, `tailscaled` issues one: a public certificate whose
+  name is recorded in Certificate Transparency logs
+  ([docs/deployment.md](../docs/deployment.md)). Get the tailnet owner's
+  agreement first.
+
+The drill changes no tailnet setting. `OPEN_FIREWALL=1` opens the drill
+port (default 47320) on `tailscale0` for at most 300 s. Writes
 `$HOME/distr-hnsw-drill/portal-tailnet-report-<utc>.json` and exits 0 only
 on a `pass` verdict.
+
+## localapi-cert-shim.py
+
+A Unix-socket proxy for drills: it forwards every LocalAPI request to the
+real `tailscaled` socket, except `GET /localapi/v0/cert/<domain>`, which it
+answers with a key and certificate pair from a file. It is used by
+`portal-tailnet-drill.sh` through `DISTR_HNSW_TAILSCALE_SOCKET`, and is not
+part of the product.
+
+## tailnet-rotation-drill.sh
+
+Real-tailnet signing-key rotation and node-join drill (M2 work package 7).
+Runs three agents on this node's tailnet address and captures the portal's
+requests with `tcpdump` on loopback (sudo), so that it can replay real
+grants and join tokens. It checks:
+- **Joins:** a token names one agent and is single use on both sides; a
+  sniffed or guessed token from another node is refused; the portal records
+  the agent's tailnet node.
+- **Replay:** a captured grant is refused from another node, on another
+  agent, for another operation, and after it expires.
+- **Rotation:** the old key verifies during the overlap, and an agent
+  offline across a rotation catches up on its next request.
+- **Revocation:** after `retire-signing --revoke` and one request per agent,
+  grants under the revoked key or the old epoch are refused. An agent offline
+  across the revocation refuses the new key set and rejoins with
+  `--reset-trust` and a new token.
+
+```sh
+REMOTE=user@other-node OPEN_FIREWALL=1 scripts/tailnet-rotation-drill.sh
+```
+
+Each check records the status, the agent's refusal code, and its message.
+The remote checks finish inside the 300 s firewall window; the expiry check
+then waits about three minutes. Writes
+`$HOME/distr-hnsw-drill/tailnet-rotation-report-<utc>.json` and exits 0
+only on a `pass` verdict.
 
 ## minio-test.sh
 
