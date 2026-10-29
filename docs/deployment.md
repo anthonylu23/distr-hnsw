@@ -116,7 +116,9 @@ $BIN portal serve --database $DB --master-key $KEY \
   Signing in again with a live cookie replaces it; `DELETE /api/session`
   signs out; `portal user disable` revokes every session and API key of
   that user. State-changing requests need the session's CSRF token in
-  `X-CSRF-Token` (from the sign-in response or `GET /api/whoami`).
+  `X-CSRF-Token` (from the sign-in response or `GET /api/whoami`). Sign-in
+  itself needs none: it can only create a session for the calling device's
+  own identity, and a sign-in with a foreign `Origin` is refused.
 - **API keys** are shown once and stored only as a BLAKE3 verifier. Each
   has collection scopes (`files:read`, `files:write`, `<collection>:admin`;
   `files` covers `/api/files`) and names the one tailnet node it may be
@@ -210,6 +212,17 @@ and expect the name to stay public after the node is gone.
 | Rotate the grant-signing key | `portal key rotate-signing`, then `portal key retire-signing --key-id <old>` once agents use the new key (`--revoke` if the old key may be compromised) | periodically, or on suspected compromise |
 
 Every command in this table except `portal health` takes `--master-key`.
+
+An agent learns of a rotation or revocation on its next request from the
+portal. An agent offline across a rotation catches up then, because the old
+key vouches for the new key set. After `retire-signing --revoke`, send every
+agent one granted request (`portal agent request --agent … health`, or a
+`portal scrub`) so each refuses outstanding grants at once; until then a
+captured grant still works there for the rest of its lifetime (2 minutes,
+plus 60 seconds of clock skew). An agent offline across both a rotation and
+the revocation trusts no key in the new key set: restart it once with
+`--reset-trust` and a new token, and join it again
+([m2-authorization-drill.md](m2-authorization-drill.md)).
 
 GC refuses to collect while any agent holds a manifest or deletion marker
 the database does not know. It also waits for backup coverage of deleted

@@ -30,8 +30,11 @@ in what order, and how each criterion will be proven.
   configuration; the portal defaults to port 8443, not 443. As of
   2026-10-28 `tailscaled` on the reference host holds no certificate, so
   the first live fetch issues a new one and publishes the host's tailnet
-  name in Certificate Transparency logs; that step waits for the owner's
-  go-ahead.
+  name in Certificate Transparency logs. A crt.sh search that day found no
+  certificate for the tailnet, so that issuance would also be the first to
+  publish the tailnet's name; the owner deferred it. The live portal drill
+  uses a private drill CA instead, through a LocalAPI shim that forwards
+  status and WhoIs to the real `tailscaled`.
   Renewal and failure paths are tested against a fake LocalAPI with
   generated certificates, because a live certificate cannot be forced to
   expire. Certificate fetches need root (or the tailnet operator user), so
@@ -169,8 +172,9 @@ in what order, and how each criterion will be proven.
     agents keep accepting the retired key until their next key-set update.
     Use `--revoke` when a key may be compromised.
 
-- **Work packages 4 to 6 — implemented 2026-10-28; live certificate
-  evidence pending.**
+- **Work packages 4 to 6 — implemented 2026-10-28; drilled on the real
+  tailnet with a private CA 2026-10-29; the public certificate run is
+  deferred.**
   - `portal_server.rs`: `portal serve` resolves its bind like an agent but
     never accepts loopback; it serves only HTTPS and only after obtaining a
     certificate. Every connection is resolved with WhoIs before the TLS
@@ -217,6 +221,49 @@ in what order, and how each criterion will be proven.
     plaintext answer, and recovery, and the bind refusals and exit 75 on
     an address change.
 
+- **Work package 7 — done except cross-host agents, which are blocked
+  (2026-10-29).**
+  - Property tests for grants and key sets (`grant.rs`, proptest). They
+    found that the agent's lifetime check wrapped on extreme times: in a
+    release build, a signed grant with an unbounded lifetime passed the
+    300 s cap. Only the portal's key can sign one, but the checks now
+    saturate.
+  - `every_route_authorizes_every_kind_of_caller` (`tests/portal_server.rs`):
+    every portal route against 18 kinds of caller, checking status, refusal
+    code, and that refused cells change nothing.
+  - `scripts/portal-tailnet-drill.sh` passed on the real tailnet with a
+    private drill CA ([m2-portal-drill.md](m2-portal-drill.md)): WhoIs
+    identity from the laptop and from the portal's own node, forged
+    headers, sign-in, cookies, CSRF, and API-key scope and node binding,
+    each checked by refusal code.
+  - `scripts/tailnet-rotation-drill.sh` passed on the real tailnet
+    ([m2-authorization-drill.md](m2-authorization-drill.md)): grants and a
+    join token captured off the wire and replayed, the rotation overlap,
+    catch-up after a missed rotation, revocation by epoch, and the rejoin
+    of an agent that missed a revocation.
+  - Blocked until the owner has a second Linux node: agents on another
+    node than the portal. The development laptop cannot run tailnet-bound
+    agents (macOS LocalAPI transport is out of scope).
+
+## Acceptance status (2026-10-29)
+
+M2 is **blocked**, not accepted. Every criterion is met by tests and the
+real-tailnet drills, except the live evidence listed in the last column.
+
+| Criterion (roadmap M2) | Evidence | Live evidence still missing |
+|---|---|---|
+| Refuse wildcard and non-tailnet binds, also after a `tailscaled` restart or address change | `tests/tailscale_localapi.rs`, `tests/portal_server.rs` (fake LocalAPI: exit 75, no fallback); tailnet binds in every drill | a `tailscaled` restart on the real tailnet (it interrupts the owner's remote access; the owner's call) |
+| Forged identity headers grant nothing | both tailnet drills, [m2-portal-drill.md](m2-portal-drill.md), the route matrix | — |
+| Certificates without plaintext exposure | fake-LocalAPI renewal, reload, and expiry tests; TLS on the tailnet with a private CA | a publicly trusted certificate (deferred by the owner) |
+| Secure cookies, rotation, CSRF | `tests/portal_server.rs`, the route matrix, the portal drill | — |
+| API keys as verifiers, with scopes | `tests/portal_server.rs`, the route matrix, the portal drill | — |
+| Grants: missing, expired, altered, wrong operation or object, stale epoch | `tests/agent_authorization.rs`, grant property tests, the rotation drill | — |
+| Single-use join tokens; rotation overlap and revocation | `tests/agent_authorization.rs`, the rotation drill | — |
+| ACL and certificate-transparency documentation | [deployment.md](deployment.md) | ACL enforcement, which the owner applies |
+
+The exit gate also asks for cross-host operation: the portal and its
+agents on different nodes. That waits for a second Linux node.
+
 ## Work packages
 
 | # | Package | Proves |
@@ -251,11 +298,13 @@ to grants in the same packages so they keep passing.
 
 ## Open items
 
-- **Live certificate evidence** comes from the owner's tailnet (approved
-  2026-10-28): issuance through LocalAPI, TLS serving with that
-  certificate, and a client on the development laptop validating it.
-  Renewal and failure behavior come from the fake LocalAPI. Because the
-  reference host has no cached certificate, the fetch is a new issuance
-  (a public CT log entry) and waits for the owner's confirmation.
+- **Live certificate evidence**: issuance through LocalAPI, TLS serving
+  with that certificate, and a client on the development laptop validating
+  it against its system trust store. Because the reference host has no
+  cached certificate, the fetch is a new issuance (a public CT log entry);
+  the owner deferred it on 2026-10-28. `CERT_SOURCE=tailscale
+  scripts/portal-tailnet-drill.sh` runs it. Renewal, hot reload, and
+  expiry come from the fake LocalAPI; TLS on the tailnet address comes
+  from the private-CA drill.
 - **ACL policy** is documented, not applied: the owner applies it to their
   own tailnet.

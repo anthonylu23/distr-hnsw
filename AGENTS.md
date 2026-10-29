@@ -5,12 +5,15 @@ encrypted blobs plus distributed HNSW vector search. Product design lives in
 `DESIGN.md`. M0, M1 (blob plane, `crates/distr-hnsw/`), and M3 (vector
 engine, `crates/distr-hnsw-index/`) are accepted; the October 2026
 hardening pass (`docs/hardening-2026-10.md`) closed on 2026-10-28. M2
-(Tailscale identity) is in progress (`docs/m2-implementation-plan.md`):
-work packages 1 to 3 (agent grants and joins) are done and drilled; 4 to 6
-(the `portal serve` HTTPS service, sessions, API keys, audit log,
-certificates) are implemented and tested against the fake LocalAPI, with
-the live certificate run pending the owner's go-ahead (the reference host
-has no cached certificate, so a fetch is a new public issuance).
+(Tailscale identity) is blocked on a second Linux node for cross-host
+agents (acceptance status in `docs/m2-implementation-plan.md`): work
+packages 1 to 3 (agent grants and joins) are done and drilled; 4 to 6 (the
+`portal serve` HTTPS service, sessions, API keys, audit log, certificates)
+are implemented and drilled on the real tailnet with a private drill CA;
+work package 7 (adversarial, rotation, and join drills) is done except
+cross-host agents. The public certificate run is deferred by the owner
+(the reference host has no cached certificate, so a fetch is a new public
+issuance).
 
 
 ## Stack
@@ -71,7 +74,8 @@ has no cached certificate, so a fetch is a new public issuance).
 - `docs/m2-implementation-plan.md` — M2 decisions, work packages, and the
   constraint that the owner's tailnet HTTPS is never disabled.
 - `docs/m2-authorization-drill.md` — real-tailnet evidence for agent
-  authorization, and the M1 drills re-run with grants.
+  authorization, rotation, and joins, and the M1 drills re-run with grants.
+- `docs/m2-portal-drill.md` — real-tailnet evidence for `portal serve`.
 - `docs/m1-lifecycle-contract.md` — safety gates for reconciliation, movement,
   retirement, and physical deletion.
 - `docs/m1-filesystem-qualification.md` — durable-write review per filesystem
@@ -158,7 +162,9 @@ until joined (`portal agent token|join`); loopback needs
 `portal serve` (`portal_server.rs`, `auth.rs`, `tls.rs`) never binds
 loopback; its tests use the shared fake LocalAPI in `tests/common` and
 loopback aliases (127.0.0.2 and up) as tailnet nodes, which Linux
-provides and the tests skip without.
+provides and the tests skip without. The live portal drill reaches real
+WhoIs through `scripts/localapi-cert-shim.py`, which answers only the
+certificate call, so it needs no public certificate and no root.
 Tests use `TMPDIR=target/` via `.cargo/config.toml` so they run on a real
 filesystem; `aws-lc-sys` needs a C compiler. The S3 tests are `#[ignore]`d
 and run against MinIO with `scripts/minio-test.sh`. Process tests rely on

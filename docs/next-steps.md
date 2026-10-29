@@ -13,7 +13,9 @@ tracks only the immediate work queue.
   2026-10-28**. M3's exit review was withdrawn on 2026-10-25 and M3 was
   **accepted on 2026-10-28**. Both reopenings came from the audit in
   [hardening-2026-10.md](hardening-2026-10.md), which is now closed.
-- M2 is in progress ([m2-implementation-plan.md](m2-implementation-plan.md)).
+- M2 is blocked (2026-10-29) on a second Linux node for cross-host agents;
+  every other criterion has evidence
+  ([m2-implementation-plan.md](m2-implementation-plan.md#acceptance-status-2026-10-29)).
 
 ## Hardening pass (closed 2026-10-28)
 
@@ -51,7 +53,7 @@ tracks only the immediate work queue.
    `684ddfe`) and that the persistence bench under-reported recall
    (`46757b8`).
 
-## M2 (now)
+## M2 (blocked)
 
 Plan: [m2-implementation-plan.md](m2-implementation-plan.md). Work packages
 1 to 3 are done (2026-10-28): agents bind to the tailnet, join with
@@ -63,15 +65,28 @@ drill and the M1 drills pass with grants
 serve` (HTTPS on the tailnet address only, WhoIs identity per connection,
 identity headers stripped and audited), browser sessions with CSRF, API
 keys with collection scopes, the audit log, and certificate renewal with
-hot reload and fail-closed expiry. Next:
+hot reload and fail-closed expiry. Work package 7 is done
+(2026-10-29) except cross-host agents: grant property tests (which found
+and fixed wrapping in the lifetime check), a request-level authorization
+matrix for every portal route, the portal drill on the real tailnet with a
+private drill CA ([m2-portal-drill.md](m2-portal-drill.md)), and the
+rotation and node-join drill
+([m2-authorization-drill.md](m2-authorization-drill.md)).
 
-1. Live certificate evidence: the reference host has no cached
-   certificate, so the first fetch issues one and publishes the host's
-   tailnet name in Certificate Transparency logs. Run it once the owner
-   agrees; then a client on the development laptop validates it.
-2. Work package 7: the adversarial drill against the live portal
-   (unauthorized node, forged headers, replayed and stale grants), the
-   key-rotation and node-join drills, and cross-host agents.
+Waiting on the owner:
+
+1. A second Linux node, so the portal and its agents run on different
+   nodes (the development laptop cannot run tailnet-bound agents). Then
+   the M2 acceptance review against [roadmap.md](roadmap.md).
+2. The public certificate run (deferred on 2026-10-28; it would be the
+   first certificate to publish the tailnet's name in Certificate
+   Transparency logs) and a `tailscaled` restart on the reference host
+   (it interrupts the owner's remote access).
+
+Optional: `portal key retire-signing --revoke` could push the new key set to
+every agent at once, closing the window in which an agent that has not yet
+heard from the portal still accepts a revoked key's grant (at most 3
+minutes; [m2-authorization-drill.md](m2-authorization-drill.md)).
 
 The development laptop serves as the unauthorized tailnet node. Tests may use the owner's tailnet, including its
 certificates, but must never disable tailnet HTTPS or change its serve,
