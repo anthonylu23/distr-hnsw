@@ -1679,3 +1679,357 @@ async fn slow_long_and_excess_connections_are_cut_off() {
         StatusCode::OK
     );
 }
+
+/// What one row of the authorization matrix presents.
+enum Credential {
+    None,
+    /// A fresh session of the owner's, created on the laptop, for each cell:
+    /// with or without its CSRF token, and with this `Origin`.
+    Session {
+        csrf: bool,
+        origin: Origin,
+    },
+    Key(String),
+}
+
+#[derive(Clone, Copy)]
+enum Origin {
+    Absent,
+    Portal,
+    Foreign,
+}
+
+/// Every route, in the matrix's column order. `{key}` and `{file}` name a
+/// live API key and a stored file.
+const ROUTES: [(&str, &str); 10] = [
+    ("GET", "/api/whoami"),
+    ("POST", "/api/session"),
+    ("DELETE", "/api/session"),
+    ("GET", "/api/keys"),
+    ("POST", "/api/keys"),
+    ("DELETE", "/api/keys/{key}"),
+    ("GET", "/api/audit"),
+    ("POST", "/api/files"),
+    ("GET", "/api/files/{file}"),
+    ("DELETE", "/api/files/{file}"),
+];
+
+fn last_audit_seq(harness: &Harness) -> i64 {
+    harness
+        .database()
+        .audit_records(0, 1_000_000)
+        .unwrap()
+        .last()
+        .and_then(|record| record.seq)
+        .unwrap_or(0)
+}
+
+/// The request-level authorization matrix: every route against every kind
+/// of caller. A cell is `<status> <code>`, `<status> <principal kind>` for
+/// `whoami`, or `-` for a connection that gets no HTTP answer. A refused
+/// cell must leave no `allowed` or `completed` audit record (nothing
+/// changed) and must not end a session it did not steal; a changing cell
+/// gets its own target, so refusals aim at targets that must survive.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_route_authorizes_every_kind_of_caller() {
+    use distr_hnsw::portal_server::{new_api_key, KeyNode};
+    if !loopback_aliases() {
+        return;
+    }
+    let harness = Harness::start().await;
+    let owner = harness
+        .database()
+        .user_by_login("owner@example.com")
+        .unwrap()
+        .unwrap();
+    let carol = harness
+        .database()
+        .add_user("Carol", "carol@example.com", now())
+        .unwrap();
+    let mint_key = |user: Uuid, scope: &str, node: KeyNode, expiry: Option<(u32, i64)>| {
+        let (days, created) = expiry.map_or((None, now()), |(days, at)| (Some(days), at));
+        let (row, secret) =
+            new_api_key(user, "matrix", &[scope.into()], node, days, created).unwrap();
+        harness.database().insert_api_key(&row).unwrap();
+        secret.encode().to_string()
+    };
+    let key_id = |key: &str| ApiKeySecret::parse(key).unwrap().key_id().to_owned();
+
+    let admin = mint_key(owner.user_id, "files:admin", KeyNode::Any, None);
+    let reader = mint_key(owner.user_id, "files:read", KeyNode::Any, None);
+    let writer = mint_key(owner.user_id, "files:write", KeyNode::Any, None);
+    let notes = mint_key(owner.user_id, "notes:admin", KeyNode::Any, None);
+    let elsewhere = mint_key(
+        owner.user_id,
+        "files:admin",
+        KeyNode::Node("nLAPTOP".into()),
+        None,
+    );
+    let expired = mint_key(
+        owner.user_id,
+        "files:admin",
+        KeyNode::Any,
+        Some((1, now() - 2 * 86_400)),
+    );
+    let revoked = mint_key(owner.user_id, "files:admin", KeyNode::Any, None);
+    assert!(harness
+        .database()
+        .revoke_api_key(&key_id(&revoked), Some(owner.user_id), now())
+        .unwrap());
+    // Disabling a user revokes their keys; a key row that is somehow still
+    // live (restored, or written in a race) is refused for the user.
+    let carols = mint_key(carol.user_id, "files:admin", KeyNode::Any, None);
+    harness
+        .database()
+        .disable_user(carol.user_id, now())
+        .unwrap();
+    let carols_live = mint_key(carol.user_id, "files:admin", KeyNode::Any, None);
+
+    let store = |idempotency: String| {
+        let admin = admin.clone();
+        let harness = &harness;
+        async move {
+            let response = upload(harness, SERVER, &admin, &idempotency, b"kept".to_vec()).await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let body: Value = response.json().await.unwrap();
+            body["file_id"].as_str().unwrap().to_owned()
+        }
+    };
+    let shared_key = key_id(&mint_key(owner.user_id, "files:read", KeyNode::Any, None));
+    let shared_file = store("shared".into()).await;
+
+    const UNAUTHENTICATED: &str = "401 unauthenticated";
+    const SESSION_ONLY: &str = "403 session_required";
+    const NO_SCOPE: &str = "403 scope_denied";
+    const NO_CSRF: &str = "403 csrf_rejected";
+    const CROSS: &str = "403 cross_origin";
+    const KEY_LOGIN: &str = "403 session_login_with_api_key";
+    const STOLEN: &str = "401 session_wrong_node";
+    const WRONG_NODE: &str = "403 api_key_wrong_node";
+    const EXPIRED: &str = "401 api_key_expired";
+    const REVOKED: &str = "401 api_key_revoked";
+    const DISABLED: &str = "401 user_disabled";
+    let anonymous = |login: &'static str| {
+        [
+            "200 anonymous",
+            login,
+            UNAUTHENTICATED,
+            UNAUTHENTICATED,
+            UNAUTHENTICATED,
+            UNAUTHENTICATED,
+            UNAUTHENTICATED,
+            UNAUTHENTICATED,
+            UNAUTHENTICATED,
+            UNAUTHENTICATED,
+        ]
+    };
+    let key_only = |cells: [&'static str; 3]| {
+        [
+            "200 api_key",
+            KEY_LOGIN,
+            SESSION_ONLY,
+            SESSION_ONLY,
+            SESSION_ONLY,
+            SESSION_ONLY,
+            SESSION_ONLY,
+            cells[0],
+            cells[1],
+            cells[2],
+        ]
+    };
+    let refused = |whoami: &'static str, rest: &'static str| {
+        [
+            whoami, KEY_LOGIN, rest, rest, rest, rest, rest, rest, rest, rest,
+        ]
+    };
+    let session = |csrf, origin| Credential::Session { csrf, origin };
+    #[rustfmt::skip]
+    let rows: Vec<(&str, &str, Credential, [&str; 10])> = vec![
+        ("anonymous, owner's laptop", LAPTOP, Credential::None, anonymous("201")),
+        ("anonymous, unknown user", INTRUDER, Credential::None, anonymous("403 unknown_user")),
+        ("anonymous, tagged node", SERVER, Credential::None, anonymous("403 tagged_node")),
+        ("anonymous, portal's node", PORTAL_NODE, Credential::None, anonymous("403 portal_node")),
+        ("address WhoIs cannot name", STRANGER, Credential::None, ["-"; 10]),
+        ("session", LAPTOP, session(true, Origin::Portal),
+            ["200 session", "201", "204", "200", "201", "204", "200", "201", "200", "200"]),
+        ("session without its CSRF token", LAPTOP, session(false, Origin::Absent),
+            ["200 session", "201", NO_CSRF, "200", NO_CSRF, NO_CSRF, "200", NO_CSRF, "200", NO_CSRF]),
+        ("session with a foreign Origin", LAPTOP, session(true, Origin::Foreign),
+            ["200 session", CROSS, CROSS, "200", CROSS, CROSS, "200", CROSS, "200", CROSS]),
+        ("session cookie from another node", PHONE, session(true, Origin::Portal),
+            [STOLEN, "201", STOLEN, STOLEN, STOLEN, STOLEN, STOLEN, STOLEN, STOLEN, STOLEN]),
+        ("key files:read", SERVER, Credential::Key(reader), key_only([NO_SCOPE, "200", NO_SCOPE])),
+        ("key files:write", SERVER, Credential::Key(writer), key_only(["201", "200", "200"])),
+        ("key files:admin", SERVER, Credential::Key(admin.clone()), key_only(["201", "200", "200"])),
+        ("key notes:admin", SERVER, Credential::Key(notes), key_only([NO_SCOPE; 3])),
+        ("key bound to another node", SERVER, Credential::Key(elsewhere), refused(WRONG_NODE, WRONG_NODE)),
+        ("expired key", SERVER, Credential::Key(expired), refused(EXPIRED, EXPIRED)),
+        ("revoked key", SERVER, Credential::Key(revoked), refused(REVOKED, REVOKED)),
+        ("disabled user's key", SERVER, Credential::Key(carols), refused(REVOKED, REVOKED)),
+        ("disabled user's live key row", SERVER, Credential::Key(carols_live), refused(DISABLED, DISABLED)),
+    ];
+
+    let clients: std::collections::HashMap<&str, reqwest::Client> =
+        [LAPTOP, INTRUDER, SERVER, PHONE, STRANGER, PORTAL_NODE]
+            .into_iter()
+            .map(|from| (from, harness.client(from)))
+            .collect();
+    let portal_origin = format!("https://{DOMAIN}:{}", harness.port);
+    let session_kind = |cookie: String| {
+        let client = clients[LAPTOP].clone();
+        let url = harness.url("/api/whoami");
+        async move {
+            let response = client
+                .get(url)
+                .header("cookie", cookie)
+                .send()
+                .await
+                .unwrap();
+            let body: Value = response.json().await.unwrap();
+            body["principal"]["kind"]
+                .as_str()
+                .or(body["code"].as_str())
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let mut cells = 0;
+    for (row, (who, from, credential, expected)) in rows.iter().enumerate() {
+        for (column, ((method, route), expected)) in ROUTES.iter().zip(expected).enumerate() {
+            let cell = format!("{who}: {method} {route}");
+            let (status, detail) = expected.split_once(' ').unwrap_or((expected, ""));
+            let changes = status.starts_with('2') && *method != "GET";
+            let key_target = if changes && route.contains("{key}") {
+                key_id(&mint_key(owner.user_id, "files:read", KeyNode::Any, None))
+            } else {
+                shared_key.clone()
+            };
+            let file_target = if changes && route.contains("{file}") {
+                store(format!("target-{row}-{column}")).await
+            } else {
+                shared_file.clone()
+            };
+            let path = if *method == "POST" && *route == "/api/files" {
+                "/api/files?name=matrix.bin".to_owned()
+            } else {
+                route
+                    .replace("{key}", &key_target)
+                    .replace("{file}", &file_target)
+            };
+            let mut request = clients[from].request(method.parse().unwrap(), harness.url(&path));
+            let mut cookie = None;
+            match credential {
+                Credential::None => {}
+                Credential::Session { csrf, origin } => {
+                    let token = SessionToken::generate();
+                    harness
+                        .database()
+                        .insert_session(
+                            &SessionRow {
+                                session_id: Uuid::new_v4(),
+                                user_id: owner.user_id,
+                                node_stable_id: "nLAPTOP".into(),
+                                created_at: now(),
+                                last_seen_at: now(),
+                                expires_at: now() + 3600,
+                                revoked_at: None,
+                            },
+                            &token.verifier(),
+                        )
+                        .unwrap();
+                    let value = format!("__Host-distr-session={}", token.encode());
+                    request = request.header("cookie", &value);
+                    if *csrf {
+                        request = request.header("x-csrf-token", token.csrf_token());
+                    }
+                    request = match origin {
+                        Origin::Absent => request,
+                        Origin::Portal => request.header("origin", &portal_origin),
+                        Origin::Foreign => request.header("origin", "https://evil.example"),
+                    };
+                    cookie = Some(value);
+                }
+                Credential::Key(key) => request = request.bearer_auth(key),
+            }
+            if *method == "POST" && *route == "/api/keys" {
+                request = request
+                    .json(&json!({"name": "matrix", "scopes": ["files:read"], "any_node": true}));
+            }
+            if *method == "POST" && *route == "/api/files" {
+                request = request
+                    .header("idempotency-key", format!("matrix-{row}-{column}"))
+                    .body(b"matrix cell".to_vec());
+            }
+
+            let before = last_audit_seq(&harness);
+            let response = request.send().await;
+            cells += 1;
+            if status == "-" {
+                assert!(response.is_err(), "{cell}: answered {response:?}");
+            } else {
+                let response = response.unwrap_or_else(|error| panic!("{cell}: {error}"));
+                assert_eq!(response.status().as_str(), status, "{cell}");
+                if !status.starts_with('2') {
+                    assert_eq!(code(response).await, detail, "{cell}");
+                } else if *route == "/api/whoami" {
+                    let body: Value = response.json().await.unwrap();
+                    assert_eq!(body["principal"]["kind"], detail, "{cell}");
+                }
+            }
+
+            if !status.starts_with('2') {
+                let changed: Vec<String> = harness
+                    .database()
+                    .audit_records(before, 10_000)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|record| record.outcome == "allowed" || record.outcome == "completed")
+                    .map(|record| record.event)
+                    .collect();
+                assert!(
+                    changed.is_empty(),
+                    "{cell}: refused, yet audited {changed:?}"
+                );
+            }
+            if let Some(cookie) = cookie {
+                // A cookie used from another node is revoked everywhere; a
+                // refusal on its own node leaves it signed in.
+                if *from != LAPTOP {
+                    assert_eq!(session_kind(cookie).await, "session_revoked", "{cell}");
+                } else if !status.starts_with('2') {
+                    assert_eq!(session_kind(cookie).await, "session", "{cell}");
+                }
+            }
+            if changes && route.contains("{key}") {
+                let key = harness.database().api_key(&key_target).unwrap().unwrap();
+                assert!(key.revoked_at.is_some(), "{cell}: key not revoked");
+            }
+            if changes && *method == "DELETE" && route.contains("{file}") {
+                let response = clients[SERVER]
+                    .get(harness.url(&format!("/api/files/{file_target}")))
+                    .bearer_auth(&admin)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "{cell}: not deleted"
+                );
+            }
+        }
+    }
+    assert_eq!(cells, rows.len() * ROUTES.len());
+
+    // Every refusal aimed at the shared targets, and they survive.
+    let key = harness.database().api_key(&shared_key).unwrap().unwrap();
+    assert!(key.revoked_at.is_none(), "the shared key was revoked");
+    let response = clients[SERVER]
+        .get(harness.url(&format!("/api/files/{shared_file}")))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"kept");
+}
